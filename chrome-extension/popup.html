@@ -33,6 +33,8 @@
       <div class="url" id="modelUrl"></div>
       <div class="meta" id="modelMeta"></div>
       <button class="btn primary" id="btnDownload">⬇️ 开始下载</button>
+      <button class="btn secondary" id="btnArchive">🗂 一键归档到本地</button>
+      <div class="archive-note hidden" id="archiveNote"></div>
     </div>
 
     <div id="view-done" class="view hidden">
@@ -48,6 +50,12 @@
       <div class="hint" id="errMsg"></div>
       <button class="btn" id="btnRetry">重试</button>
     </div>
+
+    <details class="settings" id="settingsBox">
+      <summary>设置</summary>
+      <div class="archive-status" id="archiveStatus">正在读取归档通道…</div>
+      <div class="hint">归档根目录在软件设置页修改</div>
+    </details>
   </div>
   <script src="popup.js"></script>
 </body>

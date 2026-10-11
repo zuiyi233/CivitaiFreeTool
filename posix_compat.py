@@ -14,6 +14,7 @@ follow freedesktop standards so they work on GNOME/KDE/X11/Wayland alike:
 import os
 import shutil
 import subprocess
+import tempfile
 import urllib.parse
 
 IS_WINDOWS = os.name == "nt"
@@ -93,6 +94,25 @@ def trash(paths):
             if ok:
                 return True
     return False
+
+
+def thumb_cache_dir():
+    """缩略图缓存目录：Windows 取 LOCALAPPDATA，无则回退系统临时目录。
+
+    非 Windows 取 ~/.local/share/CivitaiFreeToolWeb/thumb_cache。
+    目录创建成功返回路径，创建失败返回 None（调用方回退为不缓存直读）。
+    """
+    try:
+        if IS_WINDOWS:
+            base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+            d = os.path.join(base, "CivitaiFreeToolWeb", "thumb_cache")
+        else:
+            d = os.path.join(os.path.expanduser("~"), ".local", "share",
+                             "CivitaiFreeToolWeb", "thumb_cache")
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:
+        return None
 
 
 def get_clipboard_text():

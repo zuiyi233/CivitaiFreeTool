@@ -6,6 +6,24 @@
 
 ## 🔥 v2.2.7：Firefox 扩展「来源被拒绝」（403）修复
 
+## 🌐 局域网无头服务器资产接入（v2.2.0）
+
+### 背景
+局域网无头 Linux 模型资产无法被 Windows 端稳定管理——模型堆在服务器上，只能 SSH 手工搬运，路径对不上、缩略图反复拉取卡顿、目录断连时扫描误报"0 个模型"。
+
+### 新增功能
+1. **Samba 桥接一键接入**：Linux 服务器上 `sudo bash linux-server-setup/install-samba.sh /data/models --share models --user civitai-smb` 开共享，Windows 端 `net use Z: \\192.168.1.10\models` 映射后加入模型目录，服务器模型与本地统一扫描管理（UNC 路径 `\\192.168.1.10\models` 也可直接用）
+2. **网络路径健壮性**：每个模型根独立上报 ok/unreachable 状态，不可达目录明确提示且不中断其他根；缩略图本地缓存（`%LOCALAPPDATA%\CivitaiFreeToolWeb\thumb_cache`），二次打开直接读缓存
+3. **设置页连接测试**：模型目录与归档目录输入框旁新增「测试」按钮，当场校验路径可达性与可写性，网络路径自动标注
+
+### 🛠️ 运维提示
+- 部署脚本需 root、445 端口放行、SMB3 默认加密
+- 仅限局域网使用，不要把 445 端口暴露到公网；建议账号密码登录而非免密 guest
+
+---
+
+## 🛡️ 启动自愈：有后台无前台彻底兜底（v2.1.12）
+
 ### 修复
 - **Firefox 装扩展后一键下载报「下载失败 / 来源被拒绝」**：桥接层的 CORS 来源白名单只认 `chrome-extension://`（Chrome/Edge），不认 Firefox 的 `moz-extension://<uuid>` → 请求被 403 挡掉。
   - 现在 **Chrome 与 Firefox 的扩展来源都放行**（`^(chrome|moz)-extension://`）。

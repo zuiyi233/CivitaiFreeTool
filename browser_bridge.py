@@ -11,12 +11,14 @@
 - GET /api/heartbeat：页面心跳（用于「关页面即退出」）；
 - 端口冲突/启动失败静默（不影响主程序）。
 """
+import base64
 import json
 import mimetypes
 import os
 import re
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -29,15 +31,25 @@ _URL_PATH_RE = re.compile(r"^/(api/download/)?models/", re.I)
 _EXT_ORIGIN_RE = re.compile(r"^(chrome|moz)-extension://", re.I)
 _LOCAL_ORIGIN_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", re.I)
 
+# 归档写盘的 body 上限：仅 /api/archive/file 放宽（base64 膨胀，按原始 64MB 设计）
+_ARCHIVE_FILE_MAX = 128 * 1024 * 1024
+_ARCHIVE_RAW_MAX = 64 * 1024 * 1024
+_NOT_READY = {"ok": False, "msg": "归档服务未就绪"}
+
 _lock = threading.Lock()
 _server = None
 _version = ""
-_handler = None        # def download_url(url) -> dict（同步返回，如 {"started": True}）
+_handler = None        # def download_url(url, dest_subdir="") -> dict（同步返回，如 {"started": True}）
 _api = None            # webui.Api 实例：浏览器模式 RPC 用
 _web_root = ""         # 界面文件根目录（浏览器模式）
 _last_seen = 0.0       # 页面最后一次请求时间（心跳）
 # 界面状态（看门狗与诊断用）：mode=window/browser；window=窗口是否已可见
 _ui_state = {"mode": "window", "window": False, "pid": os.getpid(), "started_at": int(time.time())}
+# 归档注册制：webui.Api 启动时注册 config/write/done/check 四个入口
+_archive_config_fn = None  # def config() -> dict
+_archive_write_fn = None   # def write(rel_path, data: bytes) -> str/False
+_archive_done_fn = None    # def done(dir_name) -> 任意（尽力而为）
+_archive_check_fn = None   # def check(version_id) -> dict {found, paths}
 
 
 def set_ui_state(**kw):
@@ -76,6 +88,15 @@ def port():
 def touch():
     global _last_seen
     _last_seen = time.time()
+
+
+def set_archive_handlers(config_fn=None, write_fn=None, done_fn=None, check_fn=None):
+    """注册归档入口：webui.Api 启动时把 config/write/done/check 注册进来"""
+    global _archive_config_fn, _archive_write_fn, _archive_done_fn, _archive_check_fn
+    _archive_config_fn = config_fn
+    _archive_write_fn = write_fn
+    _archive_done_fn = done_fn
+    _archive_check_fn = check_fn
 
 
 def is_model_url(url):
@@ -160,6 +181,35 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, d, origin)
         if path == "/api/heartbeat":
             return self._json(200, {"ok": True}, origin)
+        if path == "/api/archive/config":
+            fn = _archive_config_fn
+            if fn is None:
+                return self._json(500, dict(_NOT_READY), origin)
+            try:
+                cfg = fn() or {}
+            except Exception as e:
+                return self._json(500, {"ok": False, "msg": "归档配置读取失败: %s" % str(e)[:120]}, origin)
+            return self._json(200, {"ok": True, "archive_root": cfg.get("archive_root") or "",
+                                    "download_dir": cfg.get("download_dir") or ""}, origin)
+        if path == "/api/library/check":
+            fn = _archive_check_fn
+            if fn is None:
+                return self._json(500, dict(_NOT_READY), origin)
+            # query 参数解析（self.path 含 query string，先切 path 再解析）
+            try:
+                qs = urllib.parse.urlparse(self.path).query
+                vid = (urllib.parse.parse_qs(qs).get("version_id") or [""])[0]
+            except Exception:
+                vid = ""
+            try:
+                result = fn(vid) or {}
+            except Exception as e:
+                return self._json(500, {"ok": False, "msg": "模型库检查失败: %s" % str(e)[:120]}, origin)
+            if isinstance(result, dict) and result.get("ok") is False and "found" not in result:
+                return self._json(400, result, origin)
+            out = {"ok": True, "found": bool(result.get("found")),
+                   "paths": list(result.get("paths") or [])}
+            return self._json(200, out, origin)
         # 浏览器模式：直接由本服务提供界面文件（只在注册了 web 根目录时启用）
         if _web_root and not path.startswith("/api/"):
             return self._serve_static(path)
@@ -225,6 +275,56 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(500, {"error": "%s: %s" % (type(e).__name__, str(e)[:200])}, origin)
         return self._json(200, {"result": result}, origin)
 
+    def _handle_archive_file(self, origin):
+        """POST /api/archive/file：body {rel_path, data_b64}，上限 128MB"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(min(length, _ARCHIVE_FILE_MAX)) if length else b""
+            data = json.loads(raw.decode("utf-8", "replace") or "{}")
+            rel_path = data.get("rel_path") or ""
+            data_b64 = data.get("data_b64") or ""
+        except Exception:
+            return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+        if not rel_path or not data_b64:
+            return self._json(400, {"ok": False, "msg": "rel_path 与 data_b64 不能为空"}, origin)
+        try:
+            blob = base64.b64decode(data_b64, validate=True)
+        except Exception:
+            return self._json(400, {"ok": False, "msg": "data_b64 解码失败"}, origin)
+        if len(blob) > _ARCHIVE_RAW_MAX:
+            return self._json(400, {"ok": False, "msg": "文件过大（解码后超过 64MB）"}, origin)
+        fn = _archive_write_fn
+        if fn is None:
+            return self._json(500, dict(_NOT_READY), origin)
+        try:
+            saved = fn(rel_path, blob)
+        except Exception as e:
+            return self._json(400, {"ok": False, "msg": str(e)[:200]}, origin)
+        if saved is False or saved is None:
+            return self._json(400, {"ok": False, "msg": "写入失败"}, origin)
+        return self._json(200, {"ok": True, "path": str(saved)}, origin)
+
+    def _handle_archive_done(self, origin):
+        """POST /api/archive/done：body {dir_name}，尽力而为语义"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(min(length, 65536)) if length else b""
+            data = json.loads(raw.decode("utf-8", "replace") or "{}")
+            dir_name = data.get("dir_name") or ""
+        except Exception:
+            return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+        fn = _archive_done_fn
+        if fn is None:
+            return self._json(500, dict(_NOT_READY), origin)
+        if not dir_name:
+            return self._json(400, {"ok": False, "msg": "dir_name 不能为空"}, origin)
+        try:
+            fn(dir_name)
+        except Exception as e:
+            # 尽力而为：done 失败也返回 ok:true + msg
+            return self._json(200, {"ok": True, "msg": "重扫触发失败: %s" % str(e)[:120]}, origin)
+        return self._json(200, {"ok": True}, origin)
+
     def do_POST(self):
         origin = self._origin()
         if not self._check_origin(origin):
@@ -233,6 +333,10 @@ class _Handler(BaseHTTPRequestHandler):
         touch()
         if path == "/api/rpc":
             return self._rpc(origin)
+        if path == "/api/archive/file":
+            return self._handle_archive_file(origin)
+        if path == "/api/archive/done":
+            return self._handle_archive_done(origin)
         if path != "/api/download":
             return self._json(404, {"ok": False, "msg": "Not Found"}, origin)
         try:
@@ -240,6 +344,7 @@ class _Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(min(length, 65536)) if length else b""
             data = json.loads(raw.decode("utf-8", "replace") or "{}")
             url = data.get("url") or ""
+            dest_subdir = data.get("dest_subdir") or ""
         except Exception:
             return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
         url = (url or "").strip()
@@ -251,7 +356,7 @@ class _Handler(BaseHTTPRequestHandler):
         if fn is None:
             return self._json(500, {"ok": False, "msg": "下载服务未就绪"}, origin)
         try:
-            result = fn(url) or {}
+            result = fn(url, dest_subdir) or {}
         except Exception as e:
             return self._json(500, {"ok": False, "msg": "下载启动失败: %s" % str(e)[:120]}, origin)
         if isinstance(result, dict) and result.get("ok") is False:

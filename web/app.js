@@ -1148,7 +1148,15 @@ function pollMmScan() {
         if (u && u.items) applyUpdatesToRows(u.items);
       } catch (e) { /* 忽略 */ }
       applyMmFilter();
-      setStatus(s.msg || "扫描完成：" + state.models.length + " 个模型");
+      // 局域网接入：roots 含不可达根时警告替代"扫描完成"（0 模型且全 ok 才正常显示）
+      const scanRoots = (s && Array.isArray(s.roots)) ? s.roots : [];
+      const badRoots = scanRoots.filter((r) => r && r.status !== "ok");
+      if (badRoots.length) {
+        const shown = badRoots.slice(0, 3).map((r) => r.path + "（" + (r.error || "不可达") + "）").join("；");
+        setStatus("以下模型目录不可达：" + shown + (badRoots.length > 3 ? "等 " + (badRoots.length - 3) + " 个" : ""));
+      } else {
+        setStatus(s.msg || "扫描完成：" + state.models.length + " 个模型");
+      }
       $("#mmCount").textContent = state.models.length + " 个";
     } else if (s && s.msg) setStatus(s.msg);
   }, 700);
@@ -4054,6 +4062,7 @@ const SETTING_FIELDS = [
   ["下载", "download_target_dir", "下载目标文件夹（预设）", "dir"],
   ["下载", "rename_clean_rules", "文件名清理符号", "select", [["", "不清理"], ["comma", "去逗号（推荐）"], ["comma,paren", "去逗号 + 括号"], ["comma,paren,dash", "去逗号+括号，横线/下划线→空格"]]],
   ["下载", "metadata_format", "metadata 格式", "select", ["sd", "civitai", "both"]],
+  ["归档", "archive_root", "归档根目录", "text"],
   ["翻译", "baidu_appid", "百度翻译 APP ID", "text"],
   ["翻译", "baidu_key", "百度翻译密钥", "password"],
   ["翻译", "auto_translate", "反向解析自动翻译", "bool"],
@@ -4145,6 +4154,7 @@ const SETTING_TIPS = {
   "update_keep_old": "「更新页面」下载新版完成后的旧版处理：默认【保留旧版文件】（新版和旧版并存，要清理可用「查重 → 删旧留新」）；选【删除旧版】则下载完成后把旧版文件移入回收站（含预览图/元数据，可还原）。只影响「更新下载」，不影响普通批量下载",
   "download_target_dir": "预设下载落地文件夹（在模型目录里选）：下载的模型连 json/封面直接放进它，不再弹窗询问。也可在「批量下载」页临时选择",
   "metadata_format": "sd = WebUI 能直接识别的扁平 json；civitai = C 站原始 info 结构；both = 两个都生成（.civitai.info 始终生成）",
+  "archive_root": "浏览器插件一键归档的封面/配图/评论等文件保存到该目录（模型文件仍走下载目录）。局域网共享可填 UNC 路径如 \\\\192.168.1.10\\models 或映射盘符如 Z:\\models",
   "baidu_appid": "百度翻译开放平台 APP ID（免费申请），用于反向解析自动翻译模型名/简介",
   "baidu_key": "百度翻译开放平台密钥，与 APP ID 配套",
   "auto_translate": "反向解析时自动把模型名/简介翻译成中文",
@@ -4224,13 +4234,17 @@ function buildSettingsForm() {
       } else if (type === "dirs") {
         const list = (Array.isArray(v) && v.length) ? v : (state.cfg.models_dir ? [state.cfg.models_dir] : []);
         input = '<textarea class="input" rows="3" data-key="' + key + '" placeholder="D:\\sd-webui-forge-neo\\webui\\models">' + esc(list.join("\n")) + '</textarea>' +
-          '<div class="tip-inline">每行一个文件夹；WebUI 与 ComfyUI 分开存放时都填进来，扫描会合并显示（推荐填你实际的 webui\\models 和 comfyui\\models 目录）</div>';
+          '<div class="tip-inline">每行一个文件夹；WebUI 与 ComfyUI 分开存放时都填进来，扫描会合并显示（推荐填你实际的 webui\\models 和 comfyui\\models 目录）</div>' +
+          '<div><button class="btn" data-dir-test="' + key + '">🔌 测试连接</button> ' +
+          '<button class="btn" data-dir-browse="' + key + '">📁 浏览</button></div>';
       } else if (type === "dir") {
         input = '<div class="dir-pick"><input class="input" data-key="' + key + '" value="' + esc(v || "") + '" readonly placeholder="（未设置：用默认下载目录，完成后弹窗询问）"/>' +
           '<button type="button" class="btn btn-tiny" data-dirpick="' + key + '">选择</button>' +
           '<button type="button" class="btn btn-tiny" data-dirclear="' + key + '">清除</button></div>';
       } else {
-        input = '<input class="input" data-key="' + key + '" value="' + esc(v || "") + '"/>';
+        input = '<input class="input" data-key="' + key + '" value="' + esc(v || "") + '"' +
+          (key === "archive_root" ? ' placeholder="\\\\192.168.1.10\\models 或 Z:\\models"' : "") + '/>';
+        if (key === "archive_root") input += '<div><button class="btn" data-dir-test="' + key + '">🔌 测试连接</button></div>';
       }
       if (type === "bool") return '<div class="form-item">' + input + "</div>";
       return '<label' + (tip ? ' data-tip="' + esc(tip) + '"' : "") + ">" + esc(label) + "</label><div>" + input + "</div>";
@@ -4319,7 +4333,50 @@ $("#wfModels").addEventListener("click", (e) => {
 // ===== 设置 =====
 $("#settingsForm").addEventListener("click", (e) => {
   const link = e.target.closest(".bd-link");
-  if (link) api.call("open_url", link.dataset.url);
+  if (link) { api.call("open_url", link.dataset.url); return; }
+  // 目录「测试连接」：逐路径调 check_dir，showToast 回显（可达/可写、网络路径标注、失败原因）；防连点禁用 1 秒
+  const testBtn = e.target.closest("[data-dir-test]");
+  if (testBtn) {
+    const key = testBtn.dataset.dirTest;
+    const inp = document.querySelector('#settingsForm [data-key="' + key + '"]');
+    const paths = (inp ? inp.value : "").split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!paths.length) { showToast("请先填写目录路径"); return; }
+    testBtn.disabled = true;
+    const orig = testBtn.textContent;
+    testBtn.textContent = "测试中…";
+    (async () => {
+      for (const p of paths) {
+        try {
+          const r = await api.call("check_dir", p);
+          if (r && (r.ok || r.exists)) {
+            let msg = p + "：可达（" + (r.writable ? "可写" : "只读") + "）";
+            if (r.is_remote) msg += "【网络路径】";
+            showToast(msg);
+          } else {
+            showToast(p + "：不可达，" + ((r && r.error) || "未知原因"));
+          }
+        } catch (err) {
+          showToast(p + "：测试失败，" + err);
+        }
+      }
+      setTimeout(() => { testBtn.disabled = false; testBtn.textContent = orig; }, 1000);
+    })();
+    return;
+  }
+  // models_dirs「浏览」按钮：复用 pick_dir，追加为 textarea 新行（保存时后端已去重）
+  const browseBtn = e.target.closest("[data-dir-browse]");
+  if (browseBtn) {
+    const key = browseBtn.dataset.dirBrowse;
+    (async () => {
+      const picked = await api.call("pick_dir");
+      if (!picked) return;
+      const inp = document.querySelector('#settingsForm [data-key="' + key + '"]');
+      if (!inp) return;
+      inp.value = (inp.value.trim() ? inp.value.replace(/\s+$/, "") + "\n" : "") + picked;
+      inp.dispatchEvent(new Event("change", { bubbles: true }));
+    })();
+    return;
+  }
 });
 
 $("#btnSaveSettings").addEventListener("click", async () => {

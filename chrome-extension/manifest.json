@@ -1,20 +1,51 @@
 {
   "manifest_version": 3,
   "name": "CivitaiFreeTool 一键下载",
-  "version": "1.1.0",
-  "description": "点击图标弹出确认窗，一键把当前 Civitai 模型页下载到 CivitaiFreeTool（需先打开 CivitaiFreeTool.exe）",
-  "permissions": ["tabs", "scripting", "contextMenus"],
+  "version": "2.0.0",
+  "description": "模型页一键下载到 CivitaiFreeTool；一键归档（封面/配图/评论/模型信息）到本地归档目录，软件离线时降级为浏览器下载",
+  "permissions": ["tabs", "scripting", "contextMenus", "storage", "downloads", "offscreen"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",
     "https://civitai.red/*",
     "https://civitai.com/*",
     "https://www.civitai.red/*",
-    "https://www.civitai.com/*"
+    "https://www.civitai.com/*",
+    "https://image.civitai.com/*",
+    "https://delivery.civitai.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://civitai.com/models/*",
+        "https://www.civitai.com/models/*",
+        "https://civitai.red/models/*",
+        "https://www.civitai.red/models/*"
+      ],
+      "js": ["lib/util.js", "content/model-page.js"],
+      "css": ["content/content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://civitai.com/images/*",
+        "https://www.civitai.com/images/*",
+        "https://civitai.red/images/*",
+        "https://www.civitai.red/images/*",
+        "https://civitai.com/posts/*",
+        "https://www.civitai.com/posts/*",
+        "https://civitai.red/posts/*",
+        "https://www.civitai.red/posts/*"
+      ],
+      "js": ["lib/util.js", "lib/idb.js", "content/image-badge.js"],
+      "css": ["content/content.css"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_title": "CivitaiFreeTool 一键下载",
     "default_popup": "popup.html",

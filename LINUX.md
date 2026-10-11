@@ -67,6 +67,33 @@ python main_web.py
   （上游针对 QtWebEngine 白屏的修复，见 pywebview #890）
 - 缺 `PySide6`/`QtPy` 时，`main_web.py` 启动即打印安装指引退出
 
+## 局域网无头服务器接入（Samba 桥接）
+
+无头 Linux 服务器上的模型资产，可通过 Samba 共享桥接到 Windows 端 CivitaiFreeTool 统一管理（映射盘符或 UNC 路径均可）。
+
+### 服务器端一键部署
+
+```bash
+sudo bash linux-server-setup/install-samba.sh /data/models --share models --user civitai-smb
+```
+
+按提示设置 SMB 密码即可。完整参数表、安全说明与常见问题见 `linux-server-setup/README.md`。
+
+### Windows 端映射与配置
+
+```cmd
+net use Z: \\192.168.1.10\models /user:civitai-smb *
+```
+
+然后在设置页模型目录里加一行 `Z:\models`（或直接填 UNC 路径 `\\192.168.1.10\models`），
+保存后重新扫描。目录旁的「测试」按钮可当场校验路径可达性与可写性。
+
+### 诊断
+
+- 服务器上验证共享：`smbclient -L //localhost -U civitai-smb`
+- Windows 端检查 445 端口：`Test-NetConnection 192.168.1.10 -Port 445`（PowerShell）
+- 不通先查：服务器防火墙是否放行 samba 服务、SELinux 布尔值、共享目录权限
+
 ## 已知限制
 
 - Win11 Mica/Acrylic 窗口特效、无边框自绘标题栏：Windows 专属，Linux 自动回退系统窗口

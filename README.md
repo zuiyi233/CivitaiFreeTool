@@ -2,7 +2,7 @@
 
 > **免费 · 全功能 · 无付费墙** —— Civitai / HuggingFace 模型下载、管理、反向解析工具（Windows / Linux / macOS）
 
-![Version](https://img.shields.io/badge/version-2.2.5-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
+![Version](https://img.shields.io/badge/version-2.2.7-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
 
 CivitaiFreeTool 是一款开箱即用的 AI 模型管理桌面工具：**批量下载 C 站 / HuggingFace 模型、本地模型管理（缩略图 / 改名 / 整理 / 校验 / 移动）、模型更新检测、反向解析、ComfyUI 工作流分析**，全部功能免费开放。内置**圆角现代（Modern Rounded）与 Metro（Windows 10 扁平）两套完整主题体系**，同一功能两种视觉语言。
 
@@ -42,6 +42,8 @@ CivitaiFreeTool 是一款开箱即用的 AI 模型管理桌面工具：**批量�
 - 校验完整性（哈希比对）· 清理冗余文件 · 下载封面图（走代理）· 翻译成中文 · 文件夹显示/隐藏
 - 详情面板：多图画廊（本地图集 + C 站图）、**简介中文翻译（富文本排版）**、触发词复制、图片右键（复制图片 / 正面提示词 / 负面提示词 / 设为缩略图 / 打开原图页）
 - 流畅度：封面双端缓存 + 滚动/筛选/排序状态保留，删除、刷新秒级完成不闪屏
+- 图片缓存清理：设置页一键删除 `模型名.images/` 文件夹
+- 支持局域网共享/网络路径（SMB 映射盘符或 UNC，如 `\\192.168.1.10\models`），配合 linux-server-setup 一键搭建
 
 ### 🔔 模型更新检测
 - 「检查更新」：按底模分组对比 C 站，版本新旧按**发布时间**判定；支持**只检查勾选**（忽略缓存与白名单）
@@ -66,6 +68,7 @@ CivitaiFreeTool 是一款开箱即用的 AI 模型管理桌面工具：**批量�
 - 下载目录、API Key、百度翻译、代理（C 站被墙时启用）、界面缩放、启动默认页
 - 分类规则（目标环境 / 整理模式 / 自定义规则）、维护（清理图片缓存）；旧版处理策略（保留 / 移入回收站）
 - 新手引导：功能介绍页 + 逐步配置
+- 模型目录支持局域网共享/网络路径（SMB 映射盘符或 UNC，如 `\\192.168.1.10\models`），配合 linux-server-setup 一键搭建
 
 ### 💡 细节体验
 - 全部按钮 / 菜单项带 **hover 浮窗备注**

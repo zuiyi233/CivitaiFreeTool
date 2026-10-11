@@ -1,0 +1,133 @@
+/* CFT content/content.css —— 归档按钮 / SAVE 徽章 / 选择弹窗 / toast
+ * 类名前缀 cft-；浮层 z-index 统一 2147483647。配色照脚本：
+ * 按钮基色 #1E88E5、进度填充 #4CAF50；徽章 SAVE rgba(0,119,255,.56)、SAVED rgba(46,204,113,.8)。
+ */
+
+/* ---------- 悬浮归档按钮（右下角固定） ---------- */
+.cft-archive-btn {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  min-width: 148px;
+  height: 44px;
+  padding: 0 18px;
+  overflow: hidden;
+  border: none;
+  border-radius: 22px;
+  background: #1e88e5;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.cft-archive-btn:hover { filter: brightness(1.08); }
+.cft-archive-btn:disabled { cursor: default; }
+.cft-archive-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background: #4caf50;
+  pointer-events: none;
+}
+.cft-archive-label {
+  position: relative;
+  z-index: 1;
+  white-space: nowrap;
+}
+.cft-archive-btn.cft-archiving { background: #1e88e5; }
+.cft-archive-btn.cft-done { background: #2e7d32; }
+.cft-archive-btn.cft-error { background: #c62828; }
+
+/* ---------- SAVE / SAVED 徽章 ---------- */
+.cft-badge-anchor { position: relative; }
+.cft-badge {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  z-index: 2147483647;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 119, 255, 0.56);
+  color: #fff;
+  font-size: 12px;
+  font-weight: bold;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  cursor: pointer;
+  user-select: none;
+}
+.cft-badge-saved { background: rgba(46, 204, 113, 0.8); cursor: default; }
+.cft-badge-busy { background: rgba(120, 120, 120, 0.75); cursor: default; }
+.cft-badge-error { background: rgba(224, 49, 49, 0.9); cursor: pointer; }
+
+/* ---------- 文件选择弹窗 ---------- */
+.cft-sel-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.cft-sel-box {
+  min-width: 320px;
+  max-width: 480px;
+  max-height: 80vh;
+  overflow: auto;
+  padding: 16px;
+  border-radius: 8px;
+  background: #25262b;
+  color: #fff;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.cft-sel-title { margin: 0 0 12px; font-size: 16px; }
+.cft-sel-item {
+  display: block;
+  width: 100%;
+  margin: 6px 0;
+  padding: 10px;
+  border: none;
+  border-radius: 4px;
+  background: #1e88e5;
+  color: #fff;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cft-sel-item:hover { filter: brightness(1.1); }
+.cft-sel-cancel {
+  margin-top: 8px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 4px;
+  background: #555;
+  color: #fff;
+  cursor: pointer;
+}
+
+/* ---------- toast ---------- */
+.cft-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 60px;
+  z-index: 2147483647;
+  max-width: 320px;
+  padding: 10px 16px;
+  border-radius: 6px;
+  background: rgba(46, 125, 50, 0.95);
+  color: #fff;
+  font-size: 13px;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  word-break: break-all;
+  transition: opacity 0.3s;
+}
+.cft-toast-error { background: rgba(224, 49, 49, 0.95); }
+.cft-toast-hide { opacity: 0; }

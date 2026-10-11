@@ -17,6 +17,7 @@ import civitai_api
 import config
 import downloader
 import model_manager
+import path_util
 import posix_compat
 import reverse_parse
 import translator
@@ -56,6 +57,10 @@ class Api:
         # 浏览器桥：Chrome 扩展一键下载当前页面（127.0.0.1 本地 HTTP，静默失败）
         browser_bridge.set_download_handler(self.dl_enqueue_url_sync)
         browser_bridge.set_api(self)     # 浏览器模式：/api/rpc 的方法调用目标
+        browser_bridge.set_archive_handlers(config_fn=self.archive_config,
+                                            write_fn=self.archive_write,
+                                            done_fn=self.archive_done,
+                                            check_fn=self.library_check)
         browser_bridge.start(version=APP_VERSION)
         self._dl_asked_move = set()   # 本次会话已询问过移动的任务 id
         self.lock = threading.Lock()
@@ -361,31 +366,44 @@ class Api:
         return {"ok": True, "msg": "保存位置已改为 %s" % p}
 
     # ---------------- 配置 ----------------
-    def _models_roots(self):
-        """有效的模型管理目录列表（多目录支持：models_dirs + 兼容 models_dir）"""
+    def _model_roots_with_status(self):
+        """模型目录候选 + 可达状态：[{"path", "status": "ok"|"unreachable", "error"}]。
+
+        供 scan_models 遍历（不可达根不中断其他根，前端据 roots 显示警告）。"""
         dirs = self.cfg.get("models_dirs") or []
         if not isinstance(dirs, list):
             dirs = [dirs] if dirs else []
-        dirs = [str(d).strip().rstrip("/\\") for d in dirs if str(d) and str(d).strip()]
-        legacy = (self.cfg.get("models_dir") or "").strip().rstrip("/\\")
+        dirs = [path_util.norm_root(d) for d in dirs if str(d) and str(d).strip()]
+        legacy = path_util.norm_root(self.cfg.get("models_dir") or "")
         if legacy and legacy not in dirs:
             dirs.insert(0, legacy)
-        # 去重保序 + 只留存在的目录
+        # 去重保序（规范化后），每个候选标注可达状态
         seen, out = set(), []
         for d in dirs:
-            if d not in seen:
-                seen.add(d)
-                if os.path.isdir(d):
-                    out.append(d)
+            if not d or d in seen:
+                continue
+            seen.add(d)
+            if os.path.isdir(d):
+                out.append({"path": d, "status": "ok", "error": ""})
+            else:
+                out.append({"path": d, "status": "unreachable",
+                            "error": path_util.NOT_FOUND_ERROR})
         return out
+
+    def check_dir(self, path):
+        """设置页连接测试：返回 {"path": path, **path_util.check_reachable(path)}"""
+        return {"path": path, **path_util.check_reachable(path)}
+
+    def _models_roots(self):
+        """有效的模型管理目录列表（多目录支持：models_dirs + 兼容 models_dir）"""
+        return [r["path"] for r in self._model_roots_with_status()
+                if r.get("status") == "ok"]
 
     def _root_of(self, path):
         """返回包含该文件的模型目录根（多目录时定位归属）"""
-        roots = self._models_roots() or [(self.cfg.get("models_dir") or "").strip().rstrip("/\\")]
-        p = (path or "").replace("\\", "/").lower()
+        roots = self._models_roots() or [path_util.norm_root(self.cfg.get("models_dir") or "")]
         for r in roots:
-            rn = r.replace("\\", "/").lower().rstrip("/")
-            if p == rn or p.startswith(rn + "/"):
+            if r and path_util.is_within(r, path or ""):
                 return r
         return roots[0] if roots else ""
 
@@ -715,14 +733,21 @@ class Api:
         """后台扫描；返回立即，进度/结果轮询 get_scan_state"""
         if self.mm_scan_state["running"]:
             return {"started": False}
-        self.mm_scan_state = {"running": True, "rows": [], "msg": ""}
+        self.mm_scan_state = {"running": True, "rows": [], "msg": "", "roots": []}
 
         def work():
             try:
-                roots = self._models_roots()
+                with_status = self._model_roots_with_status()
+                # 不可达根直接进状态，不中断其他根
+                self.mm_scan_state["roots"] = list(with_status)
                 files = []
-                for root in roots:
-                    files.extend(model_manager.scan_models(root))
+                for item in with_status:
+                    if item.get("status") != "ok":
+                        continue
+                    try:
+                        files.extend(model_manager.scan_models(item["path"]))
+                    except Exception:
+                        continue
                 hidden = set(self.cfg.get("hidden_model_folders", []))
                 show_root = self.cfg.get("show_root_models", True)
                 files = [f for f in files if _folder_visible(f["rel"], hidden, show_root)]
@@ -773,7 +798,8 @@ class Api:
         """轻量轮询状态（不含行数据，避免桥接传输大对象卡死）"""
         return {"running": self.mm_scan_state["running"],
                 "msg": self.mm_scan_state["msg"],
-                "total": len(self.mm_scan_state["rows"])}
+                "total": len(self.mm_scan_state["rows"]),
+                "roots": list(self.mm_scan_state.get("roots") or [])}
 
     def get_scan_rows(self):
         """精简行数据，以 JSON 字符串返回（规避 js_api 大 list 转换问题）"""
@@ -1088,9 +1114,10 @@ class Api:
         st = getattr(self, "_img_dl_state", None)
         return json.dumps(st or {"total": 0, "done": 0})
 
-    def _enqueue_one(self, url, dest_dir=None, skip_if_exists=False):
+    def _enqueue_one(self, url, dest_subdir="", dest_dir=None, skip_if_exists=False):
         """同步解析单条 URL 并入队（忽略付费状态）。返回 item dict：{url, ok, msg, task_id?}
 
+        dest_subdir 非空时落盘到归档根下该子目录（逃逸校验复用 _safe_archive_path），为空保持下载目录。
         dest_dir 非空时表示「指定落点」（更新下载：新版直接下到旧版所在文件夹，且不被全局目标搬走）。
         skip_if_exists=True 时做防重复：目标文件已存在、或该版本已在队列里 → 直接跳过不重复下载。
         """
@@ -1152,6 +1179,10 @@ class Api:
                     os.makedirs(dest_dir, exist_ok=True)
                 except Exception:
                     pass
+            elif (dest_subdir or "").strip():
+                # 归档桥指定子目录：落盘到归档根下该子目录（逃逸校验复用 _safe_archive_path）
+                dest_dir = self._safe_archive_path(self._archive_root(), dest_subdir)
+                info["dest_explicit"] = True      # 同样标记，不被全局目标/自动归位搬走
             dl_url = api.build_download_url(version_id, f.get("id")) if version_id else (f.get("downloadUrl") or "")
             if not dl_url:
                 item["msg"] = "无下载链接"
@@ -1193,9 +1224,9 @@ class Api:
         threading.Thread(target=work, daemon=True).start()
         return {"started": True}
 
-    def dl_enqueue_url_sync(self, url):
+    def dl_enqueue_url_sync(self, url, dest_subdir=""):
         """同步解析并入队（Chrome 扩展桥用）：返回 {ok, msg, task_id?}，失败立即返回具体原因"""
-        item = self._enqueue_one(url)
+        item = self._enqueue_one(url, dest_subdir)
         if item.get("ok"):
             self._notify_ext_download_started()
         return {"ok": item.get("ok"), "msg": item.get("msg"), "task_id": item.get("task_id")}
@@ -1212,6 +1243,121 @@ class Api:
                     pass
         except Exception:
             pass
+
+    # ---------------- 归档桥（Chrome 扩展归档助手用） ----------------
+    def archive_config(self):
+        """归档配置：archive_root 未设置时回落 download_dir"""
+        return {"archive_root": self.cfg.get("archive_root") or self.cfg.get("download_dir") or "",
+                "download_dir": self.cfg.get("download_dir") or ""}
+
+    def _archive_root(self):
+        """归档根目录（回落下载目录）；为空抛 ValueError"""
+        root = (self.cfg.get("archive_root") or self.cfg.get("download_dir") or "").strip()
+        if not root:
+            raise ValueError("归档根目录未设置")
+        return root
+
+    @staticmethod
+    def _safe_archive_path(root, rel_path):
+        """rel_path 安全校验：拒绝 .. 逃逸/绝对路径/盘符，返回落盘完整路径"""
+        rel = (rel_path or "").strip()
+        if not rel:
+            raise ValueError("rel_path 不能为空")
+        # 盘符（C:）/绝对路径/UNC 拦截（Windows 逃逸面），无新依赖
+        if (len(rel) >= 2 and rel[1] == ":") or rel.startswith(("\\\\", "/", "\\")):
+            raise ValueError("非法路径")
+        full = os.path.normpath(os.path.join(root, rel))
+        root_n = path_util.norm_root(root)
+        full_n = path_util.norm_root(full)
+        if not root_n or not full_n:
+            raise ValueError("非法路径")
+        # 落盘目标必须在归档根内（相等即根自身，同样拒绝）
+        if not path_util.is_within(root_n, full_n) or full_n == root_n:
+            raise ValueError("非法路径：禁止逃逸归档根目录")
+        return full
+
+    def archive_write(self, rel_path, data):
+        """归档写盘：二进制写入归档根下的 rel_path，返回完整路径"""
+        root = self._archive_root()
+        full = self._safe_archive_path(root, rel_path)
+        parent = os.path.dirname(full)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data or b"")
+        return full
+
+    def archive_done(self, dir_name):
+        """归档完成：daemon 线程触发模型库重扫（全库磁盘遍历，不阻塞桥响应），尽力而为"""
+        def work():
+            try:
+                self.scan_models()
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True}
+
+    def _match_version_id(self, meta, vid):
+        """元数据 dict 是否命中 version_id（兼容驼峰/下划线/嵌套 version.id）"""
+        if not isinstance(meta, dict):
+            return False
+        for key in ("version_id", "versionId"):
+            if str(meta.get(key) or "") == vid and meta.get(key) is not None:
+                return True
+        v = meta.get("version")
+        if isinstance(v, dict) and str(v.get("id") or "") == vid:
+            return True
+        info = meta.get("info")
+        if isinstance(info, dict) and self._match_version_id(info, vid):
+            return True
+        return False
+
+    def _library_check_cached(self, vid):
+        """优先查扫描缓存 rows（O(缓存行数)，无磁盘 IO；含 verId/info 两种命中）"""
+        rows = self.model_rows or []
+        hits = []
+        for r in rows:
+            if str(r.get("verId") or "") == vid:
+                hits.append(r.get("path") or "")
+                continue
+            if self._match_version_id(r.get("info") or {}, vid):
+                hits.append(r.get("path") or "")
+        return [p for p in hits if p]
+
+    def _library_check_disk(self, vid):
+        """缓存未命中时 O(n) 遍历模型目录：读 *.civitai.info 与 *.json 比对 version_id"""
+        hits = []
+        for root in self._models_roots():
+            for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for fn in filenames:
+                    low = fn.lower()
+                    if not (low.endswith(".civitai.info") or low.endswith(".json")):
+                        continue
+                    if low.endswith(".preview.png"):
+                        continue
+                    full = os.path.join(dirpath, fn)
+                    try:
+                        with open(full, "r", encoding="utf-8") as fh:
+                            meta = json.load(fh)
+                    except Exception:
+                        continue
+                    if self._match_version_id(meta, vid):
+                        hits.append(full)
+        return hits
+
+    def library_check(self, version_id):
+        """模型库检查：version_id 转 str 比较；先缓存后磁盘（注释注明性能特征）"""
+        vid = str(version_id or "").strip()
+        if not vid:
+            return {"ok": True, "found": False, "paths": []}
+        try:
+            paths = self._library_check_cached(vid)
+            if not paths:
+                paths = self._library_check_disk(vid)
+        except Exception:
+            return {"ok": True, "found": False, "paths": []}
+        return {"ok": True, "found": bool(paths), "paths": paths}
 
     def parse_image_models(self, url):
         """C 站图片链接 → 图片页用到的模型列表（__NEXT_DATA__ 提取 resources）"""
@@ -1552,9 +1698,22 @@ class Api:
             "neg_prompt": neg_prompt[:400],
         }, ensure_ascii=False)
 
-    def get_covers(self, paths, size=64):
-        """批量返回封面（JSON 字符串：{path: base64}），size 为缩略边长（列表 64 / 瀑布流 320）"""
+    def get_covers(self, paths, size=64, cache_dir=None):
+        """批量返回封面（JSON 字符串：{path: base64}），size 为缩略边长（列表 64 / 瀑布流 320）。
+
+        cache_dir 为空时取 posix_compat.thumb_cache_dir()；None/空则不缓存（原逻辑直读）。"""
         out = {}
+        try:
+            size = int(size or 64)
+        except Exception:
+            size = 64
+        if cache_dir:
+            thumb_dir = cache_dir
+        else:
+            try:
+                thumb_dir = posix_compat.thumb_cache_dir()
+            except Exception:
+                thumb_dir = None
         for p in (paths or [])[:80]:
             cover = model_manager.find_cover(p)
             if not cover or not os.path.exists(cover):
@@ -1567,13 +1726,42 @@ class Api:
                     out[p] = hit
                     continue
                 from PIL import Image
+                import hashlib
                 import io
                 import base64
+                cache_path = None
+                if thumb_dir:
+                    try:
+                        mtime = int(os.path.getmtime(cover))
+                    except Exception:
+                        mtime = 0
+                    # 磁盘缓存键：路径 sha1（与内存缓存 key 元组分离，互不覆盖）
+                    cache_key = hashlib.sha1(os.path.normcase(
+                        os.path.abspath(cover)).encode("utf-8")).hexdigest()
+                    cache_path = os.path.join(
+                        thumb_dir, "%s_%d_%d.jpg" % (cache_key, mtime, size))
+                    try:
+                        if os.path.exists(cache_path):
+                            with open(cache_path, "rb") as f:
+                                out[p] = base64.b64encode(f.read()).decode()
+                            continue
+                    except Exception:
+                        cache_path = os.path.join(
+                            thumb_dir, "%s_%d_%d.jpg" % (cache_key, mtime, size))
                 im = Image.open(cover).convert("RGB")
                 im.thumbnail((size, size))
                 buf = io.BytesIO()
                 im.save(buf, "JPEG", quality=(88 if int(size) > 320 else 82))
-                b64s = base64.b64encode(buf.getvalue()).decode()
+                raw = buf.getvalue()
+                # 未命中：写入磁盘缓存（写失败/磁盘满静默，不破坏原逻辑）
+                if cache_path:
+                    try:
+                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        with open(cache_path, "wb") as f:
+                            f.write(raw)
+                    except Exception:
+                        pass
+                b64s = base64.b64encode(raw).decode()
                 if len(self._cover_cache) > 4000:
                     self._cover_cache.clear()
                 self._cover_cache[key] = b64s
