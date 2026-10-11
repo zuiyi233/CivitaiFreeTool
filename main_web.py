@@ -20,7 +20,7 @@ def _app_dir_log():
 def _write_app_pid():
     """把真实实例 PID 写给外部看门狗（必须在单实例检查通过后调用）。
 
-    看门狗靠它找到宿主进程：窗口超时未出现就杀这棵树并重启。"""
+    看门狗靠它核验宿主身份；优先保留原生实例，允许兜底时才进行恢复。"""
     try:
         d = _app_dir_log()
         os.makedirs(d, exist_ok=True)
@@ -35,7 +35,7 @@ def _spawn_external_watchdog():
 
     为什么必须独立进程：卡死点在 pywebview/WebView2 建窗的 .NET 互操作里，GIL 被永久占住，
     进程内所有 Python 线程（含旧版内置看门狗）都会饿死——连日志都写不出来，自愈必然失效。
-    独立进程有自己的 GIL 与线程，不碰 .NET，才能真正做到「超时即杀 + 重启」。"""
+    独立进程不碰 .NET；窗口等待、身份核验与可选兜底不依赖 UI 线程。"""
     try:
         import watchdog_ext
         if watchdog_ext.watchdog_alive():
@@ -136,6 +136,96 @@ def _kill_by_name():
         pass
 
 
+
+def _window_api():
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+    u.SetForegroundWindow.argtypes = [wintypes.HWND]
+    return u
+
+
+def _native_windows_for_pid(pid):
+    """Only the verified instance's main window, including a hidden one."""
+    import ctypes
+    from ctypes import wintypes
+    u = _window_api()
+    found = []
+    def collect(hwnd, _):
+        owner = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid:
+            title = ctypes.create_unicode_buffer(256)
+            u.GetWindowTextW(hwnd, title, len(title))
+            if title.value == "CivitaiFreeTool":
+                found.append({"handle": hwnd, "visible": bool(u.IsWindowVisible(hwnd))})
+        return True
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(collect)
+    u.EnumWindows(callback, 0)
+    return found
+
+
+def _activate_native_pid(pid):
+    try:
+        windows = _native_windows_for_pid(pid)
+        if len(windows) != 1:
+            return False
+        u = _window_api()
+        handle = windows[0]["handle"]
+        u.ShowWindowAsync(handle, 9)  # SW_RESTORE, posted without blocking another UI thread.
+        for _ in range(10):
+            if u.IsWindowVisible(handle):
+                u.SetForegroundWindow(handle)
+                return True
+            time.sleep(.05)
+    except Exception:
+        pass
+    return False
+
+
+def _activate_existing_instance():
+    """Never activate a file manager by title or silently switch a native app to browser."""
+    try:
+        import watchdog_ext as wd
+        pid = wd.read_app_pid()
+        if not pid or not wd._app_pid_matches(pid, os.path.basename(sys.executable).lower()):
+            return False
+        if _activate_native_pid(pid):
+            _startup_log("existing native window restored (pid %s)" % pid)
+            return True
+        health = wd._app_health()
+        if not wd._health_matches_pid(health, pid):
+            return False
+        if health.get("mode") == "browser":
+            import webbrowser
+            webbrowser.open("http://127.0.0.1:47531/")
+            return True
+        _startup_log("existing native instance still starting; no browser opened")
+        return True  # Keep its downloads and startup intact.
+    except Exception:
+        return False
+
+
+def _reveal_initial_window(window):
+    """A launcher can request SW_HIDE even though WebView's shown event has fired."""
+    if not posix_compat.IS_WINDOWS:
+        return True
+    try:
+        if not _self_visible_window():
+            window.show()
+        visible = _self_visible_window()
+        _startup_log("native visibility verified: %s" % visible)
+        return visible
+    except Exception as error:
+        _startup_log("native show failed: %s" % type(error).__name__)
+        return False
+
+
 def _single_instance():
     """单实例保护：已有实例运行时，激活其主窗口并让新进程退出。
 
@@ -148,8 +238,12 @@ def _single_instance():
     if posix_compat.IS_WINDOWS:
         import ctypes
         from ctypes import wintypes
-        u = ctypes.windll.user32
         k = ctypes.windll.kernel32
+        k.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        k.OpenMutexW.restype = wintypes.HANDLE
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        k.CreateMutexW.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
         # 打开已有互斥体：存在 = 已有实例在运行（Global 优先，回退 Local）
         for scope in ("Global\\", "Local\\"):
             h = k.OpenMutexW(wintypes.DWORD(0x001F0001), False, scope + MUTEX_NAME)  # MUTEX_ALL_ACCESS
@@ -158,25 +252,7 @@ def _single_instance():
                 # 1) 窗口模式：激活它的主窗口；
                 # 2) 浏览器模式（没有原生窗口）：探一次后端，能应答就把浏览器界面打开（用户双击就该看到界面）；
                 # 3) 后端无响应（卡死）：弹窗问要不要结束它再启动。
-                activated = False
-                try:
-                    w = u.FindWindowW(None, "CivitaiFreeTool")
-                    if w:
-                        u.ShowWindow(w, 9)  # SW_RESTORE
-                        u.SetForegroundWindow(w)
-                        activated = True
-                except Exception:
-                    pass
-                if not activated:
-                    try:
-                        import urllib.request
-                        with urllib.request.urlopen("http://127.0.0.1:47531/api/health", timeout=2) as resp:
-                            if resp.status == 200:
-                                import webbrowser
-                                webbrowser.open("http://127.0.0.1:47531/")
-                                activated = True
-                    except Exception:
-                        pass
+                activated = _activate_existing_instance()
                 if not activated:
                     try:
                         import ctypes
@@ -291,23 +367,7 @@ def _webview_storage_path():
 def _self_visible_window():
     """当前进程是否有可见顶层窗口（ctypes EnumWindows，失败返回 False）"""
     try:
-        import ctypes
-        from ctypes import wintypes
-        u = ctypes.windll.user32
-        pid = ctypes.windll.kernel32.GetCurrentProcessId()
-        found = []
-
-        def cb(h, _):
-            p = wintypes.DWORD()
-            u.GetWindowThreadProcessId(h, ctypes.byref(p))
-            if p.value == pid and u.IsWindowVisible(h):
-                found.append(h)
-                return False  # 找到即停
-            return True
-
-        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        u.EnumWindows(WNDENUMPROC(cb), 0)
-        return bool(found)
+        return any(w["visible"] for w in _native_windows_for_pid(os.getpid()))
     except Exception:
         return False
 
@@ -376,6 +436,10 @@ def _tray_icon(api, url):
         def _quit(icon=None, item=None):
             _startup_log("browser mode: tray quit")
             try:
+                api.dl.save_tasks()
+            except Exception:
+                pass
+            try:
                 icon.stop()
             except Exception:
                 pass
@@ -390,8 +454,28 @@ def _tray_icon(api, url):
         icon = pystray.Icon("CivitaiFreeTool", img, "CivitaiFreeTool（浏览器模式运行中）", menu)
         threading.Thread(target=icon.run, daemon=True).start()
         _startup_log("browser mode: tray ok")
+        return True
     except Exception as e:
         _startup_log("browser mode: tray failed %r" % (e,))
+        return False
+
+
+def _activate_browser_ui(api):
+    """原地切换显示器：仅打开浏览器，不杀宿主、不重建 Downloader。"""
+    import browser_bridge
+    import webbrowser
+    browser_bridge.set_api(api, os.path.join(_app_dir(), "web"))
+    browser_bridge.set_ui_state(mode="browser", window=False)
+    url = "http://127.0.0.1:%d/" % (browser_bridge.port() or browser_bridge.DEFAULT_PORT)
+    if api.cfg.get("tray_icon", True) and not getattr(api, "_browser_tray_started", False):
+        api._browser_tray_started = _tray_icon(api, url)
+    if not getattr(api, "_browser_ui_opened", False):
+        if not os.environ.get("CFT_NO_BROWSER_OPEN"):
+            webbrowser.open(url)
+        api._browser_ui_opened = True
+        _watch_page_close(api)
+    _startup_log("browser fallback: switched UI in-place; download backend preserved")
+    return {"ok": True, "pid": os.getpid(), "url": url, "backend_preserved": True}
 
 
 def _watch_page_close(api):
@@ -474,6 +558,13 @@ def _browser_mode():
         _startup_log("browser mode: interrupted, exit")
 
 
+def _launch_ui_mode(argv, cfg):
+    """正常启动遵循保存的偏好；显式 CLI 参数仅用于用户主动强制模式。"""
+    if '--browser' in argv:return 'browser'
+    if '--window' in argv:return 'window'
+    return 'browser' if cfg.get('ui_mode')=='browser' else 'window'
+
+
 def main():
     # 外部看门狗模式：必须在**任何重量级导入（pywebview/clr/pythonnet）之前**分流，
     # 保证看门狗进程完全不碰 .NET（那些东西正是会把 GIL 弄死的元凶）。
@@ -487,7 +578,7 @@ def main():
         _cfg = config.load()
     except Exception:
         _cfg = {}
-    if ("--browser" in sys.argv) or (_cfg.get("ui_mode") == "browser" and "--window" not in sys.argv):
+    if _launch_ui_mode(sys.argv,_cfg)=='browser':
         return _browser_mode()
 
     _startup_log("start: begin")
@@ -515,32 +606,6 @@ def main():
     BASE_DIR = _app_dir()
     INDEX = os.path.join(BASE_DIR, "web", "index.html")
 
-    def apply_mica():
-        """给窗口启用 Win11 Mica 背景（失败静默回退）"""
-        try:
-            import ctypes
-            from ctypes import wintypes
-            u = ctypes.windll.user32
-            pid = ctypes.windll.kernel32.GetCurrentProcessId()
-            found = []
-
-            def cb(h, _):
-                p = wintypes.DWORD()
-                u.GetWindowThreadProcessId(h, ctypes.byref(p))
-                if p.value == pid and u.IsWindowVisible(h):
-                    found.append(h)
-                return True
-
-            WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-            u.EnumWindows(WNDENUMPROC(cb), 0)
-            if found:
-                hwnd = ctypes.c_void_p(found[0])
-                # DWMWA_SYSTEMBACKDROP_TYPE=38, DWMSBT_MAINWINDOW=2 (Mica)
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, 38, ctypes.byref(ctypes.c_int(2)), ctypes.sizeof(ctypes.c_int))
-        except Exception:
-            pass
-
     def set_window_icon():
         """设置窗口标题栏图标（WinForms 原生方式，失败静默）"""
         try:
@@ -555,7 +620,11 @@ def main():
                     continue
                 f = form.FindForm() if hasattr(form, "FindForm") else form
                 if f is not None:
-                    f.Icon = Icon(icon_path)
+                    # 只在窗口显示后向 UI 线程投递，不从启动后台线程直接访问 WinForms。
+                    from System import Action
+                    def apply_icon(form=f):
+                        form.Icon = Icon(icon_path)
+                    f.BeginInvoke(Action(apply_icon))
         except Exception:
             pass
 
@@ -577,6 +646,10 @@ def main():
 
     api = webui.Api()
     _startup_log("Api() ok")
+    import browser_bridge
+    browser_bridge.set_api(api, os.path.join(BASE_DIR, "web"))
+    api._browser_ui_handler = lambda: _activate_browser_ui(api)
+    webview.settings["DRAG_REGION_DIRECT_TARGET_ONLY"] = True
     window = webview.create_window(
         "CivitaiFreeTool",
         url=INDEX,
@@ -585,7 +658,13 @@ def main():
         height=820,
         min_size=(980, 640),
         background_color="#1c1c1e",
+        easy_drag=False,  # 只允许显式拖动区；全窗 easy_drag 会抢走 select/字体菜单的鼠标。
+        frameless=bool(api.cfg.get("integrated_titlebar",True)) and api.cfg.get("window_appearance","theme") not in ("system","external"),
     )
+    from window_appearance import WindowAppearance
+    window_appearance = WindowAppearance(window)
+    api._window_appearance_handler = window_appearance.request
+    api._window_appearance_controller = window_appearance
     # Linux: force the Qt backend (QWebEngineView + QWebChannel, PySide6/PyQt6
     # bindings via qtpy). Best fit for KDE Plasma; GTK stack not needed.
     # Windows keeps the default EdgeChromium (WebView2) backend.
@@ -594,6 +673,7 @@ def main():
         start_kwargs["gui"] = "qt"
         _check_qt_backend()
     else:
+        start_kwargs["gui"] = "edgechromium"
         # WebView2 GPU 策略：**默认开启 GPU 加速**。
         # 曾（v2.1.12）无条件传 --disable-gpu 规避偶发建窗卡死，但软件渲染会让
         # WebGL 氛围背景（web/shader.js，全屏动画）跑满 CPU —— 用户实测 9950X3D 全核拉高、迅速升温，
@@ -627,6 +707,15 @@ def main():
     # 关窗行为：设置 close_action = exit（默认退出）/ minimize（最小化到任务栏，不退出）
     try:
         def _on_closing():
+            if getattr(api, '_settings_dirty', False):
+                def confirm_settings_close():
+                    try: window.evaluate_js("window.requestSettingsClose && window.requestSettingsClose()")
+                    except Exception: _startup_log("settings close confirmation unavailable; close deferred")
+                threading.Thread(target=confirm_settings_close,daemon=True).start()
+                return False
+            if getattr(api,"_storage_migrating",False):
+                _startup_log("close deferred: data migration running")
+                return False
             try:
                 import config as _cfgmod
                 act = (_cfgmod.load().get("close_action") or "exit").strip()
@@ -647,8 +736,21 @@ def main():
     # 进程内观察者：只记录窗口里程碑（重启已由独立进程看门狗负责——建窗死锁会饿死本线程）
     import threading
     threading.Thread(target=_watchdog_log_only, daemon=True).start()
+    def after_shown():
+        _startup_log("native window shown")
+        browser_bridge.set_ui_state(mode="window", window=_self_visible_window())
+        window_appearance.request({"mode": api.cfg.get("window_appearance", "theme"), "integrated": api.cfg.get("integrated_titlebar", True)})
+        set_window_icon()
+    window.events.shown += after_shown
+    initial_load = [True]
+    def after_loaded():
+        if initial_load[0]:
+            initial_load[0] = False
+            _reveal_initial_window(window)
+        _startup_log("native page loaded")
+        browser_bridge.set_ui_state(loaded=True, window=_self_visible_window() if posix_compat.IS_WINDOWS else True)
+    window.events.loaded += after_loaded
     webview.start(
-        lambda: (time.sleep(0.8), apply_mica(), set_window_icon()),
         debug=False,
         **start_kwargs,
     )

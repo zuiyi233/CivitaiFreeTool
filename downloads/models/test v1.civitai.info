@@ -1,0 +1,44 @@
+{
+  "id": null,
+  "modelId": null,
+  "name": "Test Model",
+  "type": "",
+  "nsfw": false,
+  "tags": [],
+  "creator": "",
+  "description": "",
+  "url": "https://civitai.red/models/None",
+  "stats": {
+    "downloadCount": null,
+    "favoriteCount": null,
+    "commentCount": null,
+    "rating": null,
+    "ratingCount": null
+  },
+  "versionId": null,
+  "baseModel": "",
+  "trainedWords": [],
+  "version": {
+    "id": null,
+    "name": "v1",
+    "baseModel": "",
+    "publishedAt": "",
+    "createdAt": "",
+    "updatedAt": "",
+    "description": ""
+  },
+  "files": [
+    {
+      "name": "test.safetensors",
+      "sizeKB": null,
+      "type": null,
+      "format": null,
+      "fp": null,
+      "hashes": {
+        "SHA256": "abc123"
+      },
+      "downloadUrl": "https://example.com/x.safetensors"
+    }
+  ],
+  "images": []
+}

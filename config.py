@@ -4,23 +4,27 @@ import json
 import os
 import copy
 import sys
+import tempfile
+import threading
+import shutil
 
-if getattr(sys, "frozen", False):
-    # PyInstaller onefile 模式：配置放 exe 同目录，而非解压临时目录
-    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+import data_storage
+INSTALL_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys,"frozen",False) else __file__))
+APP_DIR, STORAGE_WARNING = data_storage.resolve_directory(INSTALL_DIR, use_global=bool(getattr(sys,"frozen",False)))
 
 # 界面主题（必须与 web/style.css 的 [data-theme=...] 与 app.js 设置项保持一致）
-THEMES = ("dark", "dark_purple", "dark_blue", "dark_green", "dark_red",
+THEMES = ("dark", "dark_purple", "dark_blue", "dark_green", "dark_red", "dark_graphite", "dark_pink", "dark_rose",
           "light", "light_blue", "light_pink", "light_green", "modern", "metro")
 
 DEFAULTS = {
     "api_key": "",
-    "download_dir": os.path.join(APP_DIR, "downloads", "models"),
-    "models_dir": os.path.join(APP_DIR, "downloads", "models"),
+    "download_dir": os.path.join(INSTALL_DIR, "downloads", "models"),
+    "models_dir": os.path.join(INSTALL_DIR, "downloads", "models"),
     "models_dirs": [],               # 多模型目录（每行一个；WebUI 与 ComfyUI 分开时都填）
     "max_concurrent_downloads": 3,
+    "download_name_mode": "original",    # original / civitai / chinese
+    "filename_include_version": False,   # 模型名字-原始版本号.后缀
+    "multi_file_download": "ask",       # ask / first / all；无人操作 10 秒默认第一个
     "download_timeout": 300,
     "download_retry": 5,                 # 网络中断（SSL EOF/超时）自动重试次数，每次断点续传
     "auto_translate": True,
@@ -39,7 +43,19 @@ DEFAULTS = {
     "gen_metadata": True,               # 下载完成后自动生成 json/info
     "download_cover": True,             # 下载完成后自动下载封面
     "update_keep_old": "keep",           # 更新下载完成后旧版处理：keep=保留（默认）/ delete=移入回收站（可还原）
-    "window_wait_seconds": 12,           # 窗口模式等几秒没出来就自动换浏览器模式（用户可调）
+    "window_wait_seconds": 30,           # 窗口启动至少等待 30 秒，检测到进展可继续宽限
+    "browser_fallback_enabled": True,   # 原生窗口仍是默认；失败时允许浏览器兜底
+    "cache_detail_images": True,        # 详情在线缩略图本地缓存；不下载原图
+    "pointer_effects": "off",           # off / click / trail
+    "pointer_effect_quality": "low",   # 粒子/像素预算；帧率独立设置
+    "effects_fps_limit": 60,            # 0 跟随屏幕刷新；15–360 自定义上限
+    "cache_original_images": True,      # 已查看原图与生成数据保存到软件数据目录
+    "gallery_cache_mb": 1024,           # 自动淘汰最旧缓存，不移动模型文件
+    "model_favorites": [],             # 收藏置顶的本地模型路径
+    "model_toolbar_locked": False,
+    "onboarding_done": False,
+    "model_folder_visibility": {},     # 显式目录选择，更深层选择优先
+    "model_folder_include_subfolders": True,  # 默认递归包含子目录
     "hidden_model_folders": [],         # 模型管理目录中隐藏的子文件夹
     "show_root_models": True,           # 是否显示模型目录根目录下的模型
     "metadata_format": "sd",            # sd / civitai / both（WebUI 可读 json 的格式；.civitai.info 始终生成）
@@ -58,6 +74,29 @@ DEFAULTS = {
     "ui_zoom": 100,                     # 界面缩放百分比（80-150）
     "ui_scheme": "light",               # Metro 亮暗：light / dark / auto（跟随系统）
     "metro_accent": "#0078D4",          # Metro 主题色（#RRGGBB 或 system=跟随 Windows 主题色）
+    "show_file_paths": True,            # 名称下的路径（不隐藏目标列、选中目标及详情路径）
+    "folder_picker_favorites": [],
+    "folder_picker_folded": [],
+    "folder_picker_show_paths": False,  # 默认只显示目录名，可独立开关
+    "shortcuts_enabled": False,
+    "shortcuts_bindings": {},
+    "model_list_size": 3,               # 1 精简名称但保留信息列 / 2 无封面和作者 / 3 完整（现有最大）
+    "masonry_info_mode": "always",     # always / slide / fade
+    "masonry_overlay_size": "partial", # partial / full
+    "name_scroll_speed": 70,          # px/s
+    "name_scroll_start_pause": 350,   # ms
+    "name_scroll_end_pause": 250,     # ms
+    "masonry_card_width": 220,         # 瀑布流图片/卡片宽度，140–420
+    "ui_text_size": "standard",         # small / standard / large / xlarge / huge；不改变界面缩放
+    "integrated_titlebar": True,        # 应用内窗口栏；失败保留标准系统框
+    "window_appearance": "theme",       # theme / mica / mica_alt / system / external
+    "ui_font": "",                    # 空=软件默认；其他=已安装的本地字体族
+    "folder_picker_size": {},           # 分类选择器上次尺寸，占视口的比例，兼容界面缩放
+    "custom_accent_enabled": False,     # 所有主题均可覆盖强调色
+    "custom_accent": "#60A5FA",
+    "ui_density": "standard",          # compact / standard / comfortable
+    "ui_corners": "theme",             # theme / square / soft / rounded
+    "sidebar_collapsed": False,
     "rename_menu_default": "custom",
     "default_view": "waterfall",  # 模型管理默认视图 list / waterfall  # 修改名称按钮默认动作：custom/rename_c/localize
     "rename_clean_rules": "comma,paren",  # 改名/下载命名时清理符号：comma 逗号→空格 / paren 括号删除 / dash 横线下划线→空格
@@ -73,6 +112,16 @@ DEFAULTS = {
 
 CONFIG_PATH = os.path.join(APP_DIR, "user_config.json")
 TASKS_PATH = os.path.join(APP_DIR, "download_tasks.json")
+HISTORY_PATH = os.path.join(APP_DIR, "download_history.json")
+_json_write_lock = data_storage.LOCK
+
+def use_data_directory(directory):
+    global APP_DIR, CONFIG_PATH, TASKS_PATH, HISTORY_PATH, STORAGE_WARNING
+    APP_DIR = os.path.abspath(directory)
+    CONFIG_PATH = os.path.join(APP_DIR,"user_config.json")
+    TASKS_PATH = os.path.join(APP_DIR,"download_tasks.json")
+    HISTORY_PATH = os.path.join(APP_DIR,"download_history.json")
+    STORAGE_WARNING = ""
 
 # 旧工具配置（若用户安装过原赞助工具，自动导入 API key 等，避免重复配置）
 # 在常见位置查找，避免硬编码个人路径
@@ -134,6 +183,7 @@ def load():
     except Exception:
         pass
     _import_legacy(cfg)
+    if "download_name_mode" not in disk and cfg.get("translate_filename") is True: cfg["download_name_mode"] = "chinese"
     # 旧配置只有 dark_mode 时兼容为 theme
     if "theme" not in disk:
         if "dark_mode" in disk:
@@ -142,32 +192,93 @@ def load():
     # （踩过的坑：这里曾只认 dark/light/modern，导致「暮紫/樱粉」等新主题每次启动被改回 dark）
     if cfg.get("theme") not in THEMES:
         cfg["theme"] = "dark"
+    try:
+        cfg["window_wait_seconds"] = max(30, min(600, int(cfg.get("window_wait_seconds") or 30)))
+    except (TypeError, ValueError, OverflowError):
+        cfg["window_wait_seconds"] = 30
+    normalize_ui_preferences(cfg)
     return cfg
 
 
-def save(cfg):
+def normalize_ui_preferences(cfg):
+    if cfg.get("masonry_info_mode","always") not in ("always","slide","fade"):cfg["masonry_info_mode"]="always"
+    if cfg.get("masonry_overlay_size","partial") not in ("partial","full"):cfg["masonry_overlay_size"]="partial"
+    if cfg.get("download_name_mode", "original") not in ("original", "civitai", "chinese"): cfg["download_name_mode"] = "original"
+    cfg["filename_include_version"] = cfg.get("filename_include_version") is True
+    if cfg.get("multi_file_download", "ask") not in ("ask", "first", "all"): cfg["multi_file_download"] = "ask"
+    for key,default,lo,hi in [("max_concurrent_downloads",3,1,32),("effects_fps_limit",60,15,360),("gallery_cache_mb",1024,64,8192),("model_list_size",3,1,3),("name_scroll_speed",70,10,240),("name_scroll_start_pause",350,0,5000),("name_scroll_end_pause",250,0,5000)]:
+        try:value=int(cfg.get(key,default));cfg[key]=0 if key=="effects_fps_limit" and value==0 else max(lo,min(hi,value))
+        except (TypeError,ValueError,OverflowError):cfg[key]=default
+    cfg['shortcuts_enabled']=cfg.get('shortcuts_enabled') is True
+    legacy_shortcuts=cfg.pop("shortcuts_preset", None)
+    bindings=cfg.get('shortcuts_bindings')
+    cfg['shortcuts_bindings']={str(k)[:150]:v[:80] for k,v in list(bindings.items())[:2000] if isinstance(k,str) and isinstance(v,str)} if isinstance(bindings,dict) else {}
+    # 删除多预设入口；旧 W/S、J/K 用户的导航键迁移为普通自定义绑定，不自动开启。
+    legacy_navigation={"wasd":("W","S"),"vim":("K","J")}.get(legacy_shortcuts)
+    if legacy_navigation:
+        for command,key in zip(("model:previous","model:next"),legacy_navigation):cfg['shortcuts_bindings'].setdefault(command,key)
+    values=cfg.get("model_favorites")
+    cfg["model_favorites"]=list(dict.fromkeys(p for p in values if isinstance(p,str) and p.strip()))[:10000] if isinstance(values,list) else []
+
+
+def _save_json_atomic(path, value):
+    """同目录临时文件 + 原子替换，保留上次有效 JSON，避免退出/断电产生半个文件。"""
+    temp_path = None
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        with _json_write_lock:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(path)),
+                                             prefix=os.path.basename(path) + ".", suffix=".tmp", delete=False) as f:
+                temp_path = f.name
+                json.dump(value, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as previous:
+                        json.load(previous)
+                    shutil.copyfile(path, path + ".bak")
+                except (OSError, ValueError):
+                    pass
+            os.replace(temp_path, path)
+            temp_path = None
         return True
     except Exception:
         return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
-def load_tasks():
-    try:
-        if os.path.exists(TASKS_PATH):
-            with open(TASKS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
+def save(cfg):
+    return _save_json_atomic(CONFIG_PATH, cfg)
+
+
+def _load_json_list(path):
+    for candidate in (path, path + ".bak"):
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                value = json.load(f)
+            if isinstance(value, list):
+                return value
+        except (OSError, ValueError):
+            continue
     return []
 
 
+def load_tasks():
+    return _load_json_list(TASKS_PATH)
+
+
 def save_tasks(tasks):
-    try:
-        with open(TASKS_PATH, "w", encoding="utf-8") as f:
-            json.dump(tasks, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
+    return _save_json_atomic(TASKS_PATH, tasks)
+
+
+def load_history():
+    return _load_json_list(HISTORY_PATH)
+
+
+def save_history(history):
+    return _save_json_atomic(HISTORY_PATH, history)

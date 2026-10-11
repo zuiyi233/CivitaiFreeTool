@@ -1,0 +1,315 @@
+"""图片预览/生成数据：只解析来源已提供的信息，不推测缺失提示词或使用资源。"""
+import io
+import json
+import re
+from urllib.parse import urlsplit
+
+from comfy_metadata import PARSER_REVISION, extract_prompts
+
+LIMIT = 25 * 1024 * 1024
+
+# 原图和生成数据为私有运行数据；不进入源码/发行包。缓存失败不得影响查看。
+import hashlib
+import os
+import tempfile
+import threading
+from pathlib import Path
+_cache_lock = threading.RLock()
+
+def source_revision(item):
+    """仅用于检测来源变化，不暴露路径、链接参数或账号值。"""
+    source=str(item.get('url') or item.get('orig_url') or '')
+    if item.get('local_path'):
+        try:
+            st=os.stat(item['local_path']);source=str(Path(item['local_path']).resolve())+':'+str(st.st_mtime_ns)+':'+str(st.st_size)
+        except OSError:source=str(item['local_path'])+':missing'
+    if not source:source=hashlib.sha256(str(item.get('b64','')).encode()).hexdigest()
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+def cache_key(item, cfg, metadata=False):
+    if not cfg.get('cache_original_images', False):return None
+    source=item.get('url') or item.get('orig_url')
+    if item.get('local_path'):
+        try:
+            st=os.stat(item['local_path']);source=str(Path(item['local_path']).resolve())+':'+str(st.st_mtime_ns)+':'+str(st.st_size)
+        except OSError:return None
+    if not source:return None
+    if metadata:source += ':'+PARSER_REVISION+':meta:'+hashlib.sha256(str(cfg.get('api_key','')).encode()).hexdigest()
+    import config
+    return Path(config.APP_DIR)/'gallery_cache'/hashlib.sha256(source.encode()).hexdigest()
+
+def cache_load(item, cfg, kind):
+    key=cache_key(item,cfg,kind!='original')
+    if key is None:return None
+    p=key.with_suffix('.'+kind)
+    if key.parent.is_symlink() or p.is_symlink():return None
+    try:
+        with _cache_lock:
+            if p.stat().st_size>40*1024*1024:return None
+            data=p.read_bytes();os.utime(p,None)
+            if kind=='preview':
+                original=cache_key(item,cfg).with_suffix('.original')
+                if original.is_file() and not original.is_symlink():os.utime(original,None)
+        return data if kind=='original' else json.loads(data.decode(),parse_constant=lambda _:None)
+    except (OSError,ValueError,UnicodeError):return None
+
+def cache_store(item, cfg, kind, value):
+    key=cache_key(item,cfg,kind!='original')
+    if key is None:return
+    tmp=None
+    try:
+        data=value if isinstance(value,bytes) else json.dumps(value,ensure_ascii=False,allow_nan=False).encode()
+        if len(data)>40*1024*1024:return
+        with _cache_lock:
+            if key.parent.is_symlink():return
+            key.parent.mkdir(parents=True,exist_ok=True)
+            fd,tmp=tempfile.mkstemp(dir=key.parent,prefix='.gallery-',suffix='.tmp')
+            with os.fdopen(fd,'wb') as f:f.write(data)
+            os.replace(tmp,key.with_suffix('.'+kind));tmp=None
+            try:budget=max(64,min(8192,int(cfg.get('gallery_cache_mb') or 1024)))*1024*1024
+            except (ValueError,TypeError,OverflowError):budget=1024*1024*1024
+            files=[(p,p.stat()) for p in key.parent.iterdir() if p.suffix in ('.original','.preview','.metadata') and not p.is_symlink()]
+            total=sum(st.st_size for _,st in files)
+            for p,st in sorted(files,key=lambda v:v[1].st_mtime):
+                if total<=budget:break
+                p.unlink(missing_ok=True);total-=st.st_size
+    except (OSError,ValueError,TypeError):pass
+    finally:
+        if tmp:
+            try:os.unlink(tmp)
+            except OSError:pass
+
+def clear_cache():
+    import config
+    folder=Path(config.APP_DIR)/'gallery_cache';count=0
+    if folder.is_symlink():raise ValueError('缓存目录不能是符号链接')
+    with _cache_lock:
+        if folder.exists():
+            for p in folder.iterdir():
+                if p.is_file() and not p.is_symlink() and len(p.stem)==64 and p.suffix in ('.original','.preview','.metadata'):
+                    p.unlink();count+=1
+    return count
+
+def comfy_generation(graph):
+    """只读解析标准 ComfyUI API 图中实际连接的节点，不执行或猜测未知节点。"""
+    if not isinstance(graph,dict) or len(graph)>10000:return {}
+    sampler=next((n for n in graph.values() if isinstance(n,dict) and n.get('class_type') in ('KSampler','KSamplerAdvanced','SamplerCustom','SamplerCustomAdvanced')),None)
+    if not sampler:return extract_prompts(graph)
+    inputs=sampler.get('inputs') or {}
+    if not isinstance(inputs,dict):return {}
+    def nodes(reference):
+        seen=set();pending=[reference];out=[]
+        while pending and len(seen)<256:
+            value=pending.pop()
+            if not isinstance(value,list) or len(value)<2 or str(value[0]) not in graph:continue
+            key=str(value[0])
+            if key in seen:continue
+            seen.add(key);node=graph[key]
+            if not isinstance(node,dict):continue
+            out.append(node);values=node.get('inputs') or {}
+            if isinstance(values,dict):pending.extend(v for v in values.values() if isinstance(v,list))
+        return out
+    result=extract_prompts(graph)
+    for key in ('seed','noise_seed','steps','cfg','sampler_name','scheduler','denoise'):
+        value=inputs.get(key)
+        if isinstance(value,(str,int,float)) and not isinstance(value,bool):result[{'cfg':'cfgScale','sampler_name':'sampler','noise_seed':'seed'}.get(key,key)]=value
+    for node in nodes(inputs.get('latent_image')):
+        values=node.get('inputs') or {}
+        for key in ('width','height'):
+            if isinstance(values.get(key),(int,float)):result.setdefault(key,values[key])
+    resources=[]
+    for node in nodes(inputs.get('model')):
+        values=node.get('inputs') or {}
+        for field,kind in [('ckpt_name','CHECKPOINT'),('lora_name','LORA'),('unet_name','DIFFUSION_MODEL')]:
+            name=values.get(field)
+            if isinstance(name,str) and name:
+                resource={'name':name.replace('\\','/').split('/')[-1],'type':kind}
+                if resource not in resources:resources.append(resource)
+    if resources:result['resources']=resources
+    return result
+
+
+def resource_ids(resource):
+    """只读明确的模型/版本字段、站点模型 URL 和 AIR，不把普通数字名字当模型 ID。"""
+    from urllib.parse import parse_qs
+    model=resource.get('model');version=resource.get('modelVersion')
+    mid=resource.get('modelId') or (model.get('id') if isinstance(model,dict) else None)
+    vid=resource.get('modelVersionId') or resource.get('versionId') or (version.get('id') if isinstance(version,dict) else None)
+    for value in [resource.get(k) for k in ('air','resource','urn','name','url','modelUrl','modelPage')]:
+        if not isinstance(value,str): continue
+        air=re.search(r'urn:air:[^\s:]+:[^\s:]+:civitai:(\d+)@(\d+)',value)
+        if air: mid=mid or air[1];vid=vid or air[2]
+        parsed=urlsplit(value)
+        if parsed.hostname in ('civitai.com','civitai.red','www.civitai.com','www.civitai.red'):
+            match=re.match(r'^/models/(\d+)(?:/|$)',parsed.path)
+            if match: mid=mid or match[1]
+            q=parse_qs(parsed.query);vid=vid or (q.get('modelVersionId') or [None])[0]
+            match=re.match(r'^/model-versions/(\d+)(?:/|$)',parsed.path)
+            if match: vid=vid or match[1]
+    return (int(mid) if str(mid or '').isdigit() and int(mid)>0 else None,int(vid) if str(vid or '').isdigit() and int(vid)>0 else None)
+
+
+def generation(image=None, local_path=None, saved=None):
+    image=image if isinstance(image,dict) else {}
+    meta=dict(image.get('meta') or {}) if isinstance(image.get('meta'),dict) else {}
+    source=image.get('metadata_source') or ('C站模型信息缓存' if meta else '未提供生成数据')
+    data=saved if isinstance(saved,dict) else {}
+    if local_path and saved is None:
+        try:
+            from PIL import Image
+            with Image.open(local_path) as im:data=dict(im.info)
+        except Exception:pass
+    parameters=data.get('parameters') or meta.get('parameters')
+    if isinstance(parameters,str) and parameters.strip():
+        parts=re.split(r'\n(?=Steps:\s*\d)',parameters,maxsplit=1)
+        positive,_,negative=parts[0].partition('\nNegative prompt:')
+        meta.update({'prompt':positive.strip(),'negativePrompt':negative.strip()})
+        if len(parts)>1:
+            for key,value in re.findall(r'(?:^|,\s*)([^:,]+):\s*([^,]+)',parts[1]):meta[key.strip()]=value.strip()
+        embedded=re.search(r'(?:^|,\s*)Civitai resources:\s*(\[.*)',parameters,re.S)
+        if embedded:
+            try:
+                values,_=json.JSONDecoder().raw_decode(embedded[1])
+                if isinstance(values,list):meta['civitaiResources']=values
+            except (ValueError,TypeError):pass
+        source='原图内嵌 PNG parameters'  if saved is not None else '本地图片 PNG parameters'
+    elif data.get('prompt') or data.get('workflow'):
+        for key in ('prompt','workflow'):
+            value=data.get(key)
+            if value:
+                try:value=json.loads(value,parse_constant=lambda _:None) if isinstance(value,str) else value
+                except (ValueError,TypeError):pass
+                meta['comfyPrompt' if key=='prompt' and isinstance(value,dict) else key]=value
+        source='原图内嵌 ComfyUI 元数据' if saved is not None else '本地图片 ComfyUI 元数据'
+    else:
+        comment=data.get('UserComment') or data.get('comment')
+        if isinstance(comment,bytes):comment=comment.removeprefix(b'ASCII\0\0\0').decode('utf-8',errors='replace')
+        if isinstance(comment,str):
+            try:
+                fields=json.loads(comment,parse_constant=lambda _:None)
+                if isinstance(fields,dict):meta.update(fields);source='原图内嵌 EXIF/Comment 元数据'
+            except (ValueError,TypeError):pass
+    if isinstance(meta.get('comfyPrompt'),dict):
+        for key,value in comfy_generation(meta['comfyPrompt']).items():
+            if key in ('prompt','negativePrompt','promptExtractionNote'):meta[key]=value
+            else:meta.setdefault(key,value)
+    elif isinstance(meta.get('workflow'),dict):
+        meta.update(extract_prompts(workflow=meta['workflow']))
+    resources=meta.get('civitaiResources') or image.get('resources') or meta.get('resources') or []
+    if not isinstance(resources,list):resources=[]
+    return {'meta':meta,'resources':[v for v in resources if isinstance(v,dict)],'metadata_source':source,
+            'image_id':image.get('id') or image.get('image_id'),'width':image.get('width'),'height':image.get('height'),
+            'metadata_note':meta.get('promptExtractionNote',''),
+            'orig_url':image.get('url') or image.get('orig_url') or '',
+            'image_page':image.get('image_page') or ('https://civitai.com/images/'+str(image['id']) if str(image.get('id','')).isdigit() else '')}
+
+
+def original_url(url):
+    parsed=urlsplit(str(url or ''))
+    if parsed.scheme != 'https' or parsed.hostname != 'image.civitai.com' or parsed.username or parsed.password:
+        raise ValueError('仅支持 C站官方图片 CDN 的 HTTPS 地址')
+    return re.sub(r'/(?:width=[^/]+|original=true[^/]*)/', '/original=true/',url)
+
+def read_bytes(item, cfg):
+    cached=cache_load(item,cfg,'original')
+    if cached:
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(cached)) as im:
+                fmt=im.format;w,h=im.size;im.verify()
+            if fmt in ('PNG','JPEG','WEBP','GIF') and len(cached)<=LIMIT:return cached,fmt,w,h,True
+        except Exception:pass
+    if item.get('local_path'):
+        with open(item['local_path'],'rb') as f:data=f.read(LIMIT+1)
+        original=True
+    elif item.get('url'):
+        import urllib.request
+        import civitai_api
+        proxy=cfg.get('proxy_address') if cfg.get('proxy_enabled') else None
+        opener=civitai_api.build_opener(proxy,verify=cfg.get('ssl_verify',True))
+        req=urllib.request.Request(original_url(item['url']),headers={'User-Agent':'Mozilla/5.0','Referer':'https://civitai.com/'})
+        with opener.open(req,timeout=25) as r:data=r.read(LIMIT+1)
+        original=True
+    elif item.get('b64'):
+        import base64
+        data=base64.b64decode(item['b64'],validate=True);original=False
+    else:raise ValueError('没有可查看的图片来源')
+    if len(data)>LIMIT:raise ValueError('图片超过 25 MB，建议在 C站原图页查看')
+    from PIL import Image
+    with Image.open(io.BytesIO(data)) as im:
+        if im.format not in ('PNG','JPEG','WEBP','GIF'):raise ValueError('不支持的图片格式')
+        width,height=im.size;fmt=im.format
+        im.verify()
+    if original:cache_store(item,cfg,'original',data)
+    return data,fmt,width,height,original
+
+def preview(item,cfg):
+    from PIL import Image
+    import base64
+    cached=cache_load(item,cfg,'preview')
+    if isinstance(cached,dict) and cached.get('ok') and cached.get('b64'):
+        try:
+            raw=base64.b64decode(cached['b64'],validate=True)
+            with Image.open(io.BytesIO(raw)) as im:im.verify()
+            return {**cached,'cache_hit':True}
+        except Exception:pass
+    data,fmt,w,h,original=read_bytes(item,cfg)
+    with Image.open(io.BytesIO(data)) as im:
+        saved=dict(im.info)
+        try:saved['UserComment']=im.getexif().get(0x9286) or saved.get('UserComment')
+        except Exception:pass
+        fields=generation(item,saved=saved)
+        im=im.convert('RGBA' if 'A' in im.getbands() else 'RGB');im.thumbnail((4096,4096))
+        buf=io.BytesIO();im.save(buf,'PNG' if im.mode=='RGBA' else 'JPEG',**({} if im.mode=='RGBA' else {'quality':94}))
+        mime='image/png' if im.mode=='RGBA' else 'image/jpeg'
+    result={'ok':True,'b64':base64.b64encode(buf.getvalue()).decode(),'mime':mime,'width':w,'height':h,
+            'original_available':original,'preview_limited':max(w,h)>4096,
+            'meta':fields['meta'],'resources':fields['resources'],'metadata_source':fields['metadata_source'],
+            'metadata_note':fields.get('metadata_note','')}
+    if original:cache_store(item,cfg,'preview',result)
+    return result
+
+
+def clipboard_dib(data):
+    """将受限图片转换成真正的 CF_DIB，不能把 JPEG blob 标成 image/png。"""
+    from PIL import Image
+    if not isinstance(data,bytes) or len(data)>LIMIT:raise ValueError('图片数据无效或过大')
+    with Image.open(io.BytesIO(data)) as im:
+        if im.width*im.height>4096*4096:raise ValueError('复制预览尺寸过大')
+        image=im.convert('RGB');out=io.BytesIO();image.save(out,format='BMP');image.close()
+    return out.getvalue()[14:]  # CF_DIB 不包含 BITMAPFILEHEADER。
+
+
+def copy_clipboard_image(data, owner=0):
+    import sys
+    if sys.platform!='win32' or not owner:return False  # 其他平台由网页 PNG ClipboardItem 兜底。
+    dib=clipboard_dib(data)
+    import ctypes,time
+    u,k=ctypes.WinDLL('user32',use_last_error=True),ctypes.WinDLL('kernel32',use_last_error=True)
+    u.OpenClipboard.argtypes=[ctypes.c_void_p];u.OpenClipboard.restype=ctypes.c_bool
+    u.EmptyClipboard.restype=ctypes.c_bool
+    u.SetClipboardData.argtypes=[ctypes.c_uint,ctypes.c_void_p];u.SetClipboardData.restype=ctypes.c_void_p
+    u.CloseClipboard.restype=ctypes.c_bool
+    k.GlobalAlloc.argtypes=[ctypes.c_uint,ctypes.c_size_t];k.GlobalAlloc.restype=ctypes.c_void_p
+    k.GlobalLock.argtypes=[ctypes.c_void_p];k.GlobalLock.restype=ctypes.c_void_p
+    k.GlobalUnlock.argtypes=[ctypes.c_void_p];k.GlobalFree.argtypes=[ctypes.c_void_p]
+    k.GlobalFree.restype=ctypes.c_void_p
+    handle=k.GlobalAlloc(0x42,len(dib))
+    if not handle:return False
+    try:
+        pointer=k.GlobalLock(handle)
+        if not pointer:return False
+        try:ctypes.memmove(pointer,dib,len(dib))
+        finally:k.GlobalUnlock(handle)
+        for attempt in range(5):
+            if u.OpenClipboard(ctypes.c_void_p(owner)):break
+            time.sleep(.04)
+        else:return False
+        try:
+            if not u.EmptyClipboard():return False
+            if not u.SetClipboardData(8,handle):return False  # CF_DIB，所有权交给系统。
+            handle=None;return True
+        finally:u.CloseClipboard()
+    finally:
+        if handle:k.GlobalFree(handle)

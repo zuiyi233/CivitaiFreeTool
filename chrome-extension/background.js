@@ -1,5 +1,6 @@
-// background.js —— SW 消息路由 + offscreen 管理 + 写盘通道 + bridge 客户端（MV3 module）
-// 保留旧逻辑：右键菜单 "cft-dl" → downloadUrl（badge 反馈）原样不动。
+// background.js —— SW 消息路由 + 批量提交 + offscreen 管理 + 写盘通道 + bridge 客户端（MV3 module）
+// 上游 v1.3.0 能力：批量标签页提交（cft-batch-start/status/clear）+ tabs-common.js 抽取，完整保留；
+// 归档助手 2.0 能力：CFT_* 信封路由 / ensureOffscreen / writeFile 降级 / bridge 客户端 / 一键归档入口，并接入新消息总线。
 import './lib/util.js';
 import './lib/civitai-api.js';
 import './lib/scheduler.js';
@@ -7,18 +8,95 @@ import './lib/idb.js';
 import './lib/history.js';
 import './lib/config.js';
 import './lib/log.js';
+import './tabs-common.js';
 
+const ext = typeof browser !== 'undefined' ? browser : chrome;
 const BRIDGE = 'http://127.0.0.1:47531';
 const CIVITAI_RE = /^https?:\/\/(www\.)?civitai\.(red|com)\/(api\/download\/)?models\//i;
 const OFFSCREEN_URL = 'offscreen/archive-worker.html';
 const RAW_SIZE_SOFTWARE_MAX = 32 * 1024 * 1024; // 软件通道原始大小上限
 const RAW_SIZE_DOWNLOADS_MAX = 20 * 1024 * 1024; // downloads 降级上限
 const ARCHIVE_CONFIG_TTL_MS = 30 * 1000; // getArchiveConfig 缓存 30s
+const STORE = 'lastBatch';
+
+// 批量提交状态（上游 v1.3.0）
+let job = null, starting = false;
 
 function bgLog(lvl, msg, err) {
   try { CFT.log.log(lvl, 'bg', msg, err); } catch (_) {}
 }
 CFT.config.load().then(() => bgLog('info', 'background 启动，配置已加载')).catch(() => {});
+
+// ---- 批量提交：上次批次恢复（上游 v1.3.0） ----
+const ready = (async () => {
+  const old = (await ext.storage.local.get(STORE))[STORE];
+  if (old) {
+    job = old;
+    if (job.running) {
+      job.running = false;
+      for (const row of job.items) {
+        if (row.status === 'sending') {row.status = 'uncertain'; row.msg = '提交中断，请先在 CFT 核对，避免重复下载';}
+        else if (row.status === 'waiting') {row.status = 'failed'; row.msg = '尚未提交，可重新勾选';}
+      }
+      await save();
+    }
+  }
+})();
+
+// badge：ms 可选。缺省持久显示（批量 job 常驻徽标）；传 ms 则到时自动清除（归档反馈）
+function badge(text, color, ms) {
+  ext.action.setBadgeText({ text }).catch(() => {});
+  ext.action.setBadgeBackgroundColor({ color }).catch(() => {});
+  if (ms) setTimeout(() => { ext.action.setBadgeText({ text: '' }).catch(() => {}); }, ms);
+}
+async function save() { await ext.storage.local.set({ [STORE]: job }); }
+async function post(url) {
+  const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const res = await fetch(BRIDGE + '/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }), signal: ctrl.signal });
+    const data = await res.json();
+    return res.ok && data.ok ? { status: 'sent', msg: '已提交，在 CFT 查看解析结果' } : { status: 'failed', msg: data.msg || 'CFT 未接受请求' };
+  } catch (_) {
+    // The server may have accepted it before the response was lost. Never retry implicitly.
+    return { status: 'uncertain', msg: '未收到确认，请在 CFT 核对后再发送' };
+  } finally { clearTimeout(timer); }
+}
+async function run() {
+  try {
+    for (const row of job.items) {
+      row.status = 'sending'; await save();
+      Object.assign(row, await post(row.url)); await save();
+      badge(String(job.items.filter(r => r.status === 'sent').length), '#0a84ff');
+    }
+  } catch (_) {
+    for (const row of job.items) {
+      if (row.status === 'sending') { row.status = 'uncertain'; row.msg = '提交中断，请在 CFT 核对'; }
+      else if (row.status === 'waiting') { row.status = 'failed'; row.msg = '尚未提交'; }
+    }
+  } finally {
+    job.running = false; await save();
+    const sent = job.items.filter(r => r.status === 'sent').length;
+    badge(sent === job.items.length ? '✓' : '!', sent === job.items.length ? '#0a84ff' : '#c23d50');
+    ext.action.setTitle({ title: `已提交 ${sent}/${job.items.length}，点击图标查看结果` }).catch(() => {});
+  }
+}
+async function start(urls) {
+  await ready;
+  if (starting || job?.running) return { ok: false, msg: '上一批正在提交，请稍候', job };
+  starting = true;
+  try {
+    if (!Array.isArray(urls) || !urls.length || urls.length > 500) return { ok: false, msg: '请勾选 1–500 个模型页' };
+    const links = urls.map(CftTabs.modelLink);
+    if (links.some(v => !v)) return { ok: false, msg: '含无效模型链接，未发送任何页面' };
+    const completedKeys = [...new Set([...(job?.completedKeys || []), ...(job?.items || []).filter(r => ['sent', 'uncertain'].includes(r.status)).map(r => r.key)])];
+    const items = [...new Map(links.map(v => [v.key, { ...v, status: 'waiting', msg: '' }])).values()].filter(r => !completedKeys.includes(r.key));
+    if (!items.length) return { ok: false, msg: '这些页面已提交或待核对；如确需再次发送，请先清除提交记录' };
+    job = { id: Date.now().toString(), running: true, completedKeys, items };
+    await save();
+    void run();
+    return { ok: true, job };
+  } finally { starting = false; }
+}
 
 // ---- 通用 bridge 请求（GET/POST，超时抛错，调用方处理） ----
 async function bridgeFetch(path, opts) {
@@ -39,63 +117,13 @@ async function bridgeFetch(path, opts) {
   }
 }
 
-// ---- 旧逻辑保留：badge / postDownload / downloadUrl ----
-function badge(text, color, ms) {
-  try {
-    chrome.action.setBadgeText({ text });
-    chrome.action.setBadgeBackgroundColor({ color });
-    setTimeout(() => chrome.action.setBadgeText({ text: '' }), ms || 3000);
-  } catch (_) {}
-}
-
-async function postDownload(url) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 6000);
-  try {
-    const res = await fetch(BRIDGE + '/api/download', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
-      signal: ctrl.signal,
-    });
-    const data = await res.json().catch(() => ({}));
-    return { httpOk: res.ok, ...data };
-  } catch (e) {
-    return { httpOk: false, msg: '无法连接 CivitaiFreeTool（请先打开软件）' };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function downloadUrl(url) {
-  if (!url || !CIVITAI_RE.test(url)) {
-    badge('!', '#d93025', 3000);
-    chrome.action.setTitle({ title: '当前页面不是 Civitai 模型页' });
-    return;
-  }
-  const r = await postDownload(url);
-  if (r.httpOk && r.ok) {
-    badge('✓', '#1a73e8', 3000);
-    chrome.action.setTitle({ title: '已开始下载，可在 CivitaiFreeTool 下载管理查看' });
-  } else if (r.httpOk && !r.ok) {
-    badge('!', '#d93025', 3000);
-    chrome.action.setTitle({ title: r.msg || '下载启动失败' });
-  } else {
-    badge('!', '#d93025', 3000);
-    chrome.action.setTitle({ title: r.msg || '无法连接 CivitaiFreeTool' });
-  }
-}
-
-// 右键菜单：页面 / 链接上「一键下载到 CivitaiFreeTool」（旧逻辑保留）
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
-    id: 'cft-dl',
-    title: '一键下载到 CivitaiFreeTool',
-    contexts: ['page', 'link'],
-  });
+// 右键菜单：页面 / 链接 → 批量提交入口（上游 v1.3.0）
+ext.runtime.onInstalled.addListener(() => {
+  ext.contextMenus.removeAll(() => ext.contextMenus.create({ id: 'cft-dl', title: '发送到 CivitaiFreeTool', contexts: ['page', 'link'] }));
 });
-chrome.contextMenus.onClicked.addListener((info) => {
-  downloadUrl(info.linkUrl || info.pageUrl);
+ext.contextMenus.onClicked.addListener(info => {
+  if (info.menuItemId !== 'cft-dl') return;
+  start([info.linkUrl || info.pageUrl]).then(r => { if (!r.ok) { badge('!', '#c23d50'); ext.action.setTitle({ title: r.msg }); } }).catch(() => badge('!', '#c23d50'));
 });
 
 // ---- offscreen 管理（并发防抖 + 已存在竞态兜底） ----
@@ -326,43 +354,60 @@ function forwardSaveSingleImage(payload, sender, sendResponse) {
   });
 }
 
-// ---- onMessage 总线：只处理 to==='bg'，其余放行 ----
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || msg.__cft !== true) return false;
-  if (msg.to !== 'bg') return false;
-  const type = msg.type;
-  const payload = msg.payload || {};
-  (async () => {
-    switch (type) {
-      case 'startArchive':
-        await handleStartArchive(payload, sendResponse);
-        break;
-      case 'getArchiveConfig':
-        sendResponse(await handleGetArchiveConfig());
-        break;
-      case 'writeFile':
-        sendResponse(await handleWriteFile(payload));
-        break;
-      case 'sendModelToSoftware':
-        sendResponse(await handleSendModelToSoftware(payload));
-        break;
-      case 'checkLibrary':
-        sendResponse(await handleCheckLibrary(payload));
-        break;
-      case 'notifyArchiveDone':
-        sendResponse(await handleNotifyArchiveDone(payload));
-        break;
-      case 'saveSingleImage':
-        forwardSaveSingleImage(payload, sender, sendResponse);
-        break;
-      default:
-        sendResponse({ ok: false, msg: '未知消息类型: ' + type });
-    }
-  })().catch((e) => {
-    bgLog('error', 'bg 消息处理异常: ' + type, e);
-    try {
-      sendResponse({ ok: false, msg: String((e && e.message) || e) });
-    } catch (_) {}
-  });
-  return true;
+// ---- onMessage 总线：归档信封 {__cft:true,to:'bg'} + 上游批量 cft-batch-*，互不覆盖 ----
+ext.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (!msg) return false;
+  // 归档助手信封
+  if (msg.__cft === true && msg.to === 'bg') {
+    const type = msg.type;
+    const payload = msg.payload || {};
+    (async () => {
+      switch (type) {
+        case 'startArchive':
+          await handleStartArchive(payload, respond);
+          break;
+        case 'getArchiveConfig':
+          respond(await handleGetArchiveConfig());
+          break;
+        case 'writeFile':
+          respond(await handleWriteFile(payload));
+          break;
+        case 'sendModelToSoftware':
+          respond(await handleSendModelToSoftware(payload));
+          break;
+        case 'checkLibrary':
+          respond(await handleCheckLibrary(payload));
+          break;
+        case 'notifyArchiveDone':
+          respond(await handleNotifyArchiveDone(payload));
+          break;
+        case 'saveSingleImage':
+          forwardSaveSingleImage(payload, sender, respond);
+          break;
+        default:
+          respond({ ok: false, msg: '未知消息类型: ' + type });
+      }
+    })().catch((e) => {
+      bgLog('error', 'bg 消息处理异常: ' + type, e);
+      try {
+        respond({ ok: false, msg: String((e && e.message) || e) });
+      } catch (_) {}
+    });
+    return true;
+  }
+  // 上游 v1.3.0 批量提交消息
+  if (sender.id === ext.runtime.id && ['cft-batch-start', 'cft-batch-status', 'cft-batch-clear'].includes(msg.type)) {
+    (async () => {
+      await ready;
+      if (msg.type === 'cft-batch-clear') {
+        if (starting || job?.running) return { ok: false, msg: '提交中不能清除记录' };
+        job = null; await save(); badge('', '#0a84ff');
+        return { ok: true, job };
+      }
+      return msg.type === 'cft-batch-start' ? start(msg.urls) : { ok: true, job };
+    })()
+      .then(respond, () => respond({ ok: false, msg: '扩展状态读取失败，请重新加载扩展' }));
+    return true;
+  }
+  return false;
 });

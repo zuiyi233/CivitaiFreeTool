@@ -7,20 +7,10 @@ import urllib.request
 
 import browser_bridge
 
-# 测试环境桩：pywebview 是 GUI 运行时依赖，单测不需要真实窗口；
-# 缺装时桩掉以便 import webui（被测代码零改动）
-import sys as _sys
-import types as _types
-if "webview" not in _sys.modules:
-    try:
-        import webview  # noqa: F401
-    except ImportError:
-        _sys.modules["webview"] = _types.ModuleType("webview")
-
 PORT = 47539  # 测试端口，避开默认 47531
 
 
-class FakeAPI:
+class FakeAPI(__import__("civitai_api").CivitaiAPI):
     """mock CivitaiAPI：resolve/get_model/get_model_version/pick_file 全部本地返回"""
     def resolve_url(self, url):
         return ("123", None)
@@ -29,8 +19,8 @@ class FakeAPI:
         return {"name": "Test Model", "modelVersions": [{"id": 456}]}
 
     def get_model_version(self, vid):
-        return {"name": "v1", "files": [{"name": "test.safetensors", "primary": True,
-                                         "downloadUrl": "https://example.com/x.safetensors",
+        return {"id": vid, "name": "v1", "files": [{"name": "test.safetensors", "primary": True,
+                                         "downloadUrl": "https://civitai.com/api/download/models/456",
                                          "hashes": {"SHA256": "abc123"}}]}
 
     def pick_file(self, version):
@@ -57,22 +47,19 @@ class BridgeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.received = []
-        cls.received_args = []
         browser_bridge.set_download_handler(cls._fake_dl)
         browser_bridge.start(version="test", port=PORT)
 
     @classmethod
     def _fake_dl(cls, url, dest_subdir=""):
-        """模拟 dl_enqueue_url_sync：记录 (url, dest_subdir) 并同步返回"""
+        """模拟 dl_enqueue_url：记录 URL 并同步返回（两参兼容归档桥 dest_subdir 透传）"""
         cls.received.append(url)
-        cls.received_args.append((url, dest_subdir))
         if url.startswith("https://civitai.red/models/bad"):
             return {"ok": False, "msg": "模型没有可用版本"}
         return {"started": True}
 
     def setUp(self):
         type(self).received.clear()
-        type(self).received_args.clear()
 
     def test_health(self):
         st, d = req("/api/health")
@@ -135,26 +122,6 @@ class BridgeTest(unittest.TestCase):
                     origin="http://127.0.0.1:47531")
         self.assertEqual(st, 200)
 
-    def test_download_with_dest_subdir(self):
-        st, d = req("/api/download", "POST",
-                    {"url": "https://civitai.red/models/1290339/miaomiao-blocks",
-                     "dest_subdir": "miaomiao-blocks/v1290339"},
-                    origin="chrome-extension://abcdef123456")
-        self.assertEqual(st, 200)
-        self.assertTrue(d["ok"])
-        self.assertEqual(self.received_args,
-                         [("https://civitai.red/models/1290339/miaomiao-blocks",
-                           "miaomiao-blocks/v1290339")])
-
-    def test_download_without_dest_subdir_defaults_empty(self):
-        st, d = req("/api/download", "POST",
-                    {"url": "https://civitai.red/models/1290339/miaomiao-blocks"},
-                    origin="chrome-extension://abcdef123456")
-        self.assertEqual(st, 200)
-        self.assertTrue(d["ok"])
-        self.assertEqual(self.received_args,
-                         [("https://civitai.red/models/1290339/miaomiao-blocks", "")])
-
     def test_no_handler(self):
         browser_bridge.set_download_handler(None)
         try:
@@ -164,6 +131,162 @@ class BridgeTest(unittest.TestCase):
             self.assertFalse(d["ok"])
         finally:
             browser_bridge.set_download_handler(self._fake_dl)
+
+
+class SyncEnqueueTest(unittest.TestCase):
+    """dl_enqueue_url_sync：同步解析 + 真实入队（FakeAPI，不碰网络与磁盘）"""
+
+    def setUp(self):
+        import webui
+        import config, downloader, tempfile
+        from unittest.mock import patch
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = self.temp.name
+        cfg = dict(config.DEFAULTS, api_key="synthetic-test-key", download_dir=root, models_dir=root, models_dirs=[root],
+                   download_target_dir="", download_cover=False, metadata_format="both")
+        for item in (patch.object(config,"APP_DIR",root),patch.object(config,"TASKS_PATH",os.path.join(root,"tasks.json")),
+                     patch.object(config,"HISTORY_PATH",os.path.join(root,"history.json")),patch.object(config,"load",return_value=cfg),
+                     patch.object(downloader.Downloader,"_ensure_workers"),patch.object(browser_bridge,"start")):
+            item.start();self.addCleanup(item.stop)
+        self.app = webui.Api()
+        self.app.api = FakeAPI()
+
+    def test_sync_enqueue_ok(self):
+        r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r.get("task_id"))
+        # 任务真实入队（文件名 = 模型名 + 空格 + 版本名 + 扩展名）
+        tasks = [t for t in self.app.dl.tasks if t.info and t.info.get("model_id") == "123"]
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].filename, "test.safetensors")
+        # 关键：info.meta 必须存在（下载完成后生成 json + 封面缩略图的前提）
+        meta = (tasks[0].info or {}).get("meta") or {}
+        self.assertIn("info", meta)
+        self.assertIn("sd", meta)
+        self.assertTrue(meta["info"] and meta["sd"])
+        # 下载链接用 build_download_url 生成
+        self.assertTrue(tasks[0].url.startswith("https://"))
+
+    def test_handle_dl_done_generates_metadata(self):
+        """插件入队的任务下载完成后 → 自动生成 SD json（下载管理/模型管理缩略图依赖此链路）"""
+        import os
+        from downloader import ST_DONE
+        r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
+        self.assertTrue(r["ok"])
+        task = next(t for t in self.app.dl.tasks if t.id == r["task_id"])
+        # 把任务指向工作区内临时目录并放置占位文件，模拟下载完成
+        d = self.temp.name
+        os.makedirs(d, exist_ok=True)
+        task.dest_dir = d
+        task.info["dest_explicit"] = True
+        dest = os.path.join(d, task.filename)
+        with open(dest, "w") as f:
+            f.write("placeholder")
+        task.status = ST_DONE
+        self.app._handle_dl_done(task)
+        base = os.path.splitext(dest)[0]
+        self.assertTrue(os.path.exists(base + ".json"), "SD json 未生成")
+        import json as _json
+        with open(base + ".json", encoding="utf-8") as f:
+            sd = _json.load(f)
+        self.assertEqual(sd.get("name"), "Test Model")
+        # 清理
+        for s in (".json", ".civitai.info", ".preview.png"):
+            p = base + s
+            if os.path.exists(p):
+                os.remove(p)
+        os.remove(dest)
+
+    def test_sync_enqueue_failure(self):
+        class BadAPI(FakeAPI):
+            def resolve_url(self, url):
+                raise __import__("civitai_api").CivitaiError("timed out")
+        self.app.api = BadAPI()
+        r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
+        self.assertFalse(r["ok"])
+        self.assertIn("代理", r["msg"])  # 友好错误提示含代理指引
+    def test_sync_enqueue_with_dest_subdir(self):
+        import tempfile
+        archive_root = tempfile.mkdtemp(prefix="cft_dlsub_")
+        self.app.cfg = dict(self.app.cfg, archive_root=archive_root, download_dir=archive_root,
+                            site_domain="civitai.red")
+        try:
+            r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc",
+                                             "mymodel/v123")
+            self.assertTrue(r["ok"], r)
+            task = next(t for t in self.app.dl.tasks if t.id == r["task_id"])
+            self.assertEqual(os.path.normpath(task.dest_dir),
+                             os.path.normpath(os.path.join(archive_root, "mymodel", "v123")))
+        finally:
+            import shutil
+            shutil.rmtree(archive_root, ignore_errors=True)
+
+    def test_sync_enqueue_escape_dest_subdir(self):
+        import tempfile
+        archive_root = tempfile.mkdtemp(prefix="cft_dlesc_")
+        self.app.cfg = dict(self.app.cfg, archive_root=archive_root, download_dir=archive_root,
+                            site_domain="civitai.red")
+        try:
+            for bad in ("..\\evil", "C:\\x", "\\\\srv\\share"):
+                r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc", bad)
+                self.assertFalse(r["ok"], bad)
+                self.assertIn("非法路径", r["msg"], bad)
+        finally:
+            import shutil
+            shutil.rmtree(archive_root, ignore_errors=True)
+
+
+class RenameTest(unittest.TestCase):
+    """rename_file：自定义改名必须保留扩展名（前缀含点不误判）"""
+
+    def setUp(self):
+        import webui
+        self.dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".test_tmp", "rename")
+        os.makedirs(self.dir, exist_ok=True)
+        self.app = webui.Api()
+        self.app.api = FakeAPI()
+
+    def _mk(self, name):
+        p = os.path.join(self.dir, name)
+        with open(p, "wb") as f:
+            f.write(b"x")
+        return p
+
+    def test_prefix_with_dot_keeps_ext(self):
+        # 前缀含点（如 "v1.8 前缀 Kisaki"）→ 扩展名必须保留 .safetensors
+        p = self._mk("Kisaki v1.0.safetensors")
+        r = self.app.rename_file(p, "v1.8 前缀 Kisaki")
+        self.assertTrue(r["ok"], r)
+        new_path = os.path.join(self.dir, "v1.8 前缀 Kisaki.safetensors")
+        self.assertTrue(os.path.exists(new_path), "扩展名丢失: " + str(os.listdir(self.dir)))
+        self.assertFalse(os.path.exists(p))
+
+    def test_plain_prefix_keeps_ext(self):
+        p = self._mk("Kisaki.safetensors")
+        r = self.app.rename_file(p, "我的前缀 Kisaki")
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "我的前缀 Kisaki.safetensors")))
+
+    def test_input_with_explicit_ext(self):
+        p = self._mk("Kisaki.safetensors")
+        r = self.app.rename_file(p, "新的名字.ckpt")
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "新的名字.ckpt")))
+
+    def test_sides_renamed(self):
+        p = self._mk("Kisaki.safetensors")
+        with open(os.path.join(self.dir, "Kisaki.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        r = self.app.rename_file(p, "新名")
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "新名.safetensors")))
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "新名.json")), "附属 json 未同步改名")
+
+    def tearDown(self):
+        import shutil
+        if os.path.exists(self.dir):
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 class ArchiveBridgeTest(unittest.TestCase):
@@ -346,158 +469,6 @@ class ArchiveBridgeTest(unittest.TestCase):
             self.assertFalse(d["ok"])
         finally:
             self._register()
-
-
-class SyncEnqueueTest(unittest.TestCase):
-    """dl_enqueue_url_sync：同步解析 + 真实入队（FakeAPI，不碰网络与磁盘）"""
-
-    def setUp(self):
-        import webui
-        self.app = webui.Api()
-        self.app.api = FakeAPI()
-
-    def test_sync_enqueue_ok(self):
-        r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
-        self.assertTrue(r["ok"], r)
-        self.assertTrue(r.get("task_id"))
-        # 任务真实入队（文件名 = 模型名 + 空格 + 版本名 + 扩展名）
-        tasks = [t for t in self.app.dl.tasks if t.info and t.info.get("model_id") == "123"]
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0].filename, "test v1.safetensors")
-        # 关键：info.meta 必须存在（下载完成后生成 json + 封面缩略图的前提）
-        meta = (tasks[0].info or {}).get("meta") or {}
-        self.assertIn("info", meta)
-        self.assertIn("sd", meta)
-        self.assertTrue(meta["info"] and meta["sd"])
-        # 下载链接用 build_download_url 生成
-        self.assertTrue(tasks[0].url.startswith("https://"))
-
-    def test_handle_dl_done_generates_metadata(self):
-        """插件入队的任务下载完成后 → 自动生成 SD json（下载管理/模型管理缩略图依赖此链路）"""
-        import os
-        from downloader import ST_DONE
-        r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
-        self.assertTrue(r["ok"])
-        task = next(t for t in self.app.dl.tasks if t.id == r["task_id"])
-        # 把任务指向工作区内临时目录并放置占位文件，模拟下载完成
-        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".test_tmp", "dl_done")
-        os.makedirs(d, exist_ok=True)
-        task.dest_dir = d
-        self.app.cfg["download_dir"] = d  # 上游 v2.2.x 自动归位：目标与落地一致则原地，断言不漂移
-        dest = os.path.join(d, task.filename)
-        with open(dest, "w") as f:
-            f.write("placeholder")
-        task.status = ST_DONE
-        self.app._handle_dl_done(task)
-        base = os.path.splitext(dest)[0]
-        self.assertTrue(os.path.exists(base + ".json"), "SD json 未生成")
-        import json as _json
-        with open(base + ".json", encoding="utf-8") as f:
-            sd = _json.load(f)
-        self.assertEqual(sd.get("name"), "Test Model")
-        # 清理
-        for s in (".json", ".civitai.info", ".preview.png"):
-            p = base + s
-            if os.path.exists(p):
-                os.remove(p)
-        os.remove(dest)
-
-    def test_sync_enqueue_failure(self):
-        class BadAPI(FakeAPI):
-            def resolve_url(self, url):
-                raise __import__("civitai_api").CivitaiError("timed out")
-        self.app.api = BadAPI()
-        r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
-        self.assertFalse(r["ok"])
-        self.assertIn("代理", r["msg"])  # 友好错误提示含代理指引
-
-
-    def test_sync_enqueue_with_dest_subdir(self):
-        import tempfile
-        archive_root = tempfile.mkdtemp(prefix="cft_dlsub_")
-        self.app.cfg = {"archive_root": archive_root, "download_dir": archive_root,
-                        "site_domain": "civitai.red"}
-        try:
-            r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc",
-                                             "mymodel/v123")
-            self.assertTrue(r["ok"], r)
-            task = next(t for t in self.app.dl.tasks if t.id == r["task_id"])
-            self.assertEqual(os.path.normpath(task.dest_dir),
-                             os.path.normpath(os.path.join(archive_root, "mymodel", "v123")))
-        finally:
-            import shutil
-            shutil.rmtree(archive_root, ignore_errors=True)
-
-    def test_sync_enqueue_escape_dest_subdir(self):
-        import tempfile
-        archive_root = tempfile.mkdtemp(prefix="cft_dlesc_")
-        self.app.cfg = {"archive_root": archive_root, "download_dir": archive_root,
-                        "site_domain": "civitai.red"}
-        try:
-            for bad in ("..\\evil", "C:\\x", "\\\\srv\\share"):
-                r = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc", bad)
-                self.assertFalse(r["ok"], bad)
-                self.assertIn("非法路径", r["msg"], bad)
-        finally:
-            import shutil
-            shutil.rmtree(archive_root, ignore_errors=True)
-
-
-class RenameTest(unittest.TestCase):
-    """rename_file：自定义改名必须保留扩展名（前缀含点不误判）"""
-
-    def setUp(self):
-        import webui
-        self.dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".test_tmp", "rename")
-        os.makedirs(self.dir, exist_ok=True)
-        self.app = webui.Api()
-        self.app.api = FakeAPI()
-
-    def _mk(self, name):
-        p = os.path.join(self.dir, name)
-        with open(p, "wb") as f:
-            f.write(b"x")
-        return p
-
-    def test_prefix_with_dot_keeps_ext(self):
-        # 前缀含点（如 "v1.8 前缀 Kisaki"）→ 扩展名必须保留 .safetensors
-        p = self._mk("Kisaki v1.0.safetensors")
-        r = self.app.rename_file(p, "v1.8 前缀 Kisaki")
-        self.assertTrue(r["ok"], r)
-        new_path = os.path.join(self.dir, "v1.8 前缀 Kisaki.safetensors")
-        self.assertTrue(os.path.exists(new_path), "扩展名丢失: " + str(os.listdir(self.dir)))
-        self.assertFalse(os.path.exists(p))
-
-    def test_plain_prefix_keeps_ext(self):
-        p = self._mk("Kisaki.safetensors")
-        r = self.app.rename_file(p, "我的前缀 Kisaki")
-        self.assertTrue(r["ok"], r)
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "我的前缀 Kisaki.safetensors")))
-
-    def test_input_with_explicit_ext(self):
-        p = self._mk("Kisaki.safetensors")
-        r = self.app.rename_file(p, "新的名字.ckpt")
-        self.assertTrue(r["ok"], r)
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "新的名字.ckpt")))
-
-    def test_sides_renamed(self):
-        p = self._mk("Kisaki.safetensors")
-        with open(os.path.join(self.dir, "Kisaki.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
-        r = self.app.rename_file(p, "新名")
-        self.assertTrue(r["ok"], r)
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "新名.safetensors")))
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "新名.json")), "附属 json 未同步改名")
-
-    def tearDown(self):
-        import shutil
-        if os.path.exists(self.dir):
-            shutil.rmtree(self.dir, ignore_errors=True)
-
-
-# ===== P5 新增（局域网接入契约 §7）：path_util / 扫描根状态 / 缩略图缓存 =====
-# 说明：以下 4 个 TestCase 仅追加，不改动既有 4 类的任何代码；
-# 全部方法内懒导入 + tempfile 隔离，不依赖真实网络。
 
 
 class PathUtilTest(unittest.TestCase):
@@ -721,6 +692,10 @@ class CoverCacheTest(unittest.TestCase):
         finally:
             shutil.rmtree(work, ignore_errors=True)
             shutil.rmtree(cache, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,30 @@
+{
+  "name": "Test Model",
+  "model_id": null,
+  "version_id": null,
+  "version": "v1",
+  "type": "",
+  "base_model": "",
+  "trained_words": [],
+  "trainedWords": [],
+  "trigger_words": [],
+  "activation_text": "",
+  "activation text": "",
+  "tags": [],
+  "author": "",
+  "description": "",
+  "url": "",
+  "nsfw": false,
+  "stats": {
+    "download_count": null,
+    "favorite_count": null,
+    "rating": null,
+    "rating_count": null
+  },
+  "file_name": "test.safetensors",
+  "hashes": {
+    "SHA256": "abc123"
+  },
+  "format": null,
+  "preview": "test.preview.png"
+}

@@ -34,16 +34,19 @@
 
 // 前端错误也写进后端日志（error.log），出问题时可以查
 window.addEventListener("error", (e) => {
-  try { api.call("log_ui_error", String(e.message || e.error || "?"), String(e.filename || ""), String(e.lineno || ""), String((e.error && e.error.stack) || "")); } catch (err) { /* 忽略 */ }
+  try { api.call("log_ui_error", String(e.message || e.error || "?"), String(e.filename || ""), String(e.lineno || ""), String((e.error && e.error.stack) || "")).catch(() => {}); } catch (err) { /* 忽略 */ }
 });
 window.addEventListener("unhandledrejection", (e) => {
   const r = e.reason || {};
-  try { api.call("log_ui_error", "未处理的 Promise 拒绝: " + String(r.message || r), "", "", String(r.stack || "")); } catch (err) { /* 忽略 */ }
+  try { api.call("log_ui_error", "未处理的 Promise 拒绝: " + String(r.message || r), "", "", String(r.stack || "")).catch(() => {}); } catch (err) { /* 忽略 */ }
 });
 
 const api = {
   call(method, ...args) {
-    return window.pywebview.api[method](...args);
+    if(typeof guardCivitaiAction === "function" && !guardCivitaiAction(method,args))return Promise.resolve(["rp_start","dl_action","rp_add_paths"].includes(method)?false:{ok:false,started:false,requires_api_key:true,msg:"请先填写并保存 Civitai API Key"});
+    const result=window.pywebview.api[method](...args);
+    if(method==='save_config')return Promise.resolve(result).then(ok=>{if(ok)window.dispatchEvent(new CustomEvent('cft:config-saved',{detail:args[0]}));return ok;});
+    return result;
   },
 };
 
@@ -93,11 +96,22 @@ function applyZoom(v) {
     if (content) content.style.height = "";
   } else {
     document.documentElement.style.zoom = z;
-    if (content) content.style.height = "calc((100vh - 76px) / " + z + ")";
+    if (content) content.style.height = "calc(100vh / " + z + ")";
   }
+  document.documentElement.style.setProperty("--ui-zoom-factor", String(z));
+  document.documentElement.style.setProperty("--app-height", "calc(100vh / " + z + ")");
+  document.documentElement.dataset.compactLayout = window.innerWidth / z < 1080 ? "true" : "false";
+  document.documentElement.dataset.narrowLayout = window.innerWidth / z < 760 ? "true" : "false";
   if (state && state.cfg) state.cfg.ui_zoom = v;
+  window.dispatchEvent(new Event("cft:zoom"));
 }
 document.addEventListener("wheel", (e) => {
+  if (e.altKey && !e.ctrlKey && !e.metaKey && state.mmView === "list" && e.target.closest && e.target.closest("#mmTableWrap, #mmListSizeControl")) {
+    e.preventDefault(); setModelListSize(Number(state.cfg.model_list_size || 3) + (e.deltaY < 0 ? 1 : -1), true); return;
+  }
+  if (e.altKey && !e.ctrlKey && e.target.closest && e.target.closest("#mmMasonry, #mmImageSizeControl")) {
+    e.preventDefault(); setMasonrySize(Number(state.cfg.masonry_card_width || 220) + (e.deltaY < 0 ? 20 : -20), true); return;
+  }
   if (!e.ctrlKey) return;
   e.preventDefault();
   const cur = Number((state && state.cfg && state.cfg.ui_zoom) || 100);
@@ -108,24 +122,42 @@ document.addEventListener("wheel", (e) => {
   }, 600);
 }, { passive: false });
 
-function setStatus(t) { $("#statusText").textContent = t; }
+function setStatus(t) {
+  const text = String(t ?? "");
+  $("#statusText").textContent = text;
+  if (text && text !== toastLastStatus) { toastLastStatus = text; showToast(text); }
+  if (!text) toastLastStatus = "";
+}
 
-// 醒目 toast 提示（底部悬浮，2.6s 自动消失）——用于右键等快捷操作的反馈
-let toastTimer = null;
+// 底部中心胶囊与左下角状态同步；重复轮询不延长提示，不拦截鼠标。
+let toastTimer = null, toastHideTimer = null, toastFrame = 0, toastLastStatus = "";
+function positionToast() {
+  const t = document.getElementById("toast"); if (!t) return;
+  const actions = document.getElementById("settingsActions"), z = Number(document.documentElement.style.zoom) || 1;
+  const rect = actions?.getBoundingClientRect();
+  const bottom = rect && actions.getClientRects().length && rect.top < innerHeight ? Math.max(24, innerHeight - rect.top + 12) : 24;
+  t.style.bottom = bottom / z + "px";
+}
+window.addEventListener("resize", positionToast);
+window.addEventListener("cft:zoom", positionToast);
 function showToast(msg) {
+  const text = String(msg ?? "");
+  if (!text) return;
   let t = document.getElementById("toast");
   if (!t) {
     t = document.createElement("div");
     t.id = "toast";
+    t.setAttribute("aria-hidden", "true"); // 状态栏保留文本，避免读屏重复播报。
     document.body.appendChild(t);
   }
-  t.textContent = msg;
+  clearTimeout(toastTimer); clearTimeout(toastHideTimer); cancelAnimationFrame(toastFrame);
+  t.textContent = text;
   t.style.display = "block";
-  requestAnimationFrame(() => { t.style.opacity = "1"; });
-  clearTimeout(toastTimer);
+  positionToast();
+  toastFrame = requestAnimationFrame(() => { t.style.opacity = "1"; });
   toastTimer = setTimeout(() => {
     t.style.opacity = "0";
-    setTimeout(() => { t.style.display = "none"; }, 300);
+    toastHideTimer = setTimeout(() => { t.style.display = "none"; }, 300);
   }, 2600);
 }
 
@@ -139,7 +171,7 @@ function confirmBox(msg) {
     dlg.style.width = "420px";
     dlg.innerHTML =
       '<div class="rd-title">确认操作</div>' +
-      '<div style="font-size:13px;color:var(--text);line-height:1.7;word-break:break-all">' + esc(msg) + "</div>" +
+      '<div style="font-size:calc(13px * var(--type-scale, 1));color:var(--text);line-height:1.7;word-break:break-all">' + esc(msg) + "</div>" +
       '<div class="rd-actions">' +
       ((state.cfg && state.cfg.confirm_buttons_flip)
         ? '<button class="btn" id="cfCancel">取消</button><button class="btn btn-danger" id="cfOk">确定</button>'
@@ -164,7 +196,7 @@ function confirmBoxRaw(html, title) {
     dlg.style.width = "560px";
     dlg.innerHTML =
       '<div class="rd-title">' + (title || "确认操作") + "</div>" +
-      '<div style="font-size:13px;color:var(--text);line-height:1.7">' + html + "</div>" +
+      '<div style="font-size:calc(13px * var(--type-scale, 1));color:var(--text);line-height:1.7">' + html + "</div>" +
       '<div class="rd-actions">' +
       ((state.cfg && state.cfg.confirm_buttons_flip)
         ? '<button class="btn" id="cfCancel">取消</button><button class="btn btn-danger" id="cfOk">确定</button>'
@@ -225,7 +257,7 @@ const state = {
   coverCache: new Map(),   // 前端封面缓存（path → dataURI）：重绘时同步填充，删除/刷新不再闪屏
   mmSel: new Set(),
   mmSort: { col: "name", rev: false },
-  mmBaseF: "", mmStF: "", mmFolderF: "", mmAuthorF: "",   // Metro 筛选：底模 / 更新状态 / 文件夹 / 作者
+  mmTypeF: "", mmBaseF: "", mmStF: "", mmFolderF: "", mmAuthorF: "",   // Metro 筛选：底模 / 更新状态 / 文件夹 / 作者
   mmUpdOnly: false,          // 只看有更新的模型（更新检测筛选）
   mmUpdItems: null,          // 更新检测结果（path → 记录），「更新」页面用
   mmUpdCheckedAt: 0,
@@ -246,12 +278,32 @@ const state = {
 
 // ---------- 页面切换 ----------
 function switchPage(name) {
+  if (name !== "settings" && typeof settingsHaveChanges === "function" && settingsHaveChanges()) {requestSettingsLeave(()=>switchPage(name));return;}
+  if(typeof refreshApiKeyGates === "function")refreshApiKeyGates();
+  if (name !== "models") fmClose();
+  if (name !== "models" && $("#detailMask").style.display === "flex") closeDetail();
   $$(".nav-tab").forEach((t) => t.classList.toggle("active", t.dataset.page === name));
   $$(".page").forEach((p) => p.classList.toggle("active", p.id === "page-" + name));
+  if (typeof syncModelInspector === "function") syncModelInspector(name === "models");
+  if (typeof applyTextAndWindowAppearance === "function") applyTextAndWindowAppearance();
   if (name === "models") mmScanIfNeeded();
   if (name === "download") refreshDlTarget();
   if (name === "updates") renderUpdatesPage();
+  if (name === "dlmanager" && typeof refreshDownloadHistory === "function") refreshDownloadHistory();
 }
+let navWheelDelta=0,navWheelLast=0,navWheelDirection=0,navWheelEventAt=0;
+$('#navTabs').title='滚轮上下切换页面；Ctrl + 滚轮仍调整界面缩放';
+$('#navTabs').addEventListener('wheel',e=>{
+  if(e.ctrlKey || e.metaKey || e.altKey || !e.deltaY || Math.abs(e.deltaX)>Math.abs(e.deltaY) || !window.__ready)return;
+  e.preventDefault();
+  const now=performance.now(),direction=Math.sign(e.deltaY),tabs=[...document.querySelectorAll('#navTabs .nav-tab')];
+  if(now-navWheelEventAt>240 || direction!==navWheelDirection)navWheelDelta=0;
+  navWheelEventAt=now;navWheelDirection=direction;navWheelDelta+=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?innerHeight:1);
+  if(Math.abs(navWheelDelta)<48 || now-navWheelLast<180)return;
+  const active=tabs.findIndex(t=>t.classList.contains('active')),next=Math.max(0,Math.min(tabs.length-1,active+direction));
+  navWheelDelta=0;navWheelLast=now;
+  if(next!==active){switchPage(tabs[next].dataset.page);tabs[next].scrollIntoView({block:'nearest'});}
+},{passive:false});
 $("#navTabs").addEventListener("click", (e) => {
   const b = e.target.closest(".nav-tab");
   if (b) switchPage(b.dataset.page);
@@ -311,10 +363,10 @@ function openTodoDialog() {
     '<div class="form-grid" style="grid-template-columns:90px 1fr">' +
     '<label>链接</label><input class="input" id="tdUrl" placeholder="https://civitai.red/models/..." />' +
     "</div>" +
-    '<div style="font-size:12px;color:var(--text-dim);margin:4px 0 6px 90px">时间自动选择：Early Access 模型按其免费到期时间提醒；其他模型默认 7 天后提醒</div>' +
+    '<div style="font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);margin:4px 0 6px 90px">时间自动选择：Early Access 模型按其免费到期时间提醒；其他模型默认 7 天后提醒</div>' +
     '<div class="rd-actions"><button class="btn btn-primary" id="tdAdd">添加</button></div>' +
-    '<div style="font-size:13px;font-weight:600;margin:10px 0 6px">清单：</div>' +
-    '<div id="tdList" style="max-height:200px;overflow:auto;font-size:12px;line-height:1.9"></div>' +
+    '<div style="font-size:calc(13px * var(--type-scale, 1));font-weight:600;margin:10px 0 6px">清单：</div>' +
+    '<div id="tdList" style="max-height:200px;overflow:auto;font-size:calc(12px * var(--type-scale, 1));line-height:1.9"></div>' +
     '<div class="rd-actions"><button class="btn" id="tdClose">关闭</button></div>';
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
@@ -365,11 +417,11 @@ function openTodoDialog() {
     dlg.style.width = "470px";
     const rows = r.due.map((t) =>
       '<div style="display:flex;gap:8px;align-items:center;margin:5px 0">' +
-      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px" title="' + esc(t.url) + '">' + esc(t.label || t.url) + "</span>" +
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:calc(13px * var(--type-scale, 1))" title="' + esc(t.url) + '">' + esc(t.label || t.url) + "</span>" +
       '<button class="btn btn-tiny td-dl" data-url="' + esc(t.url) + '">一键下载</button></div>').join("");
     dlg.innerHTML =
-      '<div style="font-size:15px;font-weight:600;margin-bottom:6px">到期待办：可以下载了</div>' +
-      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:8px">这些模型已到免费/可下载时间（下载成功后会自动从清单里移除）：</div>' +
+      '<div style="font-size:calc(15px * var(--type-scale, 1));font-weight:600;margin-bottom:6px">到期待办：可以下载了</div>' +
+      '<div style="font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);margin-bottom:8px">这些模型已到免费/可下载时间（下载成功后会自动从清单里移除）：</div>' +
       '<div style="max-height:240px;overflow:auto">' + rows + "</div>" +
       '<div class="rd-actions"><button class="btn btn-primary" id="tdAll">全部下载</button><button class="btn" id="tdGoDl">去下载页</button><button class="btn" id="tdLater">稍后再说</button></div>';
     document.body.appendChild(mask);
@@ -408,7 +460,7 @@ function showDlNotice() {
   dlg.style.width = "380px";
   dlg.innerHTML =
     '<div class="rd-title">已在下载队列中</div>' +
-    '<div style="font-size:13px;color:var(--text-dim);line-height:1.8">任务已开始解析并入队，请在本页等待，无需重复点击「解析」。</div>' +
+    '<div style="font-size:calc(13px * var(--type-scale, 1));color:var(--text-dim);line-height:1.8">请求已提交解析；多文件版本将在本页弹窗选择，请等待结果，无需重复点击「解析」。</div>' +
     '<div class="rd-actions"><button class="btn btn-primary" id="dnOk">知道了</button></div>';
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
@@ -569,12 +621,12 @@ function showPaidDialog(items) {
     const remain = it.deadline ? Math.max(1, Math.ceil((it.deadline - Date.now() / 1000) / 86400)) : 7;
     return '<div class="paid-row" data-url="' + esc(it.url) + '" data-deadline="' + (it.deadline || 0) + '">' +
       '<div style="font-weight:600">需付费（Early Access）</div>' +
-      '<div style="font-size:12px;color:var(--text-dim);word-break:break-all">' + esc(it.url) + "</div>" +
-      '<div style="font-size:12px;margin:4px 0 8px">约 ' + remain + ' 天后免费 —— <button class="btn btn-tiny paid-todo">加入待办（自动到期提醒）</button> <button class="btn btn-tiny paid-dl">仍要下载</button></div></div>';
+      '<div style="font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);word-break:break-all">' + esc(it.url) + "</div>" +
+      '<div style="font-size:calc(12px * var(--type-scale, 1));margin:4px 0 8px">约 ' + remain + ' 天后免费 —— <button class="btn btn-tiny paid-todo">加入待办（自动到期提醒）</button> <button class="btn btn-tiny paid-dl">仍要下载</button></div></div>';
   }).join("");
   dlg.innerHTML =
     '<div class="rd-title">以下模型需要付费或尚未公开</div>' +
-    '<div style="max-height:260px;overflow:auto;font-size:13px;line-height:1.8">' + rows + "</div>" +
+    '<div style="max-height:260px;overflow:auto;font-size:calc(13px * var(--type-scale, 1));line-height:1.8">' + rows + "</div>" +
     '<div class="rd-actions"><button class="btn" id="paidClose">知道了</button></div>';
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
@@ -615,55 +667,227 @@ async function refreshDlTarget() {
 }
 
 // 从模型目录树里选文件夹（数据源与模型管理页同源：get_folders）
-async function pickFolderModal() {
+async function pickFolderModal(options = {}) {
+  if(document.querySelector(".folder-picker"))return "";
   let data = {};
-  try { data = JSON.parse((await api.call("get_folders")) || "{}"); } catch (e) { data = {}; }
-  const root = (data.root || "").replace(/\/$/, "");
-  const rows = [{ path: root, label: "模型目录根目录（直接放根下）", depth: 0 }];
-  (function walk(nodes, depth) {
-    (nodes || []).forEach((n) => {
-      rows.push({ path: root + "\\" + String(n.path || "").replace(/\//g, "\\"), label: n.name, depth: depth + 1 });
-      walk(n.children, depth + 1);
-    });
-  })(data.tree || [], 0);
+  try { data = JSON.parse((await api.call("get_folders")) || "{}"); }
+  catch (e) { setStatus("读取分类目录失败，请检查模型目录设置后重试"); return ""; }
+  const makeRows = info => {
+    const root=String(info.root||""),sep=root.includes("\\")||/^[a-z]:/i.test(root)?"\\":"/";
+    const out=root && info.exists!==false?[{path:root,label:"模型目录根目录（直接放根下）",depth:0}]:[];
+    const walk=(nodes,depth)=>(nodes||[]).forEach(n=>{if(out.length)out.push({path:root.replace(/[\\/]$/,"")+sep+String(n.path||"").replace(/[\\/]/g,sep),label:n.name,depth:depth+1});walk(n.children,depth+1);});
+    walk(info.tree||[],0);return out;
+  };
+  let rows=makeRows(data);
+  const key=path=>normalizedModelPath(path).replace(/\/$/,"");
+  const inside=(path,parent)=>key(path)===key(parent)||key(path).startsWith(key(parent)+"/");
+  const statuses=new Map();
+  const checkFolder=async path=>{
+    const result=await api.call("folder_picker_status",[path]);
+    if(Array.isArray(result))result.forEach(r=>statuses.set(key(r.path),r));
+    return statuses.get(key(path))||{exists:rows.some(r=>key(r.path)===key(path)),valid:rows.some(r=>key(r.path)===key(path))};
+  };
 
   const mask = document.createElement("div");
   mask.className = "rd-mask";
   const dlg = document.createElement("div");
-  dlg.className = "rename-dialog";
-  dlg.style.width = "560px";
+  dlg.className = "rename-dialog folder-picker";
+  dlg.setAttribute("role", "dialog");
+  dlg.setAttribute("aria-modal", "true");
+  dlg.setAttribute("aria-labelledby", "fpTitle");
   dlg.innerHTML =
-    '<div class="rd-title">选择下载落地的文件夹</div>' +
-    '<div style="font-size:12px;color:var(--text-dim);margin-bottom:8px">下载的模型（连 json/封面一起）直接放进这个文件夹；选中后不再弹「移动分类」询问</div>' +
-    '<div id="fpList" style="max-height:330px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:6px"></div>' +
-    '<div class="rd-actions"><button class="btn" id="fpCancel">取消</button><button class="btn btn-primary" id="fpOk">确定</button></div>';
+    '<div class="fp-heading"><div class="rd-title" id="fpTitle">' + esc(options.title||"选择下载落地的文件夹") + '</div><button class="btn btn-tiny" id="fpReset">重置尺寸</button></div>' +
+    '<p class="fp-hint">模型与 json / 封面一起保存。窗口大小自动适配，也可拖动右下角调整。</p>' +
+    '<div class="fp-toolbar"><input class="input" type="search" id="fpSearch" aria-label="搜索分类名称或路径" placeholder="搜索分类名称或路径…"/><span id="fpCount" aria-live="polite"></span></div>' +
+    '<div class="fp-view-options"><label><input type="checkbox" id="fpShowPaths"/>显示详细路径</label><span>星标置顶；中键取消收藏，右键管理记录</span></div>' +
+    '<div id="fpFavorites" class="fp-favorites" aria-label="收藏文件夹"></div>' +
+    '<div id="fpList" role="listbox" aria-label="分类文件夹" tabindex="0"></div>' +
+    '<div class="fp-footer"><div class="fp-selected"><span>' + (options.anyFolder?'移动到':'保存到') + '</span><div id="fpSelected"></div></div>' +
+    '<div class="rd-actions">' + (options.anyFolder?'<button class="btn" id="fpBrowse">其他文件夹…</button>':'') + '<button class="btn" id="fpCancel">取消</button><button class="btn btn-primary" id="fpOk">确定</button></div></div>';
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
-  let sel = rows[0] ? rows[0].path : "";
+  const previousFocus = document.activeElement;
+  const currentTarget = options.target || (state.cfg && state.cfg.download_target_dir);
+  let sel = (rows.find((r) => r.path === currentTarget) || rows[0] || {}).path || "";
   const list = $("#fpList", dlg);
-  list.innerHTML = rows.map((r) =>
-    '<div class="fp-item" data-path="' + esc(r.path) + '" style="padding:6px 8px;border-radius:8px;cursor:pointer;margin-left:' + (r.depth * 16) + 'px">' +
-    (r.depth ? _icon("folder") : _icon("folder")) + esc(r.label) +
-    '<div style="font-size:11px;color:var(--text-dim);word-break:break-all">' + esc(r.path) + "</div></div>").join("");
+  const folded = new Set(Array.isArray(state.cfg.folder_picker_folded) ? state.cfg.folder_picker_folded : []);
+  const favorites = new Set(Array.isArray(state.cfg.folder_picker_favorites) ? state.cfg.folder_picker_favorites : []);
+  let showPaths = state.cfg.folder_picker_show_paths === true;
+  dlg.dataset.showPaths = String(showPaths);
+  const savePicker = async values => {
+    Object.assign(state.cfg, values);
+    if('folder_picker_show_paths' in values){const input=$('[data-key="folder_picker_show_paths"]');if(input)input.checked=values.folder_picker_show_paths;}
+    try{if(!await api.call("save_config",values))throw Error("save");return true;}catch(_){setStatus("文件夹偏好保存失败，请重试");return false;}
+  };
+  const folderName = path => String(path).replace(/[\\/]$/,"").split(/[\\/]/).pop() || "模型目录";
+  const favoritesBar = $("#fpFavorites",dlg);
+  const renderFavorites = () => {
+    favoritesBar.innerHTML = Array.from(favorites).map(path => {
+      const status=statuses.get(key(path)),missing=status?!status.exists:!rows.some(r=>key(r.path)===key(path));
+      return '<button type="button" class="fp-favorite-chip'+(path===sel?' selected':'')+(missing?' is-missing':'')+'" data-favorite-pick="'+esc(path)+'" data-missing="'+missing+'" title="'+esc(path+(missing?' · 目录失效；中键取消收藏 / 右键删除记录':' · 中键取消收藏 / 右键管理'))+'">'+esc(folderName(path))+'</button>';
+    }).join('') || '<span class="fp-favorites-empty">点击目录后的星标，收藏常用角色文件夹</span>';
+  };
+  const parents = new Map(), branches = new Set(), stack = [];
+  const buildParents=()=>{parents.clear();branches.clear();stack.length=0;rows.forEach(row=>{while(stack.length&&stack.at(-1).depth>=row.depth)stack.pop();if(stack.length){parents.set(row.path,stack.at(-1).path);branches.add(stack.at(-1).path);}stack.push(row);});};
+  buildParents();
+  let visible = rows;
   const mark = () => {
     list.querySelectorAll(".fp-item").forEach((d) => {
       const on = d.dataset.path === sel;
-      d.style.background = on ? "var(--accent, #4da3ff)" : "";
-      d.style.color = on ? "#fff" : "";
+      d.classList.toggle("selected", on);
+      d.setAttribute("aria-selected", String(on));
     });
+    $("#fpSelected", dlg).textContent = (showPaths ? sel : folderName(sel)) || "请先在设置中配置模型目录";
+    $("#fpSelected", dlg).title = sel;
+    renderFavorites();
+    const status=statuses.get(key(sel));$("#fpOk", dlg).disabled = !sel || !!(status && (!status.exists || (!options.anyFolder && !status.valid)));
   };
+  const render = () => {
+    const q = $("#fpSearch", dlg).value.trim().toLocaleLowerCase();
+    visible = rows.filter((r) => {
+      if (q) return (r.label + " " + r.path).toLocaleLowerCase().includes(q);
+      let parent = parents.get(r.path);
+      while (parent) { if (folded.has(parent)) return false; parent = parents.get(parent); }
+      return true;
+    });
+    list.innerHTML = visible.map((r) =>
+      '<div class="fp-item" role="option" data-path="' + esc(r.path) + '" title="' + esc(r.path) + '" style="--fp-depth:' + (q ? 0 : Math.min(r.depth, 10)) + '">' +
+      '<div class="fp-name">' + (branches.has(r.path) ? '<button type="button" class="fp-fold" data-fold="' + esc(r.path) + '" aria-label="折叠或展开 ' + esc(r.label) + '" aria-expanded="' + (!folded.has(r.path)) + '">' + _icon('chevron-down') + '</button>' : '<span class="fp-fold-space"></span>') + _icon("folder") + '<span class="fp-folder-label">' + esc(r.label) + '</span><button type="button" class="fp-star" data-favorite="' + esc(r.path) + '" aria-label="' + (favorites.has(r.path)?'取消收藏':'收藏') + ' ' + esc(r.label) + '" aria-pressed="' + favorites.has(r.path) + '">' + _icon('star') + '</button></div>' +
+      '<div class="fp-path" title="' + esc(r.path) + '">' + esc(r.path) + "</div></div>").join("") ||
+      '<div class="fp-empty">' + (rows.length ? "没有匹配的分类；清空搜索可查看全部" : "尚未配置模型目录，请前往设置添加") + "</div>";
+    $("#fpCount", dlg).textContent = visible.length + " / " + rows.length + " 个目录";
+    // 搜索仅过滤显示，保留已选目标，并在底部完整展示，防止误改保存位置。
+    mark();
+  };
+  $("#fpShowPaths",dlg).checked = showPaths;
+  $("#fpShowPaths",dlg).addEventListener("change",e=>{
+    showPaths=e.target.checked;dlg.dataset.showPaths=String(showPaths);savePicker({folder_picker_show_paths:showPaths});mark();
+  });
+  const refreshRows=async()=>{try{data=JSON.parse((await api.call("get_folders"))||"{}");rows=makeRows(data);buildParents();if(dlg.isConnected)render();}catch(_){setStatus("目录刷新失败，请重试");}};
+  const removeRecord=async path=>{
+    try{
+      const result=await api.call("forget_folder_record",path);if(!result?.ok){setStatus(result?.msg||"记录删除失败，请重试");return;}
+      Object.assign(state.cfg,result.preferences||{});
+      if('download_target_dir' in (result.preferences||{})){const field=document.querySelector('[data-key="download_target_dir"]');if(field){field.value=state.cfg.download_target_dir;markSettingSaved('download_target_dir');}}
+      favorites.clear();(state.cfg.folder_picker_favorites||[]).forEach(p=>favorites.add(p));folded.clear();(state.cfg.folder_picker_folded||[]).forEach(p=>folded.add(p));
+      if(result.missing){rows=rows.filter(r=>!inside(r.path,path));buildParents();if(inside(sel,path))sel=rows[0]?.path||"";}
+      if(dlg.isConnected)render();refreshDlTarget();setStatus(result.msg||"已移除记录");
+    }catch(_){setStatus("记录删除失败，请重试");}
+  };
+  const unFavorite=async path=>{
+    const before=Array.from(favorites),scroll=list.scrollTop;favorites.delete(path);render();list.scrollTop=scroll;
+    if(!await savePicker({folder_picker_favorites:Array.from(favorites)})){favorites.clear();before.forEach(p=>favorites.add(p));state.cfg.folder_picker_favorites=before;if(dlg.isConnected)render();}
+  };
+  favoritesBar.addEventListener("pointerdown",e=>{if(e.button===1&&e.target.closest('[data-favorite-pick]'))e.preventDefault();});
+  favoritesBar.addEventListener("auxclick",e=>{const chip=e.target.closest('[data-favorite-pick]');if(e.button!==1||!chip)return;e.preventDefault();unFavorite(chip.dataset.favoritePick);});
+  favoritesBar.addEventListener("click",async e=>{
+    const chip=e.target.closest("[data-favorite-pick]");if(!chip)return;
+    try{const status=await checkFolder(chip.dataset.favoritePick);if(!dlg.isConnected)return;if(!status.exists||(!options.anyFolder&&!status.valid)){renderFavorites();setStatus("目录已失效；可以中键取消收藏，或右键删除记录");return;}
+      sel=chip.dataset.favoritePick;mark();list.querySelector('[data-path="'+CSS.escape(sel)+'"]')?.scrollIntoView({block:'nearest'});
+    }catch(_){setStatus("目录状态读取失败，请重试");}
+  });
+  const menu=document.createElement('div');menu.id='fpContext';menu.className='ctx-menu fp-context';menu.setAttribute('role','menu');menu.style.display='none';document.body.appendChild(menu);
+  const hideMenu=()=>menu.style.display='none';
+  const outsideMenu=e=>{if(!e.target.closest('#fpContext'))hideMenu();};document.addEventListener('pointerdown',outsideMenu);
+  const context=async e=>{
+    const target=e.target.closest('[data-favorite-pick],.fp-item');if(!target)return;e.preventDefault();const path=target.dataset.favoritePick||target.dataset.path;
+    try{const status=await checkFolder(path);if(!dlg.isConnected)return;
+      menu.innerHTML='<button class="ctx-item" role="menuitem" data-fp-act="open">'+_icon('folder')+'打开文件夹所在位置</button><button class="ctx-item ctx-danger" role="menuitem" data-fp-act="remove" '+(!favorites.has(path)&&status.exists?'disabled':'')+'>'+_icon('trash')+'删除'+(status.exists?'收藏':'失效记录')+'</button><div class="fp-context-note">只清理记录，不删除磁盘目录或模型</div>';
+      menu.dataset.path=path;menu.style.display='block';const z=Number(document.documentElement.style.zoom)||1;menu.style.left=e.clientX/z+'px';menu.style.top=e.clientY/z+'px';const rect=menu.getBoundingClientRect();menu.style.left=Math.max(8,Math.min(e.clientX,innerWidth-rect.width-8))/z+'px';menu.style.top=Math.max(8,Math.min(e.clientY,innerHeight-rect.height-8))/z+'px';
+    }catch(_){setStatus("目录状态读取失败，请重试");}
+  };
+  favoritesBar.addEventListener('contextmenu',context);list.addEventListener('contextmenu',context);
+  menu.addEventListener('click',async e=>{const action=e.target.closest('[data-fp-act]');if(!action||action.disabled)return;const path=menu.dataset.path;hideMenu();if(action.dataset.fpAct==='remove')return removeRecord(path);try{const result=await api.call('open_folder_location',path);setStatus(result?.ok?'已打开目录所在位置':result?.msg||'目录打开失败');}catch(_){setStatus('目录打开失败，请重试');}});
+  window.addEventListener('resize',hideMenu);window.addEventListener('cft:zoom',hideMenu);
+  api.call('folder_picker_status',Array.from(new Set([...favorites,sel].filter(Boolean)))).then(result=>{if(Array.isArray(result)){result.forEach(r=>statuses.set(key(r.path),r));if(dlg.isConnected)render();}}).catch(()=>{});
   list.addEventListener("click", (e) => {
+    const star=e.target.closest("[data-favorite]");
+    if(star){
+      const path=star.dataset.favorite;favorites.has(path)?favorites.delete(path):favorites.add(path);
+      savePicker({folder_picker_favorites:Array.from(favorites)});
+      const scroll=list.scrollTop;render();list.scrollTop=scroll;
+      list.querySelector('[data-favorite="'+CSS.escape(path)+'"]')?.focus();return;
+    }
+    const toggle = e.target.closest("[data-fold]");
+    if (toggle) {
+      const path = toggle.dataset.fold;
+      folded.has(path) ? folded.delete(path) : folded.add(path);
+      savePicker({folder_picker_folded:Array.from(folded)});
+      render(); list.querySelector('[data-fold="' + CSS.escape(path) + '"]')?.focus();
+      return;
+    }
     const it = e.target.closest(".fp-item");
     if (!it) return;
     sel = it.dataset.path;
     mark();
   });
-  mark();
-  const close = () => { mask.remove(); dlg.remove(); };
-  mask.addEventListener("click", close);
-  $("#fpCancel", dlg).addEventListener("click", close);
+  $("#fpSearch", dlg).addEventListener("input", render);
+  render();
+  const clampRatio = (v, fallback) => Number.isFinite(Number(v)) ? Math.max(0.2, Math.min(0.96, Number(v))) : fallback;
+  const savedSize = (state.cfg && state.cfg.folder_picker_size) || {};
+  let preferred = { width: clampRatio(savedSize.width, 0.72), height: clampRatio(savedSize.height, 0.78) };
+  const fit = () => {
+    const z = Number(document.documentElement.style.zoom) || 1;
+    const maxW = Math.max(1, (window.innerWidth - 24) / z);
+    const maxH = Math.max(1, (window.innerHeight - 24) / z);
+    dlg.style.minWidth = Math.min(420, maxW) + "px";
+    dlg.style.minHeight = Math.min(300, maxH) + "px";
+    dlg.style.maxWidth = maxW + "px";
+    dlg.style.maxHeight = maxH + "px";
+    dlg.style.width = Math.min(maxW, Math.max(420, window.innerWidth * preferred.width / z)) + "px";
+    dlg.style.height = Math.min(maxH, Math.max(300, window.innerHeight * preferred.height / z)) + "px";
+    dlg.dataset.small = maxH < 390 || maxW < 540 ? "true" : "false";
+  };
+  const remember = () => {
+    const rect = dlg.getBoundingClientRect();
+    preferred = { width: rect.width / window.innerWidth, height: rect.height / window.innerHeight };
+  };
+  dlg.addEventListener("pointerup", remember);
+  $("#fpReset", dlg).addEventListener("click", () => { preferred = { width: 0.72, height: 0.78 }; fit(); });
+  window.addEventListener("resize", fit);
+  window.addEventListener("cft:zoom", fit);
+  fit();
+  $("#fpSearch", dlg).focus();
   return new Promise((resolve) => {
-    $("#fpOk", dlg).addEventListener("click", () => { close(); resolve(sel); });
+    let closed = false;
+    const close = (value = "") => {
+      if (closed) return;
+      closed = true;
+      remember();
+      if (state.cfg) state.cfg.folder_picker_size = preferred;
+      // 只保存尺寸字段，不顺带提交设置页尚未保存的改动。
+      api.call("save_config", { folder_picker_size: preferred }).catch(() => {});
+      window.removeEventListener("resize", fit);
+      window.removeEventListener("cft:zoom", fit);
+      document.removeEventListener("keydown", keydown, true);
+      document.removeEventListener("pointerdown",outsideMenu);window.removeEventListener("resize",hideMenu);window.removeEventListener("cft:zoom",hideMenu);menu.remove();
+      mask.remove(); dlg.remove();
+      if (previousFocus && previousFocus.isConnected) previousFocus.focus();
+      resolve(value);
+    };
+    const keydown = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); if(menu.style.display!=="none")hideMenu();else close(); }
+      else if (e.key === "Tab") {
+        const buttons = [...dlg.querySelectorAll("button:not(:disabled), input, [tabindex='0']"),...menu.querySelectorAll("button:not(:disabled)")].filter(el=>el.getClientRects().length);
+        const first = buttons[0], last = buttons[buttons.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      } else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && document.activeElement === list && visible.length) {
+        e.preventDefault();
+        const i = visible.findIndex((r) => r.path === sel);
+        sel = visible[Math.max(0, Math.min(visible.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))].path;
+        mark();
+        const selected = list.querySelector(".selected");
+        if (selected) selected.scrollIntoView({ block: "nearest" });
+      } else if (e.key === "Enter" && document.activeElement === list && sel) { e.preventDefault(); finishSelection(); }
+    };
+    document.addEventListener("keydown", keydown, true);
+    mask.addEventListener("click", () => close());
+    $("#fpCancel", dlg).addEventListener("click", () => close());
+    let confirming=false;
+    const finishSelection=async()=>{if(!sel||confirming)return;confirming=true;$('#fpOk',dlg).disabled=true;try{const status=await checkFolder(sel);if(closed)return;if(!status.exists||(!options.anyFolder&&!status.valid)){setStatus('目标目录已失效，请重新选择；收藏仍可中键取消或右键删除');await refreshRows();return;}close(sel);}catch(_){setStatus('目录状态读取失败，请重试');}finally{confirming=false;if(!closed)mark();}};
+    $("#fpOk", dlg).addEventListener("click",finishSelection);
+    $('#fpBrowse',dlg)?.addEventListener('click',async()=>{const path=await api.call('pick_dir');if(path){sel=path;mark();}});
   });
 }
 
@@ -825,7 +1049,7 @@ async function showDedupeDialog(groups, modelGroups) {
       "<b>" + esc(d.name) + "</b>" + (d.ver ? ' <span style="color:var(--warn,#d29922)">旧版 ' + esc(d.ver) + "</span>" : " <span style='color:var(--text-dim)'>重复副本</span>") +
       '<div class="dedup-dir">' + esc(d.dir) + (d.size ? " · " + fmtBytes(d.size) : "") + "</div></div></div>").join("");
     const ok = await confirmBoxRaw(
-      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">以下 <b>' + picked.length +
+      '<div style="font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);margin-bottom:6px">以下 <b>' + picked.length +
       "</b> 个文件将移入回收站（可还原，不会真正删除）：</div>" +
       '<div style="max-height:300px;overflow:auto">' + rows + "</div>",
       "清理重复 / 旧版模型（" + picked.length + " 个" + (totalSize ? " · 约 " + fmtBytes(totalSize) : "") + "）");
@@ -843,7 +1067,7 @@ async function showDedupeDialog(groups, modelGroups) {
       clearInterval(timer);
       setStatus(p.msg || "清理完成");
       if (Array.isArray(p.result) && p.result.length) {
-        infoBox('<div style="font-size:12px;line-height:1.8">' +
+        infoBox('<div style="font-size:calc(12px * var(--type-scale, 1));line-height:1.8">' +
           p.result.map((f) => "· <b>" + esc(f.file) + "</b>：" + esc(f.msg)).join("<br/>") +
           "</div>", "这些没能清理（可在资源管理器里手动删除）");
       }
@@ -856,18 +1080,22 @@ async function showDedupeDialog(groups, modelGroups) {
 if ($("#mmDedupe")) $("#mmDedupe").addEventListener("click", mmDedupeFlow);
 
 // ================= 下载管理 =================
+let dlDragging=false;
 async function dlRefresh() {
+  if(dlDragging)return;
   try {
     const tasks = await api.call("get_tasks");
     state.dlTasks = tasks || [];
+    $("#dlTable").dataset.hasErrors=state.dlTasks.some(t=>t.error)?"true":"false";
+    $("#dlRemoveCompleted").disabled=!state.dlTasks.some(t=>t.status==="done");
     const tbody = $("#dlTable tbody");
-    const selPaths = new Set(Array.from(tbody.querySelectorAll("tr.sel-row")).map((tr) => tr.dataset.fn));
+    const selPaths = new Set(Array.from(tbody.querySelectorAll("tr.sel-row")).map((tr) => tr.dataset.taskId));
     tbody.innerHTML = state.dlTasks.map((t) => {
-      const st = { pending: "等待中", downloading: "下载中", done: "已完成", paused: "已暂停", error: "失败", canceled: "已取消" }[t.status] || t.status;
-      const prog = t.status === "downloading" ? t.progress.toFixed(1) + "%" : st;
+      const st = t.hash_mismatch ? (t.manual_binding ? "已关联 · 校验不一致" : "已下载 · 校验不一致") : { pending: "等待中", downloading: "下载中", retrying: "等待重试", done: "已完成", paused: "已暂停", error: "失败", canceled: "已取消" }[t.status] || t.status;
+      const prog = t.status === "downloading" ? (Number(t.progress)||0).toFixed(1) + "%" : st;
       const speed = t.speed ? (t.speed / 1048576).toFixed(1) + " MB/s" : "";
       const size = t.total ? fmtSize(t.downloaded) + " / " + fmtSize(t.total) : fmtSize(t.downloaded);
-      const thumb = state.dlThumbs[t.filename] ? '<img class="thumb" src="data:image/jpeg;base64,' + state.dlThumbs[t.filename] + '" alt=""/>' : '<span class="thumb thumb-empty"></span>';
+      const thumb = (state.dlThumbs[t.id] || state.dlThumbs[t.filename]) ? '<img class="thumb" src="data:image/jpeg;base64,' + (state.dlThumbs[t.id] || state.dlThumbs[t.filename]) + '" alt=""/>' : '<span class="thumb thumb-empty"></span>';
       const errCell = t.error
         ? "<td class='c-err err-copy' title='点击复制完整报错'>" + esc(t.error) + "</td>"
         : "<td class='c-err'></td>";
@@ -880,12 +1108,18 @@ async function dlRefresh() {
         destShow = effFull.slice(md.length).replace(/^[\\/]+/, "");
       }
       const destTip = (destFull ? destFull : (effFull + "\n（全局目标）")) + "\n点击选择该文件的保存文件夹";
-      const destCell = "<td class='c-dest cell-dest' data-task='" + esc(t.id) + "' title='" + esc(destTip) + "'>" + esc(destShow || effFull || "未设置") + (destFull ? "" : " <span class='dest-def'>默认</span>") + "</td>";
-      return '<tr data-fn="' + esc(t.filename) + '" class="' + (selPaths.has(t.filename) ? "sel-row" : "") + '">' +
-        "<td class='c-thumb'>" + thumb + "</td><td class='c-file'>" + esc(t.filename) + "</td>" + destCell + "<td>" + esc(st) + "</td><td>" + esc(prog) + "</td>" +
+      const destLeaf = String(destShow || effFull || "未设置").replace(/[\\/]$/, "").split(/[\\/]/).pop();
+      const destCell = "<td class='c-dest cell-dest' data-task='" + esc(t.id) + "' title='" + esc(destTip) + "'><button type='button' class='dest-picker' aria-label='保存到 " + esc(destLeaf) + "'>" + _icon("folder") + "<span>" + esc(destLeaf) + "</span>" + _icon("chevron-down") + "</button>" + (destFull ? "" : " <span class='dest-def'>默认</span>") + "</td>";
+      return '<tr data-task-id="'+esc(t.id)+'" data-fn="' + esc(t.filename) + '" class="' + (selPaths.has(t.id) ? "sel-row" : "") + '">' +
+        '<td class="dl-check-col"><span class="dl-check-controls"><button type="button" class="dl-drag-handle" draggable="true" aria-label="拖动调整下载顺序" data-tip="拖动排序：前面的等待任务优先，不中断当前下载">'+ '<svg class="ic dl-grip" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="8" cy="6" r="1.7"/><circle cx="16" cy="6" r="1.7"/><circle cx="8" cy="12" r="1.7"/><circle cx="16" cy="12" r="1.7"/><circle cx="8" cy="18" r="1.7"/><circle cx="16" cy="18" r="1.7"/></svg>' +'</button><input type="checkbox" class="dl-task-check" aria-label="选择下载任务 ' + esc(t.filename) + '"'+(selPaths.has(t.id)?' checked':'')+'/></span></td>' + "<td class='c-thumb'>" + thumb + "</td><td class='c-file'><div>" + esc(t.filename) + "</div>" +
+        (effFull ? '<div class="file-subpath" title="' + esc(effFull + (/[/\\]$/.test(effFull) ? "" : (effFull.includes("\\") || /^[a-z]:/i.test(effFull) ? "\\" : "/")) + t.filename) + '">' +
+          esc(effFull + (/[/\\]$/.test(effFull) ? "" : (effFull.includes("\\") || /^[a-z]:/i.test(effFull) ? "\\" : "/")) + t.filename) + "</div>" : "") +
+        "</td>" + destCell + "<td class='dl-task-status'>" + esc(st) + (t.hash_mismatch && !t.manual_binding ? '<button type="button" class="btn btn-tiny" data-bind-download="' + esc(t.id) + '" data-tip="仅关联已保存的 C站信息，不修改文件、不代表通过校验">' + _icon('file') + '关联模型信息</button>' : '') + (["done", "error", "canceled"].includes(t.status) ? '<button class="btn btn-tiny task-archive" data-archive-task="' + esc(t.id) + '">' + _icon("clock") + '移入历史</button>' : "") + "</td><td>" + esc(prog) + "</td>" +
         "<td>" + esc(speed) + "</td><td>" + esc(size) + "</td>" + errCell + "</tr>";
     }).join("");
+    syncDlSelection();
     loadDlThumbs(state.dlTasks || []);
+    if (typeof updateDownloadQueueCount === "function") updateDownloadQueueCount();
     // 下载受限（Early Access/付费）→ 弹窗选择
     maybeAskRestricted(tasks || []);
     // 下载完成 → 询问移动分类（ask_move_after_download 开启且本次会话未询问过）
@@ -895,25 +1129,24 @@ async function dlRefresh() {
 
 // 下载管理列表缩略图：按文件名缓存，已加载的不重复请求（get_covers 传模型文件路径自动找同目录封面）
 const _dlThumbLoading = new Set();
-function loadDlThumbs(tasks) {
-  const todo = tasks.filter((t) =>
-    t.dest_dir && t.status === "done" && !state.dlThumbs[t.filename] && !_dlThumbLoading.has(t.filename)).slice(0, 40);
+async function loadDlThumbs(tasks) {
+  const todo = tasks.filter(t=>!state.dlThumbs[t.id] && !_dlThumbLoading.has(t.id)).slice(0,40);
   if (!todo.length) return;
-  todo.forEach((t) => _dlThumbLoading.add(t.filename));
-  api.call("get_covers", todo.map((t) => t.dest_dir + "\\" + t.filename), 96).then((json) => {
-    try {
-      const covers = JSON.parse(json || "{}");
-      for (const [p, b64] of Object.entries(covers)) {
-        const fn = todo.find((t) => (t.dest_dir + "\\" + t.filename).toLowerCase() === p.toLowerCase());
-        if (fn) {
-          state.dlThumbs[fn.filename] = b64;
-          const img = $("#dlTable tbody tr[data-fn='" + CSS.escape(fn.filename) + "'] .thumb");
-          if (img) img.src = "data:image/jpeg;base64," + b64;
-        }
-      }
-    } catch (e) { /* 忽略 */ }
-    todo.forEach((t) => _dlThumbLoading.delete(t.filename));
-  }).catch(() => todo.forEach((t) => _dlThumbLoading.delete(t.filename)));
+  todo.forEach(t=>_dlThumbLoading.add(t.id));
+  try {
+    const result=await api.call("get_task_thumbnails",todo.map(t=>t.id));
+    const covers=typeof result==='string'?JSON.parse(result):result||{};
+    const done=todo.filter(t=>!covers[t.id] && t.status==='done' && t.dest_dir);
+    if(done.length){
+      const cached=JSON.parse(await api.call('get_covers',done.map(t=>t.dest_dir+'\\'+t.filename),512)||'{}');
+      done.forEach(t=>{const b=cached[t.dest_dir+'\\'+t.filename];if(b)covers[t.id]=b;});
+    }
+    for(const task of todo)if(covers[task.id]){
+      state.dlThumbs[task.id]=covers[task.id];
+      const row=$('#dlTable tbody tr[data-task-id="'+CSS.escape(task.id)+'"]');
+      if(row){const img=document.createElement('img');img.className='thumb';img.alt='';img.src='data:image/jpeg;base64,'+covers[task.id];row.querySelector('.c-thumb').replaceChildren(img);}
+    }
+  }catch(_){}finally{todo.forEach(t=>_dlThumbLoading.delete(t.id));}
 }
 
 // 下载受限（C 站限制）弹窗选择：花费积分重试 / 加入待办并移除 / 浏览器打开
@@ -932,8 +1165,8 @@ function maybeAskRestricted(tasks) {
   dlg.style.width = "480px";
   dlg.innerHTML =
     '<div class="rd-title">模型下载受限（Early Access / 付费）</div>' +
-    '<div style="font-size:12px;color:var(--text-dim);word-break:break-all">' + esc(t.filename || "") + "</div>" +
-    '<div style="font-size:12px;color:var(--text-dim);margin:4px 0 10px">该模型在 C 站暂不可直接下载。若有积分可先在浏览器购买解锁，或加入待办等免费开放。</div>' +
+    '<div style="font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);word-break:break-all">' + esc(t.filename || "") + "</div>" +
+    '<div style="font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);margin:4px 0 10px">该模型在 C 站暂不可直接下载。若有积分可先在浏览器购买解锁，或加入待办等免费开放。</div>' +
     '<div class="rd-actions">' +
     '<button class="btn btn-primary" id="rkRetry">花费积分/重试下载</button>' +
     '<button class="btn" id="rkTodo">加入待办并移除</button>' +
@@ -979,9 +1212,9 @@ function maybeAskMove(tasks) {
   dlg.innerHTML =
     '<div class="rd-title">下载完成：' + esc(done.filename) + "</div>" +
     '<div style="display:flex;gap:14px;align-items:flex-start">' +
-    '<div id="mvThumb" style="width:112px;height:112px;border-radius:12px;background:var(--surface2);display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;border:1px solid var(--border)"><span style="font-size:30px"></span></div>' +
+    '<div id="mvThumb" style="width:112px;height:112px;border-radius:12px;background:var(--surface2);display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;border:1px solid var(--border)"><span style="font-size:calc(30px * var(--type-scale, 1))"></span></div>' +
     '<div style="flex:1;min-width:0">' +
-    '<div style="font-size:13px;color:var(--text-dim);line-height:1.8">是否移动到分类文件夹？（主文件与 json/封面等附属一起移动）</div>' +
+    '<div style="font-size:calc(13px * var(--type-scale, 1));color:var(--text-dim);line-height:1.8">是否移动到分类文件夹？（主文件与 json/封面等附属一起移动）</div>' +
     '<div class="rd-actions" style="margin-top:10px">' +
     '<button class="btn" id="mvNo">不移动</button>' +
     '<button class="btn btn-primary" id="mvYes">选择文件夹</button></div>' +
@@ -1021,7 +1254,33 @@ function maybeAskMove(tasks) {
   });
 }
 
+async function bindDownloadInfo(taskId) {
+  setStatus('正在读取本地文件并核对哈希…');
+  const report = await api.call('inspect_download_binding',taskId);
+  if(!report?.ok){setStatus(report?.msg||'无法关联该文件');return;}
+  const html = '<p>将本地文件关联到 <b>'+esc(report.model_name)+'</b> · '+esc(report.version_name)+'</p>' +
+    '<p class="binding-warning">文件未通过官方 SHA256 校验。此操作仅保存名称、版本和封面等来源信息，不能保证它与官方模型一致，也不改变文件。</p>' +
+    '<dl class="binding-hashes"><dt>官方 SHA256</dt><dd>'+esc(report.expected_sha256)+'</dd><dt>本地实际 SHA256</dt><dd>'+esc(report.actual_sha256)+'</dd></dl>';
+  document.querySelectorAll('.tip-float').forEach(tip=>{tip.style.display='none';});
+  const accepted = await confirmBoxRaw(html,'仅关联信息（校验仍未通过）');
+  if(!accepted)return;
+  accepted.root.remove();
+  const result = await api.call('bind_download_metadata',taskId,report.actual_sha256,true);
+  setStatus(result?.msg||'关联失败');
+  await dlRefresh();await refreshDownloadHistory();
+  if(result?.ok)mmScan();
+}
+
 $("#dlTable tbody").addEventListener("click", async (e) => {
+  const binding = e.target.closest("[data-bind-download]");
+  if(binding){e.stopPropagation();try{await bindDownloadInfo(binding.dataset.bindDownload);}catch(_){setStatus('关联失败，请重新打开窗口检查；未更改校验结果');}return;}
+  const archive = e.target.closest("[data-archive-task]");
+  if (archive) {
+    e.stopPropagation();
+    const result = await api.call("archive_download_task", archive.dataset.archiveTask);
+    setStatus(result?.msg || "已移入历史");
+    await dlRefresh(); await refreshDownloadHistory(); return;
+  }
   // 「保存到」列：给这一个任务单独选文件夹（应用内文件夹树，不用系统弹窗）
   const destCell = e.target.closest(".cell-dest");
   if (destCell) {
@@ -1036,21 +1295,32 @@ $("#dlTable tbody").addEventListener("click", async (e) => {
   const tr = e.target.closest("tr");
   if (!tr) return;
   const ctrl = e.ctrlKey || e.metaKey;
-  if (ctrl) tr.classList.toggle("sel-row");
+  if(e.target.matches(".dl-task-check"))tr.classList.toggle("sel-row",e.target.checked);
+  else if (ctrl) tr.classList.toggle("sel-row");
   else {
     $$("#dlTable tbody tr").forEach((r) => r.classList.remove("sel-row"));
     tr.classList.add("sel-row");
   }
+  syncDlSelection();
 });
 
 function dlSel() {
   return Array.from($$("#dlTable tbody tr.sel-row")).map((r) => r.dataset.fn);
 }
 
+function dlSelectedIds(){return Array.from(document.querySelectorAll('#dlTable tbody tr.sel-row')).map(r=>r.dataset.taskId);}
+function syncDlSelection(){const rows=Array.from(document.querySelectorAll('#dlTable tbody tr'));rows.forEach(r=>{const input=r.querySelector('.dl-task-check');if(input)input.checked=r.classList.contains('sel-row');});const count=rows.filter(r=>r.classList.contains('sel-row')).length;$('#dlSelectAll').checked=rows.length>0&&count===rows.length;$('#dlSelectAll').indeterminate=count>0&&count<rows.length;}
+$('#dlSelectAll').addEventListener('change',e=>{document.querySelectorAll('#dlTable tbody tr').forEach(r=>r.classList.toggle('sel-row',e.target.checked));syncDlSelection();});
+$('#dlPauseAll').addEventListener('click',()=>dlAct('pause_all'));
+$('#dlRemoveAll').addEventListener('click',async()=>{if(await confirmBox('移除全部下载任务？取消未完成下载并清理其 .part 临时文件；不删除模型文件或历史。'))dlAct('remove_all');});
 async function dlAct(action) {
-  await api.call("dl_action", action, action === "start_all" || action === "clear_done" || action === "save" ? null : dlSel());
+  if (["start","pause","retry","remove"].includes(action) && !dlSelectedIds().length) {setStatus("请先勾选下载任务");return;}
+  if(action==="remove" && !(await confirmBox("移除选中任务并清理未完成的 .part？已完成模型和历史保留。")))return;
+  const result = await api.call("dl_action", action, null, ["start_all","pause_all","remove_all","clear_done","remove_completed","save"].includes(action) ? null : dlSelectedIds());
+  if (action === "save") setStatus(result ? "任务及历史已保存" : "记录保存失败，请检查目录写入权限");
   dlRefresh();
 }
+$("#dlStartSel").addEventListener("click", () => dlAct("start"));
 $("#dlStartAll").addEventListener("click", () => dlAct("start_all"));
 $("#dlPauseSel").addEventListener("click", () => dlAct("pause"));
 $("#dlRetrySel").addEventListener("click", () => dlAct("retry"));
@@ -1058,7 +1328,7 @@ $("#dlRemoveSel").addEventListener("click", () => dlAct("remove"));
 // 批量/单选：给任务指定保存文件夹（应用内文件夹树；未勾选=全部任务）
 $("#dlSetTarget").addEventListener("click", async () => {
   const sel = dlSel();
-  const tasks = (state.dlTasks || []).filter((t) => !sel.length || sel.indexOf(t.filename) >= 0);
+  const ids=dlSelectedIds();const tasks = (state.dlTasks || []).filter((t) => !ids.length || ids.includes(t.id));
   if (!tasks.length) { setStatus(sel.length ? "选中的任务里没有可设置的" : "任务列表为空"); return; }
   const p = await pickFolderModal();
   if (!p) return;
@@ -1070,21 +1340,25 @@ $("#dlSetTarget").addEventListener("click", async () => {
   setStatus("已设置 " + ok + " 个任务的保存位置" + (fail ? ("，失败 " + fail + (msg ? "：" + msg : "")) : ""));
   dlRefresh();
 });
+$('#dlRemoveCompleted').addEventListener('click',()=>dlAct('remove_completed'));
 $("#dlClearDone").addEventListener("click", () => dlAct("clear_done"));
 $("#dlSave").addEventListener("click", () => dlAct("save"));
 
-// 下载管理行右键菜单：打开所在文件夹 / 复制文件名 / 打开C站（复用全局 ctxMenu，act 前缀 dl_）
+// Download context actions target the right-clicked task ID, never the previous selection.
+let dlContextTaskId = null;
 $("#dlTable tbody").addEventListener("contextmenu", (e) => {
   const tr = e.target.closest("tr");
   if (!tr) return;
-  const t = (state.dlTasks || []).find((x) => x.filename === tr.dataset.fn);
+  const t = (state.dlTasks || []).find((x) => x.id === tr.dataset.taskId);
   if (!t) return;
   e.preventDefault();
+  dlContextTaskId = t.id;
   const menu = $("#ctxMenu");
   menu.innerHTML =
     '<div class="ctx-item" data-act="dl_folder" data-tip="打开资源管理器并选中该文件">打开所在文件夹</div>' +
     '<div class="ctx-item" data-act="dl_copy" data-tip="复制当前文件名">复制文件名</div>' +
-    '<div class="ctx-item" data-act="dl_site" data-tip="在浏览器打开该模型在 C 站的主页">打开C站</div>';
+    '<div class="ctx-item" data-act="dl_site" data-tip="在浏览器打开该模型在 C 站的主页">打开C站</div>' +
+    '<hr class="ctx-sep"/><button class="ctx-item danger" data-act="dl_remove" data-tip="取消此任务，停止写入后清理未完成 .part；已完成模型与历史保留">' + _icon("trash") + '移除此任务</button>';
   menu.style.display = "block";
   const zf = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
   menu.style.left = (e.clientX / zf) + "px";
@@ -1096,12 +1370,15 @@ $("#dlTable tbody").addEventListener("contextmenu", (e) => {
 $("#ctxMenu").addEventListener("click", async (e) => {
   const item = e.target.closest("[data-act^=dl_]");
   if (!item) return;
-  const tr = document.querySelector("#dlTable tbody tr.sel-row");
-  const t = tr && (state.dlTasks || []).find((x) => x.filename === tr.dataset.fn);
+  const t = (state.dlTasks || []).find((x) => x.id === dlContextTaskId);
   $("#ctxMenu").style.display = "none";
   const act = item.dataset.act;
   if (!t) return;
-  if (act === "dl_copy") {
+  if (act === "dl_remove") {
+    if(!(await confirmBox("移除此任务："+t.filename+"？未完成的 .part 会在写入停止后清理；已完成模型与历史保留。")))return;
+    const result=await api.call("remove_download_task",t.id);
+    setStatus(result?.msg||"任务已移除");await dlRefresh();await refreshDownloadHistory();
+  } else if (act === "dl_copy") {
     await window.__copyText(t.filename);
     setStatus("文件名已复制: " + t.filename);
   } else if (act === "dl_folder") {
@@ -1134,6 +1411,7 @@ function pollMmScan() {
       clearInterval(t);
       try {
         state.models = JSON.parse((await api.call("get_scan_rows")) || "[]");
+        const cfg=await api.call("get_config");if(cfg?.model_favorites)state.cfg.model_favorites=cfg.model_favorites;
       } catch (e) {
         state.models = [];
         setStatus("行数据解析失败: " + e);
@@ -1148,12 +1426,11 @@ function pollMmScan() {
         if (u && u.items) applyUpdatesToRows(u.items);
       } catch (e) { /* 忽略 */ }
       applyMmFilter();
-      // 局域网接入：roots 含不可达根时警告替代"扫描完成"（0 模型且全 ok 才正常显示）
-      const scanRoots = (s && Array.isArray(s.roots)) ? s.roots : [];
-      const badRoots = scanRoots.filter((r) => r && r.status !== "ok");
+      // 局域网增强：扫描根状态上报——不可达目录明确警告，不用"0 个模型"误导
+      const badRoots = Array.isArray(s.roots) ? s.roots.filter((r) => r && r.status !== "ok") : [];
       if (badRoots.length) {
         const shown = badRoots.slice(0, 3).map((r) => r.path + "（" + (r.error || "不可达") + "）").join("；");
-        setStatus("以下模型目录不可达：" + shown + (badRoots.length > 3 ? "等 " + (badRoots.length - 3) + " 个" : ""));
+        setStatus("⚠ 以下模型目录不可达：" + shown + (badRoots.length > 3 ? " 等 " + badRoots.length + " 个" : ""));
       } else {
         setStatus(s.msg || "扫描完成：" + state.models.length + " 个模型");
       }
@@ -1163,6 +1440,9 @@ function pollMmScan() {
 }
 
 function renderMm() {
+  setMasonrySize((state.cfg || {}).masonry_card_width, false);
+  setModelListSize((state.cfg || {}).model_list_size, false);
+  const _scMV=$("#mmMasonryViewport")?.scrollTop||0;
   const _scM = ($("#mmMasonry") || {}).scrollTop || 0;
   const _scT = ($("#mmTableWrap") || {}).scrollTop || 0;
   const rows = state.display.slice();
@@ -1178,9 +1458,12 @@ function renderMm() {
     });
     if (state.mmSort.rev) rows.reverse();
   }
+  rows.sort((a,b)=>Number(isModelFavorite(b.path))-Number(isModelFavorite(a.path)));
+  applyModelToolbarLock();
   state.display = rows.slice();  // 同步排序后的显示顺序（shift 区间 / data-idx 依赖）
   if (state.mmView === "masonry") {
     renderMasonry(rows);
+    if($("#mmMasonryViewport"))$("#mmMasonryViewport").scrollTop=_scMV;
     if ($("#mmMasonry")) $("#mmMasonry").scrollTop = _scM;
     if ($("#mmTableWrap")) $("#mmTableWrap").scrollTop = _scT;
     return;
@@ -1192,14 +1475,14 @@ function renderMm() {
   const tbody = $("#mmTable tbody");
   tbody.innerHTML = rows.map((r, i) => {
     const rel = root ? r.path.replace(root.replace(/\\/g, "/"), "").replace(/^\//, "") : r.path;
-    return '<tr data-idx="' + i + '" data-path="' + esc(r.path) + '" class="' + (state.mmSel.has(r.path) ? "sel-row" : "") + '">' +
+    return '<tr data-idx="' + i + '" data-path="' + esc(r.path) + '" class="' + (state.mmSel.has(r.path) ? "sel-row" : "") + (normalizedModelPath(state.historyFocusPath)===normalizedModelPath(r.path)?" history-focus":"") + '">' +
       '<td class="cell-sel" data-col="sel">' + (state.mmChecked.has(r.path) ? '<span class="cbox on"></span>' : '<span class="cbox"></span>') + "</td>" +
       "<td class='c-name' data-col='name'><div class='ml-wrap'>" +
         '<img data-idx="' + i + '" data-path="' + esc(r.path) + '" class="thumb ml-thumb" alt=""/>' +
         (r.upd && r.upd.has_update ? '<a href="#" class="mm-upd" data-url="' + esc(r.upd.url || "") + '" title="' + esc(updTip(r.upd)) + '">' + _icon("alert") + '</a>' : "") +
         '<div class="ml-txt">' +
-          '<div class="ml-1" data-tip="' + esc((r.civitai_name || r.name) + "\n" + String(r.name || "")) + '">' + esc(r.civitai_name || r.name) + "</div>" +
-          ((r.civitai_name && r.name && String(r.civitai_name) !== String(r.name)) ? '<div class="ml-2" data-tip="本地文件名">' + esc(short(r.name, 46)) + "</div>" : "") +
+          '<div class="ml-1" data-tip="' + esc((r.civitai_name || r.name) + "\n" + String(r.name || "")) + '">' + (isModelFavorite(r.path)?_icon("star","ic model-star"):"")+esc(r.civitai_name || r.name) + "</div>" +
+          ((r.civitai_name && r.name && String(r.civitai_name) !== String(r.name)) ? '<div class="ml-2" data-tip="本地文件名">' + esc(r.name) + "</div>" : "") +
           ((r.author || (r.info && r.info.creator)) ? '<div class="ml-3">作者 ' + esc(r.author || (r.info && r.info.creator)) + "</div>" : "") +
         "</div></div></td>" +
       "<td class='c-name' data-col='cname' data-tip='' >" + esc(r.civitai_name || "-") + "</td>" +
@@ -1210,6 +1493,7 @@ function renderMm() {
       "<td data-col='size'>" + fmtSize(r.size) + "</td><td class='c-time' data-col='mtime'>" + fmtTime(r.mtime) + "</td>" +
       "<td class='c-path' data-col='path' data-full='" + esc(rel.replace(/[^\\/]+$/, "")) + "' data-tip='" + esc(r.path) + "'>" + esc(short(rel.replace(/[^\\/]+$/, ""), 26) || "\\") + "</td></tr>";
   }).join("");
+  tbody.querySelectorAll("td[data-col]:not([data-col=sel]):not([data-col=name]):not([data-col=path])").forEach(td=>td.title=td.textContent.trim());
   $("#mmCheckLabel").textContent = "已勾选 " + state.mmChecked.size + " 个";
   _applyCoverCache($("#mmTable"));
   loadThumbs(0);
@@ -1245,6 +1529,7 @@ function _applyCoverCache(root) {
   });
 }
 async function loadThumbs(start) {
+  if (state.mmView === "list" && Number(state.cfg.model_list_size || 3) < 3) return;
   const batch = state.display.slice(start, start + 40);
   if (!batch.length) return;
   const miss = batch.filter((r) => !state.coverCache.has(r.path));
@@ -1272,7 +1557,7 @@ async function loadThumbs(start) {
 (function () {
   let drag = null;
   const KEY = "mm_col_w2";
-  const FLEX = "name";                     // 弹性列（width:auto）
+  const flexName = () => $("#mmTable").dataset.mmFlex || "name"; // 路径优先弹性，路径隐藏时名称兜底
   function thOf(colName) { return document.querySelector('#mmTable th[data-col="' + colName + '"]'); }
   function colOf(colName) { return document.querySelector('#mmTable col.c-' + colName); }
   function visibleNext(th) {
@@ -1281,9 +1566,10 @@ async function loadThumbs(start) {
     return (el && el.dataset && el.dataset.col) ? el : null;
   }
   function targetOf(th) {                  // 分隔线（th 右缘）对应目标列：默认左列；左列是弹性列时取右列
-    if (th.dataset.col !== FLEX) return th;
+    if (th.dataset.col === "sel") return null; // 选择格不是信息列，不能拖成宽列。
+    if (th.dataset.col !== flexName()) return th;
     const nx = visibleNext(th);
-    return (nx && nx.dataset.col !== FLEX) ? nx : null;
+    return (nx && nx.dataset.col !== flexName()) ? nx : null;
   }
   function applyWidth(colName, px) {
     const v = Math.round(px) + "px";
@@ -1291,17 +1577,20 @@ async function loadThumbs(start) {
     const th = thOf(colName); if (th) th.style.width = v;
   }
   function saveWidths() {
-    const out = {};
+    let out = {}; try { out = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (_) {}
+    delete out.sel;
     document.querySelectorAll("#mmTable col[class^='c-']").forEach((c) => {
       const name = c.className.replace(/^c-/, "");
-      if (c.style.width && name !== FLEX) out[name] = c.style.width;
+      if (name === "sel" || name === flexName()) return;
+      if (c.style.width) out[name] = c.style.width; else delete out[name];
     });
     try { localStorage.setItem(KEY, JSON.stringify(out)); } catch (e) { }
+    window.mmApplyCols();
   }
   function restoreWidths() {
     let w = {};
     try { w = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { }
-    Object.keys(w).forEach((k) => { if (k !== FLEX) applyWidth(k, parseFloat(w[k])); });
+    Object.keys(w).forEach((k) => { const px=parseFloat(w[k]); if (k !== "sel" && k !== flexName() && Number.isFinite(px) && px >= 50) applyWidth(k, px); });
   }
   document.addEventListener("mousemove", (e) => {
     if (!drag) return;
@@ -1326,7 +1615,7 @@ async function loadThumbs(start) {
         e.preventDefault(); e.stopPropagation();
         const targetTh = thOf(tg.dataset.col);
         drag = { col: tg.dataset.col, startX: e.clientX,
-                 startW: targetTh ? targetTh.getBoundingClientRect().width : 100 };
+                 startW: targetTh ? targetTh.getBoundingClientRect().width / (parseFloat(getComputedStyle(document.documentElement).zoom)||1) : 100 };
         tg.classList.add("resizing");
       });
       hd.addEventListener("dblclick", () => { // 双击 = 重置该列宽度
@@ -1368,6 +1657,22 @@ $("#mmTable thead").addEventListener("click", (e) => {
 const MM_COLS = [["sel", "勾选"], ["thumb", "缩略图"], ["name", "模型信息"], ["cname", "C站模型名"],
                  ["type", "类型"], ["base", "基础模型"], ["ver", "版本"], ["update", "更新"],
                  ["hash", "哈希"], ["size", "大小"], ["mtime", "下载时间"], ["path", "路径"]];
+// 列宽以内容用途为单位；只让一个可见列弹性，避免 fixed 布局把空白均摊给勾选格。
+function mmSizeColumns(hidden) {
+  const table = $("#mmTable"), scale = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--type-scale")) || 1;
+  const widths = {sel:40,name:({1:160,2:220,3:280})[Number(state.cfg.model_list_size)||3]||280,cname:180,type:56,base:88,ver:72,update:80,hash:140,size:80,mtime:136,path:120};
+  const flex = hidden.has("path") ? "name" : "path"; table.dataset.mmFlex = flex;
+  let saved = {}; try { saved = JSON.parse(localStorage.getItem("mm_col_w2") || "{}"); } catch (_) {}
+  let minimum = 0;
+  for (const [key, width] of Object.entries(widths)) table.style.setProperty("--mm-col-"+key, width * scale + "px");
+  document.querySelectorAll("#mmTable thead th[data-col]").forEach(th => {
+    const key=th.dataset.col; if(key===flex || key==="sel") th.style.width="";
+    if(hidden.has(key)) return;
+    const custom=parseFloat(saved[key]);
+    minimum += key!==flex && key!=="sel" && Number.isFinite(custom) && custom>=50 ? custom : (widths[key]||80)*scale;
+  });
+  table.style.minWidth = Math.ceil(minimum) + "px";
+}
 function mmApplyCols() {
   let hidden = [];
   const DEFAULT_HIDDEN = ["cname", "hash"];   // 只收起「C站模型名」「哈希」；大小/时间/路径都保留（信息密度优先）
@@ -1382,6 +1687,7 @@ function mmApplyCols() {
     }
   } catch (e) { hidden = DEFAULT_HIDDEN.slice(); }
   const hs = new Set(hidden);
+  // 档位只调整模型信息单元格；类型/基础/版本/更新/大小/时间/路径依用户列设置保留。
   // 表头与数据行必须用同一份清单、同步隐藏（否则表头 A 位置/数据 B 位置）
   document.querySelectorAll("#mmTable thead [data-col], #mmTable tbody [data-col]").forEach((el) => {
     el.style.display = hs.has(el.dataset.col) ? "none" : "";
@@ -1399,7 +1705,7 @@ function mmApplyCols() {
   }
   // 「缩略图」是伪列（缩略图在模型信息单元格里，没有独立 <col>）：用表上的 class 控制
   const tbl = document.getElementById("mmTable");
-  if (tbl) tbl.classList.toggle("no-thumb", hs.has("thumb"));
+  if (tbl) {tbl.classList.toggle("no-thumb", hs.has("thumb")); mmSizeColumns(hs);}
 }
 $("#mmTable thead").addEventListener("contextmenu", (e) => {
   e.preventDefault();
@@ -1458,15 +1764,17 @@ function renderMasonry(rows) {
     const _sub = (_cn && _cn !== r.name) ? String(r.name || "") : "";
     const _meta = [r.base, r.type].filter(Boolean).map((x) => short(String(x), 16)).join(" · ");
     const _meta2 = [r.ver ? short(String(r.ver), 16) : "", fmtSize(r.size)].filter(Boolean).join(" · ");
-    return '<div class="ms-card' + (checked ? " checked" : "") + '" data-idx="' + i + '" data-path="' + esc(r.path) + '" title="' + esc(String(r.name || "") + " · " + String(r.path || "")) + '">' +
+    return '<div class="ms-card' + (checked ? " checked" : "") + (normalizedModelPath(state.historyFocusPath)===normalizedModelPath(r.path)?' history-focus':'') + '" tabindex="0" data-idx="' + i + '" data-path="' + esc(r.path) + '" title="' + esc(String(r.name || "") + " · " + String(r.path || "")) + '">' +
       '<span class="ms-check">' + (checked ? '<span class="cbox on"></span>' : '<span class="cbox"></span>') + "</span>" +
       _msTag(r) +
       (r.upd && r.upd.has_update ? '<a href="#" class="ms-upd" data-url="' + esc(r.upd.url || "") + '" title="' + esc(updTip(r.upd)) + '">' + _icon("alert") + '</a>' : "") +
       '<div class="ms-img-wrap" data-ph="loading"><img class="ms-img" data-idx="' + i + '" data-path="' + esc(r.path) + '" alt=""/></div>' +
-      '<div class="ms-name">' + esc(short(_disp, 30)) + "</div>" +
-      (_sub ? '<div class="ms-sub">' + esc(short(_sub, 30)) + "</div>" : "") +
+      '<div class="ms-info"><div class="ms-titles"><div class="ms-name" data-civitai-name="' + (_cn ? 'true' : 'false') + '">' + (isModelFavorite(r.path)?_icon('star','ic model-star'):'') + esc(_disp) + "</div>" +
+      (_sub ? '<div class="ms-sub">' + esc(_sub) + "</div>" : "") +
+      '</div><div class="ms-footer">' +
+      (r.author ? '<div class="ms-author" title="' + esc(r.author) + '">作者：' + esc(r.author) + '</div>' : '') +
       '<div class="ms-meta">' + esc(_meta || (r.type || "-")) + "</div>" +
-      '<div class="ms-size">' + esc(_meta2 || fmtSize(r.size)) + "</div></div>";
+      '<div class="ms-size">' + esc(_meta2 || fmtSize(r.size)) + "</div></div></div></div>";
   }).join("");
   _applyCoverCache($("#mmMasonry"));
   $("#mmCheckLabel").textContent = "已勾选 " + state.mmChecked.size + " 个";
@@ -1538,6 +1846,7 @@ $("#mmMasonry").addEventListener("click", (e) => {
   }
   const card = e.target.closest(".ms-card");
   if (!card) return;
+  if(e.detail>1)return;
   const p = card.dataset.path;
   const cardChk = card.querySelector(".ms-check");
   if (state.mmChecked.has(p)) state.mmChecked.delete(p);
@@ -1545,69 +1854,20 @@ $("#mmMasonry").addEventListener("click", (e) => {
   card.classList.toggle("checked", state.mmChecked.has(p));
   if (cardChk) cardChk.innerHTML = state.mmChecked.has(p) ? '<span class="cbox on"></span>' : '<span class="cbox"></span>';
   $("#mmCheckLabel").textContent = "已勾选 " + state.mmChecked.size + " 个";
+  showModelDetail(p);
 });
-$("#mmMasonry").addEventListener("contextmenu", (e) => {
-  const card = e.target.closest(".ms-card");
-  if (!card) return;
-  e.preventDefault();
-  ctxRow = state.display.find((r2) => r2.path === card.dataset.path) || null;
-  if (!ctxRow) return;
-  const menu = $("#ctxMenu");
-  const r = ctxRow;
-  menu.innerHTML =
-    '<div class="ctx-item" data-act="copy_name" data-tip="复制当前本地文件名">复制文件名</div>' +
-    '<div class="ctx-item" data-act="copy_cname" data-tip="复制 C 站上的模型名（不改本地文件）">🀄 复制C站模型名</div>' +
-    '<div class="ctx-item" data-act="folder" data-tip="打开资源管理器并选中该文件">打开所在文件夹</div>' +
-    '<div class="ctx-item" data-act="site" data-tip="在浏览器打开该模型在 C 站的主页">打开C站</div>' +
-    '<div class="ctx-item" data-act="rename" data-tip="自定义改名（保留扩展名）">改名</div>' +
-    '<div class="ctx-item" data-act="rename_c" data-tip="把本地文件名改成 C 站上的模型名（只改本地文件）">文件名改成C站名</div>' +
-    '<div class="ctx-item" data-act="sdjson" data-tip="生成 WebUI 能识别的「模型名.json」元数据文件">生成SD可读json</div>' +
-    '<div class="ctx-item" data-act="localize" data-tip="把本地文件名翻译成中文">🀄 文件名翻中文</div>' +
-    '<div class="ctx-item" data-act="rp" data-tip="从 C 站匹配该模型的名字/触发词/封面">识别模型信息</div>' +
-    '<div class="ctx-item" data-act="wl" data-tip="以后不再提示这个模型的更新（按模型记入白名单）">不再提醒更新（加入白名单）</div>' +
-    '<div class="ctx-item" data-act="organize" data-tip="把该模型移动到分类文件夹（需先在设置选 目标环境）">整理模型</div>' +
-    '<div class="ctx-item" data-act="move" data-tip="把该模型文件（连同 info/预览图/示例图等附属文件）移动到指定文件夹">移动文件…</div>' +
-    '<hr class="ctx-sep"/>' +
-    '<div class="ctx-item danger" data-act="del" data-tip="把该模型文件移入回收站（可还原）">移入回收站</div>';
-  menu.style.display = "block";
-  const zf = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
-  const mw = 200, mh = 280;
-  // 迭代校正：反复对比实际渲染位置与鼠标位置，最多 4 次收敛
-  menu.style.left = (e.clientX / zf) + "px";
-  menu.style.top = (e.clientY / zf) + "px";
-  for (let k = 0; k < 4; k++) {
-    const got = menu.getBoundingClientRect();
-    const dx = e.clientX - got.left;
-    const dy = e.clientY - got.top;
-    if (Math.abs(dx) < 2 && Math.abs(dy) < 2) break;
-    menu.style.left = (parseFloat(menu.style.left) + dx) + "px";
-    menu.style.top = (parseFloat(menu.style.top) + dy) + "px";
-  }
-  // 边缘限制
-  const mr = menu.getBoundingClientRect();
-  if (mr.right > window.innerWidth) menu.style.left = Math.max(0, window.innerWidth - mr.width) + "px";
-  if (mr.bottom > window.innerHeight) menu.style.top = Math.max(0, window.innerHeight - mr.height) + "px";
-  // rAF 后再校正一次（布局稳定，防显示瞬间读到旧位置）
-  requestAnimationFrame(() => {
-    for (let k = 0; k < 3; k++) {
-      const got = menu.getBoundingClientRect();
-      const dx = e.clientX - got.left;
-      const dy = e.clientY - got.top;
-      if (Math.abs(dx) < 2 && Math.abs(dy) < 2) break;
-      menu.style.left = (parseFloat(menu.style.left) + dx) + "px";
-      menu.style.top = (parseFloat(menu.style.top) + dy) + "px";
-    }
-    const mr2 = menu.getBoundingClientRect();
-    if (mr2.right > window.innerWidth) menu.style.left = Math.max(0, window.innerWidth - mr2.width) + "px";
-    if (mr2.bottom > window.innerHeight) menu.style.top = Math.max(0, window.innerHeight - mr2.height) + "px";
-  });
+$("#mmMasonry").addEventListener("contextmenu",e=>{
+  const card=e.target.closest('.ms-card');if(!card)return;
+  showModelContextMenu(e,state.display.find(r=>r.path===card.dataset.path));
 });
 
-// 列表：单击行 = 勾选（shift 范围多选，ctrl 加选）；双击打开详情
+// 列表：单击主体勾选并更新详情；勾选格 / Ctrl / Shift 保留独立批量选择
 $("#mmTable tbody").addEventListener("click", (e) => {
   const tr = e.target.closest("tr");
   if (!tr) return;
   const path = tr.dataset.path;
+  const checkboxClick=!!e.target.closest(".cell-sel");
+  if(e.detail>1 && !checkboxClick)return;
   const idx = Number(tr.dataset.idx);
   let targets = [path];
   if (e.shiftKey) {
@@ -1640,6 +1900,7 @@ $("#mmTable tbody").addEventListener("click", (e) => {
   });
   state.mmSel = new Set(state.mmChecked);
   $("#mmCheckLabel").textContent = "已勾选 " + state.mmChecked.size + " 个";
+  if(!e.shiftKey && !checkboxClick)showModelDetail(path);
 });
 
 // 筛选
@@ -1663,6 +1924,7 @@ function applyMmFilter() {
       return p2.indexOf("/" + _fp + "/") >= 0 || p2.indexOf("/" + _fp) === p2.length - _fp.length - 1;
     });
   }
+  if (state.mmTypeF) rows = rows.filter(r => String(r.type_filter || r.type || "Unknown").toLowerCase() === state.mmTypeF.toLowerCase());
   if (state.mmBaseF) rows = rows.filter((r) => String(r.base || "") === state.mmBaseF);
   if (state.mmAuthorF) rows = rows.filter((r) => String(r.author || "") === state.mmAuthorF);
   if (state.mmStF) {
@@ -1673,6 +1935,10 @@ function applyMmFilter() {
     });
   }
   state.display = rows.slice();
+  // Selection belongs to the current visible result, never hidden rows.
+  const visible=new Set(state.display.map(r=>r.path));
+  for(const selected of [state.mmChecked,state.mmSel])for(const path of selected)if(!visible.has(path))selected.delete(path);
+  state.mmLastSel=null;
   renderMm();
   fillMmBaseOptions();
   fillMmFolderOptions();
@@ -1872,7 +2138,7 @@ function _updRowHtml(x) {
       '<div class="upd-meta">' +
         '<div class="upd-nm" data-tip="' + esc(it.model_name || _updBase(x.path)) + '">' + esc(it.model_name || _updBase(x.path)) + "</div>" +
         '<div class="upd-sub2">' + (it.author ? "作者：" + esc(it.author) + " ｜ " : "") + (it.local_base ? "底模：" + esc(it.local_base) : "") + (it.model_type ? " ｜ " + esc(it.model_type) : "") + "</div>" +
-        '<div class="upd-sub2 upd-dim" data-tip="' + esc(x.path) + '">' + esc(_updBase(x.path)) + " ｜ " + esc(_updDir(x.path)) + "</div>" +
+        '<div class="upd-sub2 upd-dim file-subpath" data-tip="' + esc(x.path) + '">' + esc(_updBase(x.path)) + " ｜ " + esc(_updDir(x.path)) + "</div>" +
       "</div></div></td>" +
     '<td class="c-cur"><span class="ver-badge" data-tip="' + esc(it.local_name || "") + '">' + esc(curName || "未知") + "</span>" +
       (!curName && it.local_version ? '<div class="upd-dim upd-id">ID ' + esc(it.local_version) + "</div>" : "") + "</td>" +
@@ -1886,7 +2152,7 @@ function _updRowHtml(x) {
     "</div></td></tr>";
 }
 
-function _updFilterRows() {
+function _updLibraryRows() {
   const items = state.mmUpdItems || {};
   const union = Object.assign({}, items);
   for (const r of (state.models || [])) {         // 扫到、有 C 站信息、但还没检查过的 → 补一条「未检查」行
@@ -1895,7 +2161,10 @@ function _updFilterRows() {
                         local_base: r.base || "", model_type: r.type || "", author: r.author || "" };
     }
   }
-  let rows = Object.entries(union).map(([path, it]) => ({ path, it: it || {} }));
+  return Object.entries(union).map(([path, it]) => ({ path, it: it || {} }));
+}
+function _updFilterRows() {
+  let rows = _updLibraryRows();
   const q = String(state.updQ || "").trim().toLowerCase();
   if (state.updBase) rows = rows.filter((x) => String(x.it.local_base || "") === state.updBase);
   if (q) rows = rows.filter((x) => ((x.it.model_name || "") + " " + x.path + " " + (x.it.local_name || "") + " " + (x.it.author || "")).toLowerCase().includes(q));
@@ -1968,8 +2237,9 @@ async function renderUpdatesPage() {
   // 顶部统计
   const nUpd = Object.values(items).filter((it) => it && it.has_update).length;
   const ca = state.mmUpdCheckedAt ? new Date(state.mmUpdCheckedAt * 1000).toLocaleString() : "还没检查过";
+  const libraryTotal=_updLibraryRows().length;
   const cnt = $("#updCount");
-  if (cnt) cnt.innerHTML = "可更新 <b class=\"warn\">" + nUpd + "</b> ｜ 共 " + Object.keys(items).length + " 个 ｜ 上次检查 " + esc(ca);
+  if (cnt) cnt.innerHTML = "可更新 <b class=\"warn\">" + nUpd + "</b> ｜ 共 " + libraryTotal + " 个 ｜ 上次检查 " + esc(ca);
 
   // 表体 + 空态
   const empty = $("#updEmpty");
@@ -2006,7 +2276,7 @@ async function renderUpdatesPage() {
 
   // 底栏
   const st1 = $("#updStat");
-  if (st1) st1.textContent = "共 " + all.length + " 个模型" + (all.length !== Object.keys(items).length ? "（筛选中，总 " + Object.keys(items).length + "）" : "");
+  if (st1) st1.textContent = "共 " + all.length + " 个模型" + (all.length !== libraryTotal ? "（筛选中，总 " + libraryTotal + "）" : "");
   _updSyncSel();
   const pg = $("#updPager");
   if (pg) pg.innerHTML = _updPagerHtml(pages, state.updPage);
@@ -2285,6 +2555,14 @@ async function updWhitelistDialog() {
 }
 
 // 工具栏 / 底栏交互（一次性绑定）
+$('#updSync').addEventListener('click',async()=>{
+ const button=$('#updSync');button.disabled=true;setStatus('正在同步本地模型与更新记录…');
+ try{
+  const r=await api.call('sync_local_model_updates');
+  if(r?.ok){state.models=JSON.parse(await api.call('get_scan_rows')||'[]');const u=await api.call('get_model_updates');state.mmUpdItems=u?.items||{};applyUpdatesToRows(state.mmUpdItems);applyMmFilter();state.updPage=1;await renderUpdatesPage();}
+  setStatus(r?.msg||'同步未返回结果');
+ }catch(_){setStatus('同步失败，原更新记录保留');}finally{button.disabled=false;}
+});
 if ($("#updCheck")) $("#updCheck").addEventListener("click", async () => {
   const st = await api.call("get_mm_update_state").catch(() => null);
   if (st && st.running) {                       // 正在检查 → 再点一次 = 停止
@@ -2357,7 +2635,7 @@ function infoBox(html, title) {
   dlg.style.width = "560px";
   dlg.innerHTML =
     '<div class="rd-title">' + (title || "提示") + '<span class="dlg-x" id="ibX" title="关闭（Esc）">' + _icon("x") + "</span></div>" +
-    '<div class="ib-body" style="font-size:13px;color:var(--text);line-height:1.7">' + html + "</div>" +
+    '<div class="ib-body" style="font-size:calc(13px * var(--type-scale, 1));color:var(--text);line-height:1.7">' + html + "</div>" +
     '<div class="rd-actions"><button class="btn btn-primary" id="ibOk">知道了</button></div>';
   const onKey = (e) => { if (e.key === "Escape") close(); };
   const close = () => { document.removeEventListener("keydown", onKey); mask.remove(); dlg.remove(); };
@@ -2482,7 +2760,7 @@ async function mmUpdateFlow(paths) {
     clearInterval(timer);
     setStatus(p.msg || "更新完成");
     if (Array.isArray(p.result) && p.result.length) {
-      infoBox("<div style='font-size:12px;line-height:1.9'>" +
+      infoBox("<div style='font-size:calc(12px * var(--type-scale, 1));line-height:1.9'>" +
         p.result.map((f) => "· <b>" + esc(f.file) + "</b>：" + esc(f.msg)).join("<br/>") +
         "</div>", "这些没能加入下载队列");
     }
@@ -2490,16 +2768,16 @@ async function mmUpdateFlow(paths) {
   return true;
 }
 async function mmUpdateSelectedFlow() {
-  const paths = state.models.filter((r) => state.mmChecked.has(r.path) && r.upd && r.upd.has_update).map((r) => r.path);
+  const paths = state.display.filter((r) => state.mmChecked.has(r.path) && r.upd && r.upd.has_update).map((r) => r.path);
   if (!paths.length) {
     setStatus("没有勾选「有新版」的模型：先点「检查更新」，再用「有更新」筛出来并全选");
     return;
   }
   const ok = await confirmBoxRaw(
-    "<div style='font-size:13px;line-height:1.8'>将下载以下 <b>" + paths.length + "</b> 个模型的<b>新版</b>：" +
+    "<div style='font-size:calc(13px * var(--type-scale, 1));line-height:1.8'>将下载以下 <b>" + paths.length + "</b> 个模型的<b>新版</b>：" +
     "<div style='max-height:200px;overflow:auto;margin-top:6px'>" +
     paths.map((p) => "· " + esc(p.replace(/\\/g, "/").split("/").pop())).join("<br/>") + "</div>" +
-    "<div style='font-size:12px;color:var(--text-dim);margin-top:6px'>新版会下到旧版所在文件夹；<b>旧版文件不会被动</b>（要清理可用「查重」的删旧留新）。</div></div>",
+    "<div style='font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);margin-top:6px'>新版会下到旧版所在文件夹；<b>旧版文件不会被动</b>（要清理可用「查重」的删旧留新）。</div></div>",
     "更新选中的 " + paths.length + " 个模型");
   if (!ok) return;
   if (ok.root) ok.root.remove();
@@ -2519,7 +2797,7 @@ if ($("#mmGoUpdates")) $("#mmGoUpdates").addEventListener("click", () => {
 
 if ($("#mmUpdDl")) $("#mmUpdDl").addEventListener("click", () => {
   // 模型管理页的「更新选中」：把勾选里有新版的交给新的批量更新流程（版本按更新页每行的下拉选择）
-  const paths = state.models.filter((r) => state.mmChecked.has(r.path) && r.upd && r.upd.has_update).map((r) => r.path);
+  const paths = state.display.filter((r) => state.mmChecked.has(r.path) && r.upd && r.upd.has_update).map((r) => r.path);
   if (!paths.length) { setStatus("没有勾选「有新版」的模型：先点「检查更新」，再勾选带 的条目"); return; }
   updBatchDownload(paths);
 });
@@ -2545,9 +2823,34 @@ $$("#mmTable th[data-sort]").forEach((th) => {
   });
 });
 
+let mmMoving=false;
+async function moveCheckedModels(){
+  if(mmMoving)return;
+  const paths=state.display.filter(r=>state.mmChecked.has(r.path)).map(r=>r.path);if(!paths.length){setStatus('请先勾选要批量移动的模型');return;}
+  mmMoving=true;$('#mmMoveTo').disabled=true;
+  try{
+    const operation=await api.call('get_mm_progress');if(operation?.running){setStatus('已有模型操作正在进行，请稍后批量移动');return;}
+    const dir=await pickFolderModal({title:'选择批量移动目标文件夹',anyFolder:true});if(!dir)return;
+    const confirmation=await confirmBoxRaw('<div>将 <b>'+paths.length+'</b> 个勾选模型移动到：</div><p>'+esc(dir)+'</p><p>模型及 JSON、封面、示例图一起移动；同名冲突会跳过，不覆盖。不会修改全局下载保存位置。</p>','批量移动模型');if(!confirmation)return;if(confirmation.root)confirmation.root.remove();
+    let done=0;const failed=[];let detailPath=detailRow?.path;
+    for(let i=0;i<paths.length;i++){
+      const path=paths[i];setStatus('批量移动 '+(i+1)+' / '+paths.length+'：'+path.replace(/\\/g,'/').split('/').pop());
+      try{const result=await api.call('move_file_to',path,dir);if(!result?.ok){failed.push({path,msg:result?.msg||'移动失败'});continue;}
+        const next=result.path||path;if(next!==path){for(const set of [state.mmChecked,state.mmSel])if(set.delete(path))set.add(next);const row=state.models.find(r=>r.path===path);if(row)row.path=next;if(state.coverCache.has(path)){state.coverCache.set(next,state.coverCache.get(path));state.coverCache.delete(path);}if(detailPath===path)detailPath=next;}done++;
+      }catch(_){failed.push({path,msg:'移动未完成，请检查文件位置后重试'});}
+    }
+    try{const cfg=await api.call('get_config');if(cfg.model_favorites)state.cfg.model_favorites=cfg.model_favorites;}catch(_){}
+    _mmFolderTree=null;renderMm();mmScan();if(detailPath && detailRow?.path!==detailPath)await showModelDetail(detailPath);
+    setStatus('批量移动完成：成功 '+done+'，失败/跳过 '+failed.length+'（共 '+paths.length+'）');
+    if(failed.length)infoBox(failed.map(r=>'<p>'+esc(r.path)+'<br/>'+esc(r.msg)+'</p>').join(''),'未移动的模型');
+  }catch(_){setStatus('批量移动未完成，请检查文件位置后重试');}
+  finally{mmMoving=false;$('#mmMoveTo').disabled=false;}
+}
+$('#mmMoveTo').addEventListener('click',moveCheckedModels);
+
 function mmCheckedPaths() {
-  const checked = state.models.filter((r) => state.mmChecked.has(r.path)).map((r) => r.path);
-  const sel = Array.from(state.mmSel);
+  const checked = state.display.filter((r) => state.mmChecked.has(r.path)).map((r) => r.path);
+  const sel = state.display.filter(r=>state.mmSel.has(r.path)).map(r=>r.path);
   return checked.length ? checked : (sel.length ? sel : null);
 }
 
@@ -2563,103 +2866,177 @@ function mmOp(name, fn) {
     const paths = mmCheckedPaths();
     if (name !== "mmScan" && !paths && !["mmScan"].includes(name)) { setStatus("请先勾选或选中模型"); return; }
     setStatus(name + " 开始 ...");
-    // fire-and-forget + 独立轮询
-    fn(paths).catch(() => {});
-    pollMmProgress();
+    fn(paths).then(result=>{
+      if(!result?.started){setStatus(result?.msg||"操作未开始");return;}
+      pollMmProgress();
+    }).catch(()=>setStatus("操作未开始，请重试"));
   });
 }
 
 // ===== 文件夹显示：竖排二级菜单 =====
 let foldersState = null;
-function fmTreeHtml(tree, hidden, depth) {
-  return tree.map((n) => {
-    const isHidden = hidden.has(n.path);
-    const kids = n.children.length ? fmTreeHtml(n.children, hidden, depth + 1) : "";
-    return '<div class="fm-item" data-path="' + esc(n.path) + '" style="padding-left:' + (12 + depth * 18) + 'px">' +
-      '<span class="fm-icon">' + "" + "</span>" +
-      '<span class="fm-name">' + esc(n.name) + "</span>" +
-      '<span class="fm-state ' + (isHidden ? "off" : "on") + '">' + (isHidden ? "隐藏" : "显示") + "</span></div>" + kids;
-  }).join("");
+function fmDirectoryVisible(path) {
+  let key=String(path).replace(/\\/g,'/').replace(/^\/+|\/+$/g,'').toLowerCase();
+  const choices=foldersState.visibility || {};
+  if(foldersState.include_subfolders===false)return Object.hasOwn(choices,key)?choices[key]:!key.includes('/');
+  while(key){if(Object.hasOwn(choices,key))return choices[key];key=key.includes('/')?key.slice(0,key.lastIndexOf('/')):'';}
+  return true;
+}
+// Parent clicks are explicit subtree operations, not merely inherited defaults.
+function fmSubtreeChoices(path, visible) {
+  const normal=p=>String(p).replace(/\\/g,'/').replace(/^\/+|\/+$/g,'').toLowerCase();
+  const key=normal(path),choices={...(foldersState.visibility||{})};
+  if(!key)return choices;
+  const inside=p=>normal(p)===key||normal(p).startsWith(key+'/');
+  // Reset old descendant overrides too, even if that folder is no longer in the tree.
+  for(const p of Object.keys(choices))if(inside(p))choices[p]=visible;
+  choices[key]=visible;
+  (function walk(nodes){for(const node of nodes||[]){if(inside(node.path))choices[normal(node.path)]=visible;walk(node.children);}})(foldersState.tree);
+  return choices;
+}
+function fmTreeHtml(tree, depth) {
+  return (tree||[]).map(n=>{
+    const visible=fmDirectoryVisible(n.path);
+    return '<div class="fm-item" role="checkbox" tabindex="0" aria-checked="'+visible+'" data-path="'+esc(n.path)+'" style="padding-left:'+(12+depth*18)+'px">'+
+      '<input type="checkbox" tabindex="-1" aria-hidden="true"'+(visible?' checked':'')+'/>'+_icon('folder')+'<span class="fm-name">'+esc(n.name)+'</span>'+
+      '<span class="fm-state '+(visible?'on':'off')+'">'+(visible?'显示':'排除')+'</span></div>'+fmTreeHtml(n.children,depth+1);
+  }).join('');
 }
 function fmRender() {
-  const panel = $("#mmFoldersPanel");
-  if (!foldersState) return;
-  const hidden = new Set(foldersState.hidden || []);
-  const showRoot = foldersState.show_root;
-  panel.innerHTML =
-    '<div class="fm-title">文件夹显示（点击条目切换）</div>' +
-    '<div class="fm-toolbar">' +
-    '<button class="btn btn-tiny" id="fmAll">全选</button>' +
-    '<button class="btn btn-tiny" id="fmNone">全不选</button></div>' +
-    '<div class="fm-item fm-top" data-path="__root__">' +
-      '<span class="fm-icon"></span><span class="fm-name">根目录下的模型</span>' +
-      '<span class="fm-state ' + (showRoot ? "on" : "off") + '">' + (showRoot ? "显示" : "隐藏") + "</span></div>" +
-    '<hr class="fp-sep"/>' +
-    fmTreeHtml(foldersState.tree || [], hidden, 0);
+  const panel=$('#mmFoldersPanel');if(!foldersState)return;
+  const showRoot=foldersState.show_root;
+  panel.innerHTML='<div class="fm-title">模型文件夹显示</div><div class="fm-title">'+
+    (foldersState.include_subfolders===false?'直属模式：点击父文件夹也会同步勾选或排除已列出的子文件夹。':'默认全部显示。点击父文件夹同步切换整个子树，再单独调整子文件夹。想只显示 A/B：先排除 A，再显示 A/B。显示 A、排除 B：仅排除 B 子树。')+
+    ' 不移动或删除文件。</div><div class="fm-toolbar"><button class="btn btn-tiny" id="fmAll">全部显示</button><button class="btn btn-tiny" id="fmNone">全部排除</button></div>'+
+    '<div class="fm-item fm-top" role="checkbox" tabindex="0" aria-checked="'+showRoot+'" data-path="__root__"><input type="checkbox" tabindex="-1" aria-hidden="true"'+(showRoot?' checked':'')+'/>'+
+    '<span class="fm-name">根目录下的模型</span><span class="fm-state '+(showRoot?'on':'off')+'">'+(showRoot?'显示':'排除')+'</span></div><hr class="fp-sep"/>'+fmTreeHtml(foldersState.tree||[],0);
 }
-// 文件夹全选/全不选：隐藏集合整体变更后保存并刷新
-function fmSetHidden(nextHidden) {
-  foldersState.hidden = nextHidden;
-  api.call("save_folders", nextHidden, foldersState.show_root).then(() => {
-    fmRender();
+// 独立弹层：锁定工具栏的 overflow 不再裁切文件夹菜单。
+let fmAnchor = null, fmRequest = 0, fmSaving = false;
+function fmClose(restoreFocus = false) {
+  ++fmRequest;
+  $("#mmFoldersPanel").classList.remove("open");
+  $("#mmFolders").setAttribute("aria-expanded", "false");
+  if (restoreFocus && fmAnchor) fmAnchor.focus();
+}
+function fmPosition() {
+  const panel = $("#mmFoldersPanel");
+  if (!panel.classList.contains("open") || !fmAnchor) return;
+  if (!fmAnchor.getClientRects().length || !$("#page-models").classList.contains("active")) { fmClose(); return; }
+  const z = Number(document.documentElement.style.zoom) || 1;
+  const rect = fmAnchor.getBoundingClientRect(), gap = 8;
+  panel.style.minWidth = "0";
+  panel.style.width = Math.min(340 * z, innerWidth - 2 * gap) / z + "px";
+  const below = innerHeight - rect.bottom - 2 * gap, above = rect.top - 2 * gap;
+  const upwards = below < 180 * z && above > below;
+  panel.style.maxHeight = Math.max(60, Math.min(440 * z, upwards ? above : below, innerHeight - 2 * gap)) / z + "px";
+  const box = panel.getBoundingClientRect();
+  panel.style.left = Math.max(gap, Math.min(rect.left, innerWidth - box.width - gap)) / z + "px";
+  panel.style.top = Math.max(gap, Math.min(upwards ? rect.top - box.height - gap : rect.bottom + gap, innerHeight - box.height - gap)) / z + "px";
+}
+async function fmSave(visibility, showRoot) {
+  if (!foldersState || fmSaving) return;
+  fmSaving = true;
+  const panel = $("#mmFoldersPanel");
+  const focusedPath=panel.contains(document.activeElement)?document.activeElement.closest(".fm-item")?.dataset.path:null;
+  panel.setAttribute("aria-busy", "true");
+  try {
+    const nextHidden=Object.keys(visibility).filter(p=>visibility[p]===false);
+    const saved = await api.call("save_folders", nextHidden, showRoot, visibility);
+    if (saved !== true) throw new Error("save_folders failed");
+    foldersState.hidden = nextHidden; foldersState.visibility=visibility; foldersState.show_root = showRoot;
+    Object.assign(state.cfg,{hidden_model_folders:nextHidden,model_folder_visibility:{...visibility},show_root_models:showRoot});
+    // A changed folder scope must not leave hidden models selected while the scan refreshes.
+    state.mmChecked.clear();state.mmSel.clear();state.mmLastSel=-1;renderMm();
+    fmRender(); fmPosition();
+    if(focusedPath)panel.querySelector('.fm-item[data-path="'+CSS.escape(focusedPath)+'"]')?.focus();
+    setStatus("文件夹显示已保存（仅筛选显示，不移动或删除模型）");
     mmScan();
-  });
+  } catch (err) { setStatus("文件夹显示保存失败，请重试"); }
+  finally { fmSaving = false; panel.removeAttribute("aria-busy"); }
 }
 $("#mmFoldersPanel").addEventListener("click", (e) => {
+  e.stopPropagation();
   const btn = e.target.closest("#fmAll, #fmNone");
-  if (!btn) return;
-  if (!foldersState) return;
-  const all = [];
-  (function walk(nodes) {
-    (nodes || []).forEach((n) => {
-      all.push(n.path);
-      walk(n.children);
-    });
-  })(foldersState.tree || []);
-  if (btn.id === "fmAll") fmSetHidden([]);       // 全部显示
-  else fmSetHidden(all);                          // 全部隐藏
+  if (btn && foldersState) {
+    const all = [];
+    (function walk(nodes) { (nodes || []).forEach(n => { all.push(n.path); walk(n.children); }); })(foldersState.tree);
+    const visible=btn.id==='fmAll';
+    fmSave(Object.fromEntries(all.map(p=>[p.replace(/\\/g,'/').toLowerCase(),visible])),visible);
+    return;
+  }
+  const item = e.target.closest(".fm-item");
+  if (!item || !foldersState) return;
+  e.preventDefault();
+  const path=item.dataset.path, choices=path==="__root__"?{...(foldersState.visibility||{})}:fmSubtreeChoices(path,!fmDirectoryVisible(path));
+  fmSave(choices,path==="__root__"?!foldersState.show_root:foldersState.show_root);
 });
+$("#mmFoldersPanel").addEventListener("keydown",e=>{if((e.key===' '||e.key==='Enter')&&e.target.matches('.fm-item')){e.preventDefault();e.target.click();}});
 $("#mmFolders").addEventListener("click", async (e) => {
   e.stopPropagation();
   const panel = $("#mmFoldersPanel");
-  if (panel && panel.classList.contains("open")) {
-    panel.classList.remove("open");
-    return;
-  }
-  const json = await api.call("get_folders");
-  try {
-    foldersState = JSON.parse(json || "{}");
-  } catch (err) { foldersState = {}; }
-  if (!foldersState || !foldersState.tree) { setStatus("请先配置模型管理目录"); return; }
-  fmRender();
+  if (panel.classList.contains("open")) { fmClose(); return; }
+  fmAnchor = e.currentTarget.getClientRects().length ? e.currentTarget : $("[data-menu='mmMoreMenu']");
+  if (panel.parentElement !== document.body) document.body.appendChild(panel);
   panel.classList.add("open");
+  $("#mmFolders").setAttribute("aria-expanded", "true");
+  panel.innerHTML = '<div class="fm-title">正在读取文件夹…</div>';
+  fmPosition();
+  const request = ++fmRequest;
+  try {
+    const json = await api.call("get_folders");
+    if (request !== fmRequest) return;
+    const data = typeof json === "string" ? JSON.parse(json || "{}") : json;
+    if (!data || !data.root || !Array.isArray(data.tree)) {
+      panel.innerHTML = '<div class="fm-title">请先在设置中配置模型管理目录</div>'; return;
+    }
+    foldersState = {...data, hidden: data.hidden || [], visibility:data.visibility||Object.fromEntries((data.hidden||[]).map(p=>[p.replace(/\\/g,'/').toLowerCase(),false])), show_root: data.show_root !== false};
+    _mmFolderTree = data.tree;
+    fmRender();
+    if (!data.tree.length) panel.insertAdjacentHTML("beforeend", '<div class="fm-title">暂无子文件夹，根目录模型仍可单独切换</div>');
+  } catch (err) {
+    if (request === fmRequest) { panel.innerHTML = '<div class="fm-title">文件夹读取失败，请关闭后重试</div>'; setStatus("文件夹读取失败，请重试"); }
+  } finally { if (request === fmRequest) fmPosition(); }
 });
-document.addEventListener("click", (e) => {
-  const panel = $("#mmFoldersPanel");
-  if (panel && panel.classList.contains("open") && !e.target.closest("#mmFoldersWrap")) {
-    panel.classList.remove("open");
-  }
+document.addEventListener("click", e => {
+  if (!e.target.closest("#mmFoldersWrap, #mmFoldersPanel, [data-proxy='mmFolders']")) fmClose();
 });
-$("#mmFoldersPanel").addEventListener("click", async (e) => {
-  const item = e.target.closest(".fm-item");
-  if (!item || !foldersState) return;
-  const path = item.dataset.path;
-  const hidden = new Set(foldersState.hidden || []);
-  if (path === "__root__") {
-    foldersState.show_root = !foldersState.show_root;
-  } else {
-    if (hidden.has(path)) hidden.delete(path); else hidden.add(path);
-    foldersState.hidden = Array.from(hidden);
-  }
-  await api.call("save_folders", Array.from(hidden), foldersState.show_root);
-  fmRender();
-  setStatus("文件夹显示已保存");
-  await api.call("scan_models");
-  pollMmScan();
-});
+document.addEventListener("keydown", e => { if (e.key === "Escape" && $("#mmFoldersPanel").classList.contains("open")) fmClose(true); });
+window.addEventListener("resize", fmPosition);
+window.addEventListener("cft:zoom", fmPosition);
+document.addEventListener("scroll", e => { if (!$("#mmFoldersPanel").contains(e.target)) fmPosition(); }, true);
+
+// 详情单模型立即反查：不切页，不启动批量队列里的其它模型。
+let detailRpPath=null;
+async function identifyDetailModel(path){
+  if(detailRpPath){setStatus('当前已有模型正在识别，请稍候');return false;}
+  detailRpPath=path;let failures=0;
+  const updateButton=()=>{if($('#dRp'))$('#dRp').disabled=!!detailRpPath;};updateButton();
+  try{
+    const start=await api.call('rp_identify_model',path);
+    if(!start?.started){setStatus(start?.msg||'识别未启动');return false;}
+    setStatus('正在识别当前模型：'+String(path).split(/[\\/]/).pop());
+    while(true){
+      await new Promise(r=>setTimeout(r,600));
+      let progress,rows;
+      try{[progress,rows]=await Promise.all([api.call('rp_state'),api.call('rp_get_rows')]);failures=0;}
+      catch(_){if(++failures<3)continue;setStatus('暂时无法读取进度；后端识别仍在继续，请稍后检查');return false;}
+      const row=(rows||[]).find(r=>normalizedModelPath(r.path)===normalizedModelPath(path));
+      if(progress?.running){setStatus((progress.msg||'正在反查')+' · '+(progress.progress||0)+'% · '+String(path).split(/[\\/]/).pop());continue;}
+      if(row?.status==='成功'){
+        const parsed=JSON.parse((await api.call('get_scan_rows'))||'[]');if(Array.isArray(parsed)){state.models=parsed;applyMmFilter();}
+        if(normalizedModelPath(detailRow?.path)===normalizedModelPath(path))await showModelDetail(path);
+        setStatus('模型识别完成：'+(row.model||String(path).split(/[\\/]/).pop()));return true;
+      }
+      setStatus('模型识别'+(row?.status||'未完成')+(row?.model?'：'+row.model:''));return false;
+    }
+  }catch(_){setStatus('当前模型识别启动失败，请检查日志或网络后重试');return false;}
+  finally{detailRpPath=null;updateButton();}
+}
 
 // 模型详情二级界面（C 站风格）
 let detailRow = null;
+let detailGeneration = 0;
 // 详情面板全局状态（document 级图片右键委托需要访问）
 let detailImgIdx = 0;
 let detailImgLocalPath = null;
@@ -2777,12 +3154,16 @@ function syncDialogRender(d, st) {
   const okb = dlg.querySelector("#sdOk"); if (okb) okb.addEventListener("click", () => syncDialogClose(d));
 }
 
-async function showModelDetail(path) {
-  const json = await api.call("get_model_detail", path);
+async function showModelDetail(path, historyId = "") {
+  const generation = ++detailGeneration;
+  let json;try{json = await api.call(historyId ? "get_history_detail" : "get_model_detail", historyId || path);}catch(_){if(generation===detailGeneration)setStatus('详情读取异常，请检查元数据或刷新后重试');return;}
   let d;
-  try { d = JSON.parse(json || "{}"); } catch (e) { d = {}; }
-  if (!d.ok) { setStatus("详情获取失败"); return; }
+  try { d = typeof json==='object' && json!==null?json:JSON.parse(json || "{}"); } catch (e) { d = {}; }
+  if (generation !== detailGeneration || !$("#page-models").classList.contains("active")) return;
+  if (!d.ok) { setStatus(d.msg||"详情获取失败：元数据格式异常或文件不可读取"); return; }
   detailRow = d;
+  detailRow.history_id = historyId;
+  document.body.classList.add("models-workspace");
   const info = d.info || {};
   const v = info.version || {};
   const creator = (info.creator && info.creator.username) || info.creator || "";
@@ -2807,14 +3188,14 @@ async function showModelDetail(path) {
       '<div class="dt-head-t">模型详情</div>' +
       '<div class="dt-head-r">' +
         (creator ? '<span class="dt-author author-chip" data-author="' + esc(creator) + '" data-tip="点击复制作者链接">' + esc(creator) + '</span>' : "") +
-        '<button class="icon-btn dt-close" id="dClose" data-tip="关闭（Esc）">' + _icon("x") + '</button>' +
+        '<button class="icon-btn dt-close" id="dFavorite" aria-pressed="'+isModelFavorite(d.path)+'" title="收藏并置顶 / 取消收藏">' + _icon('star') + '</button>' +
       '</div>' +
     '</div>' +
     '<div class="dt-body">' +
     '<div class="detail-left">' +
     (mainB64
       ? '<img class="detail-main-img" id="dMain" src="data:image/jpeg;base64,' + mainB64.b64 + '"/>'
-      : '<div class="detail-main-img dt-empty" id="dMain">' + _icon("image", "ic-lg") + '<span>暂无封面</span></div>') +
+      : covers.length?'<img class="detail-main-img" id="dMain" data-empty="true" alt="示例图片"/>':'<div class="detail-main-img dt-empty" id="dMain">' + _icon("image", "ic-lg") + '<span>暂无封面</span></div>') +
     '<div class="detail-thumbs">' + covers.map((c, i) =>
       c.b64
         ? '<img class="detail-thumb' + (i === 0 ? " on" : "") + '" data-i="' + i + '" src="data:image/jpeg;base64,' + c.b64 + '"/>'
@@ -2822,6 +3203,7 @@ async function showModelDetail(path) {
     ).join("") + "</div></div>" +
     '<div class="detail-right">' +
     '<div class="detail-title">' + esc(info.name || d.name || "-") + "</div>" +
+    (info.association?.hash_verified === false ? '<p class="binding-warning">手动关联来源信息 · SHA256 校验不一致，不能据此确认文件与官方模型相同。</p>' : '') +
     (info.modelName && info.modelName !== info.name ? '<div class="detail-cname">' + esc(info.modelName) + "</div>" : "") +
     '<div class="dt-mrs">' +
       '<div class="dt-mr"><span class="k">类型</span><span class="v">' + esc(info.type || "-") + "</span></div>" +
@@ -2851,6 +3233,7 @@ async function showModelDetail(path) {
       "</div></div>" +
       '<div class="dt-ag"><div class="dt-ag-h">文件</div><div class="dt-ag-b">' +
         '<button class="btn" id="dRename" data-tip="自定义改名（保留扩展名）">' + _icon("pencil") + '改名</button>' +
+        '<button class="btn" id="dRenameC" data-tip="先预览，确认后仅改这个模型及附属文件">' + _icon('file') + '文件名 → C站名称</button>' +
         '<button class="btn" id="dCover" data-tip="用本地图片替换封面">' + _icon("image") + '设置封面</button>' +
       "</div></div>" +
       '<div class="dt-ag"><div class="dt-ag-h">信息处理</div><div class="dt-ag-b">' +
@@ -2866,10 +3249,15 @@ async function showModelDetail(path) {
     "</div>" +
     "</div></div>";
   $("#detailMask").style.display = "flex";
+  if (d.cached_history) {
+    panel.querySelector('.detail-title').insertAdjacentHTML('afterend', '<p class="history-model">历史信息缓存 · 本地文件已移走或不存在，仅供查看</p>');
+    panel.querySelectorAll('#dEditInfo,#dRename,#dRenameC,#dCover,#dRp,#dSync,#dTranslate,#dLocalize,#dJson,#dAllImgs').forEach(button => button.disabled = true);
+  }
   // 自动加载所有 URL 缩略图（避免空占位）
   covers.forEach((c, i) => {
     if (!c.b64 && c.url) {
       api.call("get_cover_b64", c.url).then((b64) => {
+        if (generation !== detailGeneration) return;
         if (!b64) {
           // 加载失败：移除该占位缩略图
           const th = panel.querySelector('.detail-thumb[data-i="' + i + '"]');
@@ -2880,30 +3268,34 @@ async function showModelDetail(path) {
         const th = panel.querySelector('.detail-thumb[data-i="' + i + '"]');
         if (th) th.src = "data:image/jpeg;base64," + b64;
         const main = $("#dMain");
-        if (main && main.src.indexOf("data:image/jpeg;base64,") < 0 && main.getAttribute("src") !== undefined && (!mainB64 || main.dataset.empty)) {
+        if (main?.tagName==="IMG" && detailImgIdx===i && main.dataset.hdIndex!==String(i) && (!main.src || main.dataset.empty)) {
           main.src = "data:image/jpeg;base64," + b64;
-          main.style.opacity = "1";
+          main.style.opacity = "1";delete main.dataset.empty;
         }
       });
     }
   });
+  $("#dMain", panel).addEventListener("click", () => openImageViewer(detailRow, detailImgIdx));
+  $("#dMain", panel).setAttribute("title", "点击放大图片并查看生成数据");
+  $("#dMain", panel).tabIndex=0;
+  $("#dMain", panel).addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();openImageViewer(detailRow,detailImgIdx);}});
   // 画廊切换
-  const loadB64 = async (i) => {
-    const c = covers[i];
-    if (!c) return;
-    detailImgIdx = i;
-    detailImgLocalPath = (c.local && d.path) ? d.path : null;
-    const img = $("#dMain");
-    if (c.b64) { img.src = "data:image/jpeg;base64," + c.b64; }
-    else if (c.url) {
-      img.style.opacity = "0.5";
-      const b64 = await api.call("get_cover_b64", c.url);
-      if (b64) { img.src = "data:image/jpeg;base64," + b64; c.b64 = b64; }
-      img.style.opacity = "1";
+  let imageChoiceGeneration=0;
+  const loadB64=async i=>{
+    const c=covers[i];if(!c)return;
+    const choice=++imageChoiceGeneration;detailImgIdx=i;detailImgLocalPath=c.local?d.path:null;
+    const image=panel.querySelector('#dMain');delete image.dataset.hdIndex;
+    panel.querySelectorAll('.detail-thumb').forEach(t=>t.classList.toggle('on',Number(t.dataset.i)===i));
+    const current=()=>generation===detailGeneration && detailImgIdx===i && choice===imageChoiceGeneration;
+    const warm=typeof warmViewedGallery==='function'?await warmViewedGallery(detailRow,i):null;
+    if(!current())return;
+    if(warm){image.src=warm.url;image.dataset.hdIndex=String(i);image.style.opacity='1';delete image.dataset.empty;return;}
+    if(c.b64){image.src='data:image/jpeg;base64,'+c.b64;delete image.dataset.empty;}
+    else if(c.url){
+      image.style.opacity='.5';const b64=await api.call('get_cover_b64',c.url);
+      if(!current())return;
+      if(b64){image.src='data:image/jpeg;base64,'+b64;c.b64=b64;delete image.dataset.empty;}image.style.opacity='1';
     }
-    panel.querySelectorAll(".detail-thumb").forEach((t) => t.classList.remove("on"));
-    const th = panel.querySelector('.detail-thumb[data-i="' + i + '"]');
-    if (th) th.classList.add("on");
   };
   panel.querySelectorAll(".detail-thumb").forEach((t) => {
     t.addEventListener("click", () => loadB64(Number(t.dataset.i)));
@@ -3015,13 +3407,10 @@ async function showModelDetail(path) {
     setStatus(r.ok ? "已下载 " + r.downloaded + " 张图片" : "失败: " + (r.msg || ""));
     if (r.ok) { closeDetail(); showModelDetail(d.path); }
   });
+  $("#dRenameC", panel).addEventListener("click", () => renameDetailToCivitai(d));
   $("#dRename", panel).addEventListener("click", () => { closeDetail(); showRenameDialog(d.path, d.name); });
-  $("#dRp", panel).addEventListener("click", async () => {
-    await api.call("rp_add_paths", [d.path]);
-    closeDetail();
-    setStatus("已发送去识别模型信息");
-    document.querySelector('.nav-tab[data-page="reverse"]').click();
-  });
+  $("#dRp", panel).disabled=!!detailRpPath;
+  $("#dRp", panel).addEventListener("click", () => identifyDetailModel(d.path));
   $("#dSync", panel).addEventListener("click", async () => {
     const btn = $("#dSync", panel);
     if (btn) btn.disabled = true;
@@ -3102,7 +3491,18 @@ async function showModelDetail(path) {
     }
     setStatus(ok ? "简介已复制" : "复制失败（可手动选中复制）");
   });
-  $("#dClose", panel).addEventListener("click", closeDetail);
+  $("#dFavorite", panel).addEventListener("click", () => toggleModelFavorite(d.path));
+  // 只准备本地已有缓存的在线图；未知在线图不会后台下载。串行、空闲调度，避免同时解码整组图片。
+  if(typeof warmViewedGallery==='function'){
+    const prepare=async i=>{
+      if(generation!==detailGeneration || detailRow!==d || i>=covers.length)return;
+      const entry=await warmViewedGallery(d,i);
+      if(generation!==detailGeneration || detailRow!==d)return;
+      if(entry && detailImgIdx===i){const image=panel.querySelector('#dMain');if(image?.tagName==='IMG'){image.src=entry.url;image.dataset.hdIndex=String(i);image.style.opacity='1';delete image.dataset.empty;}}
+      const next=()=>prepare(i+1);if(window.requestIdleCallback)requestIdleCallback(next,{timeout:500});else setTimeout(next,40);
+    };
+    prepare(0);
+  }
 }
 // 详情图片右键：复制/打开文件夹/复制提示词/打开原图（document 级委托）
 let detailImgCtx = null;
@@ -3149,6 +3549,8 @@ $("#ctxMenu").addEventListener("click", async (e) => {
     // 本地图文件路径：优先图自身 local_path（右键哪张就用哪张），本地图无路径时用模型文件兜底
     const localImgPath = c.local_path || (c.local ? detailRow.path : null);
     if (act === "img_copy") {
+      try {const result=await api.call('copy_gallery_image',detailRow.path,idx,detailRow.history_id||'');if(result?.ok){showToast(result.msg);return;}} catch(_){}
+
       // 复制图片本身到剪贴板（本地图读原图；远程图用已加载的 b64；都没有才复制路径/链接）
       let b64 = null;
       if (c.local_path) {
@@ -3239,22 +3641,16 @@ document.addEventListener("keydown", (e) => {
   }
 });
 function closeDetail() {
+  detailGeneration++;
   $("#detailMask").style.display = "none";
   $("#detailPanel").innerHTML = "";
   detailRow = null;
+  if (typeof syncModelInspector === "function") syncModelInspector($("#page-models").classList.contains("active"));
 }
 $("#detailMask").addEventListener("click", (e) => {
   if (e.target.id === "detailMask") closeDetail();
 });
-// 打开入口：行双击 / 瀑布流卡片双击（单击统一为选中）
-document.addEventListener("dblclick", (e) => {
-  // 双击只对"模型主体"生效：按钮 / 链接 / 输入 / 下拉 / 自绘勾选 等交互控件上的双击不打开详情（防冒泡误触）
-  if (e.target.closest("button, a, input, select, textarea, .cbox, .ms-check, .ms-upd, .btn, .mm-menu")) return;
-  const tr = e.target.closest("tr[data-path]");
-  if (tr && tr.dataset.path) showModelDetail(tr.dataset.path);
-  const card = e.target.closest(".ms-card");
-  if (card && card.dataset.path) showModelDetail(card.dataset.path);
-});
+// 模型详情在单击选中后更新，不再另发双击请求；下载历史的双击入口保持独立。
 
 // ===== 工作流分析（独立页面：拖入/选择 → 解析 → 节点 + 模型哈希匹配） =====
 function wfSetStatus(t, k) {
@@ -3278,73 +3674,10 @@ async function wfAnalyze(path) {
   wfRenderResult(r);
 }
 async function wfRenderResult(r) {
-  $("#wfResult").style.display = "block";
-  const isPng = /\.png$/i.test(r.file || "");
-  $("#wfResultTitle").innerHTML =
-    '<div class="wf-file">' +
-    '<span class="wf-file-ico"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-file"/></svg></span>' +
-    '<span class="wf-file-name" title="' + esc(r.file) + '">' + esc(r.file) + "</span>" +
-    '<span class="wf-tags">' +
-    '<span class="wf-tag">' + (isPng ? "PNG" : "JSON") + "</span>" +
-    '<span class="wf-tag">' + (r.has_workflow ? "含内嵌 Workflow" : "仅提示词信息") + "</span>" +
-    '<span class="wf-tag">节点 ' + (r.node_count || 0) + " 个</span>" +
-    "</span>" +
-    '<span class="wf-file-actions"><button class="btn" id="wfRechoose">重新选择</button><button class="btn btn-primary" id="wfReanalyze">重新分析</button></span>' +
-    "</div>";
-  const nodes = r.nodes || [];
-  const NODE_COLORS = ["#7c5cff", "#2f7cf6", "#1f9d4d", "#e08a00", "#00a0b0", "#d9534f", "#8e6bbf", "#4a90d9"];
-  const nodeIco = (t) => {
-    let h = 0; const sb = String(t || "?");
-    for (let k = 0; k < sb.length; k++) h = (h * 31 + sb.charCodeAt(k)) >>> 0;
-    const c = NODE_COLORS[h % NODE_COLORS.length];
-    return '<span class="wf-node-ico" style="--nc:' + c + '"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-grid"/></svg></span>';
-  };
-  $("#wfNodes").innerHTML = nodes.length
-    ? nodes.map((n) => {
-      const wtxt = (n.widgets && n.widgets.length) ? n.widgets.join(" · ") : "";
-      const key = [n.type, n.title, wtxt].join(" ").toLowerCase();
-      return '<div class="wf-node" data-search="' + esc(key) + '">' + nodeIco(n.type) +
-        '<span class="wf-node-type">' + esc(n.type || "?") + "</span>" +
-        (n.title ? '<span class="wf-node-title">' + esc(n.title) + "</span>" : "") +
-        (wtxt ? '<span class="wf-node-widgets">' + esc(wtxt) + "</span>" : "") +
-        '<span class="wf-node-arrow">\u203a</span></div>';
-    }).join("")
-    : '<div class="wf-empty">未识别到节点</div>';
-  { const nc = $("#wfNodeCount"); if (nc) nc.textContent = nodes.length ? nodes.length + " 个节点" : ""; }
-  { const ns = $("#wfNodeSearch"); if (ns) { ns.value = ""; try { ns.dispatchEvent(new Event("input")); } catch (e) { } } }
-  const refs = r.models || [];
-  $("#wfModels").innerHTML = '<div class="wf-hint">本地匹配计算中...</div>';
-  if (refs.length) {
-    try {
-      const mjson = await api.call("workflow_model_matches", refs);
-      const matches = JSON.parse(mjson || "[]");
-      $("#wfModels").innerHTML = matches.map((m) =>
-        '<div class="wf-model' + (m.local ? " hit" : "") + '">' +
-        '<span class="wf-model-ref">' + esc(m.ref) + "</span>" +
-        (m.local
-          ? '<span class="wf-badge hit">✓ 本地匹配</span>' +
-            '<span class="wf-model-path">' + esc(m.path) + "</span>" +
-            (m.sha256 ? '<span class="wf-model-sha">SHA256: ' + esc(m.sha256) + "…</span>" : "")
-          : '<span class="wf-badge miss">未在本地找到</span>' +
-            '<span class="wf-model-sub">本地: 未找到</span>' +
-            '<span class="wf-search" data-search="' + esc(m.ref) + '">搜索下载</span>') +
-        "</div>").join("");
-    } catch (e) {
-      $("#wfModels").innerHTML = '<div class="wf-empty">模型匹配失败</div>';
-    }
-  } else {
-    $("#wfModels").innerHTML = '<div class="wf-empty">未识别到模型引用</div>';
-  }
-  const pos = r.positive || r.pos_prompt || "";
-  const neg = r.negative || r.neg_prompt || "";
-  wfLastPromptText = [pos ? "正向:\n" + pos : "", neg ? "负向:\n" + neg : ""].filter(Boolean).join("\n\n");
-  { const cp = $("#wfCopy"); if (cp) cp.style.display = (pos || neg) ? "" : "none"; }
-  $("#wfPrompts").innerHTML =
-    (pos ? '<div class="wf-prompt"><span class="wf-prompt-label">正向</span><div class="wf-prompt-text">' + esc(pos) + "</div></div>" : "") +
-    (neg ? '<div class="wf-prompt"><span class="wf-prompt-label neg">负向</span><div class="wf-prompt-text">' + esc(neg) + "</div></div>" : "") +
-    ((!pos && !neg) ? '<div class="wf-empty">未从该 Workflow 中提取到提示词</div>' : "");
+  if (r.source_path) wfLastPath = r.source_path;
+  return window.CftWorkflow.render(r);
 }
-const wfDrop = $("#wfDrop");
+const wfDrop = $(".wf-workspace");
 wfDrop.addEventListener("dragover", (e) => { e.preventDefault(); wfDrop.classList.add("over"); });
 wfDrop.addEventListener("dragleave", () => wfDrop.classList.remove("over"));
 wfDrop.addEventListener("drop", (e) => {
@@ -3396,15 +3729,6 @@ $("#wfPick").addEventListener("click", async () => {
       else setStatus("没有可重新分析的文件");
     }
   }); }
-{ const ns = $("#wfNodeSearch");
-  if (ns) ns.addEventListener("input", () => {
-    const kw = ns.value.trim().toLowerCase();
-    document.querySelectorAll("#wfNodes .wf-node").forEach((row) => {
-      row.style.display = (!kw || String(row.dataset.search || "").includes(kw)) ? "" : "none";
-    });
-  }); }
-
-
 // ===== 关于弹窗（右下角「关于」/左上角 logo） =====
 async function showAbout() {
   const mask = document.createElement("div");
@@ -3421,14 +3745,14 @@ async function showAbout() {
     '<div class="about-head">' +
     '<img class="about-logo" src="bili_face.png" alt=""/>' +
     '<div><div class="about-name">CivitaiFreeTool <span class="about-ver">' + esc(ver) + '</span></div>' +
-    '<div style="font-size:12px;color:var(--text-dim)">Civitai / HuggingFace 模型下载、管理、反向解析工具（免费全功能）</div></div></div>' +
+    '<div style="font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim)">Civitai / HuggingFace 模型下载、管理、反向解析工具（免费全功能）</div></div></div>' +
     '<div class="about-updates">' +
-    '<div class="about-up-title">🆕 最近更新（' + esc(ver) + '）</div>' +
+    '<div class="about-up-title">最近更新（' + esc(ver) + '）</div>' +
     '<div class="about-up-body">' +
-    '<div class="about-up-item"><b>修复「翻译成中文」不生效</b>：简介+触发词一起翻，写回 info 与 json，英文原文保留，复制触发词仍为英文原文（WebUI 用）</div>' +
-    '<div class="about-up-item"><b>下载体验</b>：批量下载跳转弹窗提示；移动分类弹窗显示模型缩略图；下载列表新增缩略图列+行右键菜单（打开文件夹/复制文件名/打开C站）</div>' +
-    '<div class="about-up-item"><b>新手引导大修</b>：点击功能卡片/主题切换即刻生效；引导缩小为右下角小窗不中断；保存设置不再白屏刷新</div>' +
-    '<div class="about-up-item">10 套主题 + 氛围背景跟随主题；设置页「保存设置」红色显眼</div>' +
+    '<div class="about-up-item"><b>左右工作台</b>：左侧导航可收起，模型详情改为右侧抽屉，统一线性图标。</div>' +
+    '<div class="about-up-item"><b>设置重构</b>：八个分类、跨分类搜索、常用与高级分开，功能说明直接展示。</div>' +
+    '<div class="about-up-item"><b>分类规则</b>：使用流程与示例放在旁边，格式错误明确提示，插入示例不覆盖已有内容。</div>' +
+    '<div class="about-up-item"><b>下载历史</b>：自动保存并恢复任务，收起队列不删除历史。旧版未保存的记录无法补回。</div>' +
     '</div></div>' +
     '<div class="about-thanks">' +
     '<div class="about-up-title">感谢 Contributors</div>' +
@@ -3491,12 +3815,14 @@ if (_logoEl) _logoEl.addEventListener("click", showAbout);
     if (!text || !text.trim()) { tip.style.display = "none"; return; }
     tip.textContent = text.trim();
     tip.style.display = "block";
-    tip.classList.remove("show");
-    void tip.offsetWidth;
     tip.classList.add("show");
     const zf = parseFloat(document.documentElement.style.zoom) || 1;
-    tip.style.left = (e.clientX / zf + 14) + "px";
-    tip.style.top = (e.clientY / zf + 14) + "px";
+    tip.style.maxWidth=Math.min(360,(innerWidth-16)/zf)+"px";
+    const width=tip.offsetWidth*zf,height=tip.offsetHeight*zf;
+    const x=e.clientX+14+width>innerWidth-8?e.clientX-width-14:e.clientX+14;
+    const y=e.clientY+14+height>innerHeight-8?e.clientY-height-14:e.clientY+14;
+    tip.style.left=Math.max(8,Math.min(x,innerWidth-width-8))/zf+"px";
+    tip.style.top=Math.max(8,Math.min(y,innerHeight-height-8))/zf+"px";
     clearTimeout(tip._h);
     tip._h = setTimeout(() => { tip.style.display = "none"; }, 3000);
   });
@@ -3504,44 +3830,37 @@ if (_logoEl) _logoEl.addEventListener("click", showAbout);
 
 // ===== 模型管理右键菜单 =====
 let ctxRow = null;
-$("#mmTable tbody").addEventListener("contextmenu", (e) => {
-  const tr = e.target.closest("tr[data-path]");
-  if (!tr) return;
-  e.preventDefault();
-  ctxRow = state.display.find((r2) => r2.path === tr.dataset.path) || null;
-  if (!ctxRow) return;
-  const menu = $("#ctxMenu");
-  const r = ctxRow;
-  menu.innerHTML =
-    '<div class="ctx-item" data-act="copy_name" data-tip="复制当前本地文件名">复制文件名</div>' +
-    '<div class="ctx-item" data-act="copy_cname" data-tip="复制 C 站上的模型名（不改本地文件）">🀄 复制C站模型名</div>' +
-    '<div class="ctx-item" data-act="folder" data-tip="打开资源管理器并选中该文件">打开所在文件夹</div>' +
-    '<div class="ctx-item" data-act="site" data-tip="在浏览器打开该模型在 C 站的主页">打开C站</div>' +
-    '<div class="ctx-item" data-act="rename" data-tip="自定义改名（保留扩展名）">改名</div>' +
-    '<div class="ctx-item" data-act="rename_c" data-tip="把本地文件名改成 C 站上的模型名（只改本地文件）">文件名改成C站名</div>' +
-    '<div class="ctx-item" data-act="sdjson" data-tip="生成 WebUI 能识别的「模型名.json」元数据文件">生成SD可读json</div>' +
-    '<div class="ctx-item" data-act="localize" data-tip="把本地文件名翻译成中文">🀄 文件名翻中文</div>' +
-    '<div class="ctx-item" data-act="rp" data-tip="从 C 站匹配该模型的名字/触发词/封面">识别模型信息</div>' +
-    '<div class="ctx-item" data-act="wl" data-tip="以后不再提示这个模型的更新（按模型记入白名单）">不再提醒更新（加入白名单）</div>' +
-    '<div class="ctx-item" data-act="organize" data-tip="把该模型移动到分类文件夹（需先在设置选 目标环境）">整理模型</div>' +
-    '<div class="ctx-item" data-act="move" data-tip="把该模型文件（连同 info/预览图/示例图等附属文件）移动到指定文件夹">移动文件…</div>' +
-    '<hr class="ctx-sep"/>' +
-    '<div class="ctx-item danger" data-act="del" data-tip="把该模型文件移入回收站（可还原）">移入回收站</div>';
-  menu.style.display = "block";
-  const zf = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
-  menu.style.left = (e.clientX / zf) + "px";
-  menu.style.top = (e.clientY / zf) + "px";
-  for (let k = 0; k < 4; k++) {
-    const got = menu.getBoundingClientRect();
-    const dx = e.clientX - got.left;
-    const dy = e.clientY - got.top;
-    if (Math.abs(dx) < 2 && Math.abs(dy) < 2) break;
-    menu.style.left = (parseFloat(menu.style.left) + dx) + "px";
-    menu.style.top = (parseFloat(menu.style.top) + dy) + "px";
-  }
-  const mr = menu.getBoundingClientRect();
-  if (mr.right > window.innerWidth) menu.style.left = Math.max(0, window.innerWidth - mr.width) + "px";
-  if (mr.bottom > window.innerHeight) menu.style.top = Math.max(0, window.innerHeight - mr.height) + "px";
+function placeContextMenu(menu,x,y){
+  const z=Number(document.documentElement.style.zoom)||1;
+  menu.style.display='block';menu.style.maxHeight=Math.max(100,(innerHeight-16)/z)+'px';
+  const rect=menu.getBoundingClientRect();
+  menu.style.left=Math.max(8,Math.min(x,innerWidth-rect.width-8))/z+'px';
+  menu.style.top=Math.max(8,Math.min(y,innerHeight-rect.height-8))/z+'px';
+}
+function contextAction(act,label,icon,tip=''){
+  return '<button type="button" class="ctx-item'+(act==='del'?' danger':'')+'" data-act="'+esc(act)+'" title="'+esc(tip||label)+'" data-tip="'+esc(tip||label)+'">'+_icon(icon)+'<span>'+esc(label)+'</span></button>';
+}
+function showModelContextMenu(e,row){
+  if(!row)return;e.preventDefault();ctxRow=row;detailImgCtx=null;
+  const menu=$('#ctxMenu');
+  const action=(act,label,icon,tip)=>contextAction(act,label,icon,tip);
+  const group=(label,icon,items)=>'<details class="ctx-group"><summary class="ctx-group-label" data-tip="展开'+esc(label)+'功能；菜单项可悬停查看用途">'+_icon(icon)+label+_icon('chevron-down','ic ctx-chevron')+'</summary><div>'+items+'</div></details>';
+  menu.innerHTML='<div class="ctx-caption">'+esc(row.civitai_name||row.name||'模型操作')+'</div>'+
+    action('detail','查看模型信息','info')+action('favorite',isModelFavorite(row.path)?'取消收藏置顶':'收藏并置顶','star')+action('folder','打开所在文件夹','folder')+action('move','移动到…文件夹','folder','只移动当前右键模型及附属文件、图片文件夹，不包含其它勾选模型')+action('site','打开 C站','external')+
+    '<hr class="ctx-sep"/>'+group('复制','copy',action('copy_name','复制文件名','copy')+action('copy_cname','复制 C站模型名','copy'))+
+    group('改名与整理','pencil',action('rename','自定义改名','pencil')+action('rename_c','文件名 → C站名称','pencil')+action('localize','文件名翻译为中文','file')+action('organize','按分类规则整理','folder','按设置里的分类规则移动此模型及附属文件；不是刷新或扫描，需先配置目标环境'))+
+    group('元数据与更新','settings',action('rp','识别模型信息','search')+action('sdjson','生成 SD 元数据 JSON','file')+action('wl','不再提醒此模型更新','refresh'))+
+    '<hr class="ctx-sep"/>'+action('del','移入回收站','trash','可从系统回收站恢复');
+  menu.querySelectorAll('.ctx-group').forEach(group=>{
+    group.querySelector('summary').addEventListener('click',()=>{if(!group.open)menu.querySelectorAll('.ctx-group').forEach(other=>{if(other!==group)other.open=false;});});
+    group.addEventListener('toggle',()=>{
+    if(group.open)menu.querySelectorAll('.ctx-group').forEach(other=>{if(other!==group)other.open=false;});
+    const box=menu.getBoundingClientRect();placeContextMenu(menu,box.left,box.top);
+  });});
+  placeContextMenu(menu,e.clientX,e.clientY);
+}
+$("#mmTable tbody").addEventListener("contextmenu",e=>{
+  const tr=e.target.closest('tr[data-path]');if(tr)showModelContextMenu(e,state.display.find(r=>r.path===tr.dataset.path));
 });
 document.addEventListener("click", (e) => {
   const menu = $("#ctxMenu");
@@ -3550,12 +3869,14 @@ document.addEventListener("click", (e) => {
   }
 });
 $("#ctxMenu").addEventListener("click", async (e) => {
-  const item = e.target.closest(".ctx-item");
-  if (!item || !ctxRow) return;
+  const item = e.target.closest(".ctx-item[data-act]");
+  if (!item || /^(img_|dl_)/.test(item.dataset.act) || !ctxRow) return;
   const act = item.dataset.act;
   $("#ctxMenu").style.display = "none";
   const path = ctxRow.path;
   try {
+    if (act === "favorite") {await toggleModelFavorite(path);return;}
+    if (act === "detail") {await showModelDetail(path);return;}
     if (act === "folder") { api.call("open_in_folder", path); return; }
     if (act === "copy_name") {
       try { await window.__copyText(ctxRow.name || ""); setStatus("已复制文件名: " + ctxRow.name); }
@@ -3612,7 +3933,8 @@ $("#ctxMenu").addEventListener("click", async (e) => {
 });
 
 // 改名弹窗
-function showRenameDialog(path, oldName) {
+async function showRenameDialog(path, oldName) {
+  try { const suggested=await api.call("get_rename_default",path);if(typeof suggested === "string" && suggested)oldName=suggested; }catch(_){}
   const mask = document.createElement("div");
   mask.className = "rd-mask";
   const dlg = document.createElement("div");
@@ -3645,68 +3967,18 @@ function showRenameDialog(path, oldName) {
 }
 
 async function showMoveDialog(path) {
-  // 已知文件夹：实时取 get_folders（树路径是相对 → 拼 root 成绝对路径）
-  let root = "";
-  let tree = null;
-  try {
-    const j = JSON.parse((await api.call("get_folders")) || "{}");
-    root = (j && j.root) || "";
-    tree = Array.isArray(j) ? j : ((j && j.tree) || []);
-    _mmFolderTree = tree;
-  } catch (e) { tree = _mmFolderTree || []; }
-  const _abs = (p2) => (/^([A-Za-z]:[\\/]|\/)/.test(String(p2)) ? p2 : (root ? root.replace(/[\\/]+$/, "") + "/" + p2 : p2));
-  const flat = [];
-  (function walk(nodes, depth) {
-    (nodes || []).forEach((n) => {
-      if (n && n.path) flat.push({ path: _abs(n.path), name: (depth ? "\u3000".repeat(depth) : "") + (n.name || n.path) });
-      if (n && n.children) walk(n.children, depth + 1);
-    });
-  })(tree, 0);
-  const curDir = String(path).replace(/[\\/][^\\/]*$/, "");
-  const mask = document.createElement("div");
-  mask.className = "rd-mask";
-  const dlg = document.createElement("div");
-  dlg.className = "rename-dialog mv-dialog";
-  dlg.innerHTML =
-    '<div class="rd-title">移动文件（含附属文件）</div>' +
-    '<div class="mv-info">' + esc(String(path).split(/[\\/]/).pop() || path) + '</div>' +
-    '<div class="mv-info mv-dim">当前位置：' + esc(curDir) + '</div>' +
-    '<select class="input" id="mvSel">' +
-    (flat.some((f) => f.path === curDir) ? "" : '<option value="' + esc(curDir) + '">' + esc(curDir) + "</option>") +
-    flat.map((f) => '<option value="' + esc(f.path) + '">' + esc(f.name) + "</option>").join("") +
-    "</select>" +
-    '<div class="rd-actions">' +
-    '<button class="btn" id="mvBrowse" data-tip="选择列表之外的文件夹（仍须位于模型管理目录内）">浏览…</button>' +
-    '<span style="flex:1"></span>' +
-    '<button class="btn" id="mvCancel">取消</button>' +
-    '<button class="btn btn-primary" id="mvOk">移动</button></div>';
-  document.body.appendChild(mask);
-  document.body.appendChild(dlg);
-  const sel = $("#mvSel");
-  if (sel && flat.some((f) => f.path === curDir)) sel.value = curDir;
-  const close = () => { mask.remove(); dlg.remove(); };
-  $("#mvCancel").addEventListener("click", close);
-  mask.addEventListener("click", close);
-  $("#mvBrowse").addEventListener("click", async () => {
-    const d = await api.call("pick_dir");
-    const v = Array.isArray(d) ? (d[0] || "") : String(d || "");
-    if (!v) return;
-    if (!Array.from(sel.options).some((o) => o.value === v)) {
-      const o = document.createElement("option");
-      o.value = v; o.textContent = "（浏览）" + v;
-      sel.appendChild(o);
-    }
-    sel.value = v;
-  });
-  $("#mvOk").addEventListener("click", async () => {
-    const dest = sel.value;
-    if (!dest) return;
-    close();
-    setStatus("正在移动…");
-    const res = await api.call("mm_move", path, dest);
-    setStatus((res && res.msg) || "移动完成");
-    if (res && res.ok) { await api.call("scan_models"); pollMmScan(); }
-  });
+  if(mmMoving){setStatus('已有移动任务正在进行');return;}
+  mmMoving=true;
+  try{
+    const progress=await api.call('get_mm_progress');if(progress?.running){setStatus('已有模型操作正在进行');return;}
+    const destination=await pickFolderModal({title:'移动当前模型到…文件夹',anyFolder:true});if(!destination)return;
+    const name=String(path).split(/[\\/]/).pop();
+    const confirmation=await confirmBoxRaw('<p>只移动当前模型：<b>'+esc(name)+'</b></p><p>目标：'+esc(destination)+'</p><p>附属文件、同名 .images 图片目录一起移动。同名冲突不覆盖，不包含其它勾选模型。</p>','移动单个模型');
+    if(!confirmation)return;if(confirmation.root)confirmation.root.remove();
+    const result=await api.call('move_file_to',path,destination);setStatus(result?.msg||'移动未完成');
+    if(result?.ok){_mmFolderTree=null;mmScan();if(detailRow?.path===path&&result.path)showModelDetail(result.path);}
+  }catch(_){setStatus('移动未完成，请检查原目录与目标目录');}
+  finally{mmMoving=false;}
 }
 
 function pollMmProgress() {
@@ -3738,7 +4010,7 @@ $("#mmOrganize").addEventListener("click", async () => {
   }
   if ((state.cfg.organize_mode || "manual") === "manual") {
     const paths = Array.from(state.mmChecked);
-    const rows = state.models.filter((r) => paths.includes(r.path));
+    const rows = state.display.filter((r) => paths.includes(r.path));
     if (!rows.length) { setStatus("请先勾选要整理的模型"); return; }
     setStatus("手动整理：共 " + rows.length + " 个，逐个选择目标文件夹 …");
     for (const r of rows) {
@@ -3750,7 +4022,8 @@ $("#mmOrganize").addEventListener("click", async () => {
     mmScan();
     return;
   }
-  mmOp("mmOrganize", (p) => api.call("mm_organize", p));
+  const paths=mmCheckedPaths();if(!paths){setStatus("请先勾选当前筛选结果中的模型");return;}
+  const result=await api.call("mm_organize",paths);if(!result?.started){setStatus(result?.msg||"整理未开始");return;}pollMmProgress();
 });
 mmOp("mmCleanup", (p) => api.call("mm_cleanup", p));
 $("#mmRestore").addEventListener("click", async () => {
@@ -3767,7 +4040,7 @@ $("#mmRestore").addEventListener("click", async () => {
     "· " + esc(it.src.split(/[\\/]/).pop()) + " → " + esc(it.dest.replace(/\\/g, "/").replace(root, "")) + "（" + esc(it.why) + "）").join("<br/>");
   const more = prev.count > 30 ? "<br/>… 共 " + prev.count + " 个" : "";
   const ok = await confirmBox(
-    "<div style='font-size:12px;color:var(--text-dim);line-height:1.8'>以下模型将被移回标准目录（只移动不删除，json/封面随行）：</div><div style='font-size:12px;line-height:1.9;max-height:240px;overflow:auto;margin-top:6px'>" + lines + more + "</div>",
+    "<div style='font-size:calc(12px * var(--type-scale, 1));color:var(--text-dim);line-height:1.8'>以下模型将被移回标准目录（只移动不删除，json/封面随行）：</div><div style='font-size:calc(12px * var(--type-scale, 1));line-height:1.9;max-height:240px;overflow:auto;margin-top:6px'>" + lines + more + "</div>",
     "恢复误整理");
   if (!ok) return;
   setStatus("正在恢复 …");
@@ -3837,11 +4110,11 @@ async function mmRenamePreview(act, paths) {
   dlg.querySelector("#rpApply").addEventListener("click", () => {
     close();
     setStatus(label + " 开始 …");
-    api.call(act === "rename_c" ? "mm_rename" : "mm_localize", paths).then(() => {
-      setStatus("完成，刷新中 …");
-      api.call("scan_models");
-      pollMmScan();
-    }).catch(() => {});
+    api.call(act === "rename_c" ? "mm_rename" : "mm_localize", paths).then(result => {
+      if(!result?.started){setStatus(result?.msg||"改名未开始");return;}
+      // These APIs start a background worker; do not scan until it finishes.
+      pollMmProgress();
+    }).catch(() => setStatus("改名未开始，请重试"));
   });
 }
 $("#mmRenameMain").addEventListener("click", () => {
@@ -3870,8 +4143,9 @@ $("#mmRenameSub").addEventListener("click", (e) => {
 $("#mmSendRp").addEventListener("click", async () => {
   const p = mmCheckedPaths();
   if (!p) { setStatus("请先勾选或选中模型"); return; }
-  await api.call("rp_add_paths", p);
-  setStatus("已发送 " + p.length + " 个到反向解析");
+  if(!await api.call("rp_add_paths", p))return;
+  switchPage("reverse");await rpRefresh();
+  setStatus("已发送 " + p.length + " 个到反向解析，请点击开始反查");
 });
 
 // 批量从 C 站同步：勾选模型 → 加入反向解析队列并立即开始 → 进度 → 汇总
@@ -3887,7 +4161,7 @@ async function mmSyncBatchRun() {
   _batchSyncBusy = true;
   try {
     await api.call("rp_add_paths", paths);
-    await api.call("rp_start");
+    if(!await api.call("rp_start", paths)){setStatus("反查未开始，请检查 API Key 或已有任务");return;}
     const t0 = Date.now();
     let st = null;
     while (true) {
@@ -3920,7 +4194,7 @@ function rpStatusCls(st) {
   const t = String(st || "");
   if (/成功|完成|匹配到|已收录/.test(t)) return "ok";
   if (/反查中|进行|匹配中|处理中/.test(t)) return "run";
-  if (/失败|错误|未收录/.test(t)) return "err";
+  if (/失败|错误|未收录|文件不存在/.test(t)) return "err";
   return "wait";
 }
 function rpStatusGlyph(c) { return c === "ok" ? "\u2713 " : c === "run" ? "\u25cc " : c === "err" ? "\u00d7 " : ""; }
@@ -3941,76 +4215,67 @@ function rpProgRender(s2) {
     el.style.display = "none";
   }
 }
-async function rpRefresh() {
-  const rows = await api.call("rp_get_rows");
-  state.rpRows = rows || [];
-  const kw = $("#rpFilter").value.trim().toLowerCase();
-  const tbody = $("#rpTable tbody");
-  const shown = rows.filter((r) => !kw ||
-    String(r.path || "").toLowerCase().includes(kw) || (r.model || "").toLowerCase().includes(kw) || (r.status || "").toLowerCase().includes(kw));
-  tbody.innerHTML = shown.map((r) => {
-    const p = String(r.path || "");
-    const base = p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
-    const dir = base.length < p.length ? p.slice(0, p.length - base.length) : "";
-    const st = rpStatusCls(r.status);
-    const sha = String(r.sha || "");
-    return '<tr data-path="' + esc(p) + '">' +
-      '<td class="c-file" title="' + esc(p) + '"><div class="rp-fname">' + esc(base) + '</div><div class="rp-fdir">' + esc(dir) + '</div></td>' +
-      '<td class="c-sha"><span class="rp-sha" title="' + esc(sha) + '">' + esc(sha.length > 18 ? sha.slice(0, 18) + "\u2026" : sha) + '</span></td>' +
-      '<td><span class="rp-st ' + st + '">' + rpStatusGlyph(st) + esc(r.status || "") + '</span></td>' +
-      '<td class="c-name"><div class="rp-model" title="' + esc(r.model || "") + '">' + esc(r.model || "") + '</div></td>' +
-      '<td>' + (r.version ? '<span class="rp-ver">' + esc(r.version) + '</span>' : '') + '</td></tr>';
-  }).join("") || '<tr class="rp-empty"><td colspan="5">' + (rows.length ? "没有符合筛选的项目" : "暂无待反查任务") + '</td></tr>';
+const rpChecked = new Set();
+let rpShown = [], rpRenderSignature = "";
+function rpVisibleRows(rows) {
+  const kw = $("#rpFilter").value.trim().toLowerCase(), failed = $("#rpOnlyFailed").checked;
+  return rows.filter(r => (!failed || rpStatusCls(r.status) === "err") && (!kw || [r.path,r.model,r.status].some(v => String(v || "").toLowerCase().includes(kw))));
 }
-
-$("#rpFilter").addEventListener("input", rpRefresh);
-$("#rpFilterClear").addEventListener("click", () => { $("#rpFilter").value = ""; rpRefresh(); });
-
-// v2.2.1：入口已移除（模型统一在模型管理页添加/发起识别，反向解析页只做结果管理）
-// $("#rpAddFiles").addEventListener("click", async () => {
-//   const files = await api.call("pick_files");
-//   if (files && files.length) { await api.call("rp_add_paths", files); rpRefresh(); }
-// });
-// $("#rpAddDir").addEventListener("click", async () => {
-//   const d = await api.call("pick_dir");
-//   if (d) { await api.call("rp_add_dir", d); rpRefresh(); }
-// });
-$("#rpRemoveSel").addEventListener("click", async () => {
-  const paths = Array.from($$("#rpTable tbody tr.sel-row")).map((r) => r.dataset.path);
-  if (paths.length) { await api.call("rp_remove", paths); rpRefresh(); }
-});
-let rpLastSel = -1;
-$("#rpTable tbody").addEventListener("click", (e) => {
-  const tr = e.target.closest("tr");
-  if (!tr) return;
-  const rows = Array.from($$("#rpTable tbody tr"));
-  const idx = rows.indexOf(tr);
-  const ctrl = e.ctrlKey || e.metaKey;
-  if (e.shiftKey && rpLastSel >= 0) {
-    const a = Math.min(rpLastSel, idx), b = Math.max(rpLastSel, idx);
-    rows.slice(a, b + 1).forEach((r) => r.classList.add("sel-row"));
-  } else if (ctrl) {
-    tr.classList.toggle("sel-row");
-  } else {
-    rows.forEach((r) => r.classList.remove("sel-row"));
-    tr.classList.add("sel-row");
-  }
-  rpLastSel = idx;
-});
-$("#rpClearAll").addEventListener("click", async () => {
-  const ok = await confirmBox("确定清空反向解析列表的全部条目？");
-  if (!ok) return;
-  await api.call("rp_clear");
+function rpSelectionSync() {
+  const visible = new Set(rpShown.map(r => r.path));
+  for(const path of rpChecked)if(!visible.has(path))rpChecked.delete(path);
+  const count = rpChecked.size, all = $("#rpSelectAll");
+  all.checked = rpShown.length > 0 && count === rpShown.length;all.indeterminate = count > 0 && count < rpShown.length;
+  $("#rpSelectedCount").textContent = "已选 " + count + " 项";
+  $("#rpRemoveSel").disabled = !count;$("#rpStartSelected").disabled = !count || !!state.rpRunning;
+}
+async function rpRefresh() {
+  const rows = await api.call("rp_get_rows") || [];state.rpRows = rows;
+  rpShown = rpVisibleRows(rows);rpSelectionSync();
+  const signature = JSON.stringify([rpShown,Array.from(rpChecked)]);
+  if(signature === rpRenderSignature)return;rpRenderSignature = signature;
+  $("#rpTable tbody").innerHTML = rpShown.map(r => {
+    const p=String(r.path||""),base=p.replace(/[\\/]+$/,"").split(/[\\/]/).pop()||p;
+    const dir=base.length<p.length?p.slice(0,p.length-base.length):"",st=rpStatusCls(r.status),sha=String(r.sha||"");
+    return '<tr data-path="'+esc(p)+'"'+(rpChecked.has(p)?' class="sel-row"':'')+'><td class="rp-check-col"><input type="checkbox" class="rp-row-check" aria-label="勾选 '+esc(base)+'"'+(rpChecked.has(p)?' checked':'')+'/></td>'+
+      '<td class="c-file" title="'+esc(p)+'"><div class="rp-fname">'+esc(base)+'</div><div class="rp-fdir file-subpath">'+esc(dir)+'</div></td>'+
+      '<td class="c-sha"><span class="rp-sha" title="'+esc(sha)+'">'+esc(sha.length>18?sha.slice(0,18)+"…":sha)+'</span></td>'+
+      '<td><span class="rp-st '+st+'">'+rpStatusGlyph(st)+esc(r.status||"")+'</span></td>'+
+      '<td class="c-name"><div class="rp-model" title="'+esc(r.model||"")+'">'+esc(r.model||"")+'</div></td><td>'+esc(r.version||"")+'</td></tr>';
+  }).join("") || '<tr class="rp-empty"><td colspan="6">'+(rows.length?"没有符合筛选的项目":"暂无待反查任务；点击上方逐步教程")+'</td></tr>';
+}
+$("#rpFilter").addEventListener("input",rpRefresh);
+$("#rpOnlyFailed").addEventListener("change",rpRefresh);
+$("#rpFilterClear").addEventListener("click",()=>{$("#rpFilter").value="";$("#rpOnlyFailed").checked=false;rpRefresh();});
+$("#rpSelectAll").addEventListener("change",()=>{for(const r of rpShown){if($("#rpSelectAll").checked)rpChecked.add(r.path);else rpChecked.delete(r.path);}rpRefresh();});
+$("#rpTable tbody").addEventListener("click",e=>{
+  const row=e.target.closest('tr[data-path]');if(!row)return;
+  if(e.target.closest('button,a'))return;
+  if(e.target.matches('.rp-row-check')){if(e.target.checked)rpChecked.add(row.dataset.path);else rpChecked.delete(row.dataset.path);}
+  else{if(rpChecked.has(row.dataset.path))rpChecked.delete(row.dataset.path);else rpChecked.add(row.dataset.path);}
   rpRefresh();
-  $("#rpStart").disabled = false;
 });
-$("#rpStart").addEventListener("click", async () => {
-  await api.call("rp_start");
-  $("#rpStart").disabled = true;
-  $("#rpPause").disabled = false;
-  $("#rpStop").disabled = false;
-  pollRp();
+$("#rpRemoveSel").addEventListener("click",async()=>{
+  const paths=rpShown.filter(r=>rpChecked.has(r.path)).map(r=>r.path);if(!paths.length)return;
+  if(!await confirmBox("移除这 "+paths.length+" 条反查列表记录？不会删除模型文件；进行中的任务会保留。"))return;
+  const r=await api.call("rp_remove_selected",paths);setStatus(r?.msg||"列表移除未完成");await rpRefresh();
 });
+$("#rpClearAll").addEventListener("click",async()=>{
+  if(!await confirmBox("确定清空反向解析列表？只清列表记录，不删除模型文件。"))return;
+  if(!await api.call("rp_clear")){setStatus("反查进行中，请先停止后再清空");return;}rpChecked.clear();await rpRefresh();
+});
+async function rpStartScope(selected=false) {
+  if(state.rpRunning){setStatus("已有反查正在运行");return;}
+  const paths=rpShown.filter(r=>!selected||rpChecked.has(r.path)).map(r=>r.path);
+  if(!paths.length){setStatus(selected?"请先勾选要反查的模型":"没有符合筛选的待反查模型");return;}
+  const started=await api.call("rp_start",paths,$("#rpOnlyFailed").checked);
+  if(!started){setStatus("反查未开始：请检查 API Key、失败筛选或已有任务");return;}
+  state.rpRunning=true;$("#rpStart").disabled=true;$("#rpStartSelected").disabled=true;$("#rpPause").disabled=false;$("#rpStop").disabled=false;pollRp();
+}
+$("#rpStart").addEventListener("click",()=>rpStartScope(false));
+$("#rpStartSelected").addEventListener("click",()=>rpStartScope(true));
+$("#rpTutorial").addEventListener("click",startReverseTutorial);
+
 $("#rpPause").addEventListener("click", async () => {
   const paused = await api.call("rp_pause");
   $("#rpPause").textContent = paused ? "继续" : "暂停";
@@ -4028,7 +4293,7 @@ function pollRp() {
       s = await api.call("rp_state");
       await rpRefresh();
     } catch (e) { s = null; }
-    rpProgRender(s);
+    state.rpRunning=!!s?.running;rpSelectionSync();rpProgRender(s);
     if (s && s.running) setStatus("反向解析 " + s.done + "/" + s.total + (s.paused ? "（已暂停）" : ""));
     else if (s && !s.running && s.total > 0) {
       clearInterval(t);
@@ -4048,31 +4313,36 @@ const SETTING_FIELDS = [
   ["基本", "api_key", "Civitai API Key", "password"],
   ["基本", "download_dir", "下载目录", "text"],
   ["基本", "models_dirs", "模型管理目录（每行一个）", "dirs"],
+  ["归档", "archive_root", "归档根目录", "text"],
   ["基本", "site_domain", "站点域名", "select", ["civitai.red", "civitai.com"]],
   ["网络", "proxy_enabled", "启用代理", "bool"],
   ["网络", "ssl_verify", "启用证书验证", "bool"],
   ["网络", "proxy_address", "代理地址", "text"],
-  ["网络", "max_concurrent_downloads", "并发下载数", "number"],
+  ["下载", "max_concurrent_downloads", "同时下载数量", "number"],
   ["网络", "download_timeout", "下载超时(秒)", "number"],
   ["网络", "download_retry", "断流自动重试次数", "number"],
   ["网络", "hash_threads", "哈希线程数", "number"],
+  ["下载", "multi_file_download", "多文件版本下载方式", "select", [["ask", "弹窗多选（无人操作 10 秒选第一个）"], ["first", "直接下载第一个"], ["all", "直接下载全部模型文件"]]],
   ["下载", "gen_metadata", "完成后自动生成 json/info", "bool"],
   ["下载", "download_cover", "完成后自动下载封面", "bool"],
   ["下载", "ask_move_after_download", "完成后询问移动分类", "bool"],
   ["下载", "download_target_dir", "下载目标文件夹（预设）", "dir"],
   ["下载", "rename_clean_rules", "文件名清理符号", "select", [["", "不清理"], ["comma", "去逗号（推荐）"], ["comma,paren", "去逗号 + 括号"], ["comma,paren,dash", "去逗号+括号，横线/下划线→空格"]]],
   ["下载", "metadata_format", "metadata 格式", "select", ["sd", "civitai", "both"]],
-  ["归档", "archive_root", "归档根目录", "text"],
   ["翻译", "baidu_appid", "百度翻译 APP ID", "text"],
   ["翻译", "baidu_key", "百度翻译密钥", "password"],
   ["翻译", "auto_translate", "反向解析自动翻译", "bool"],
-  ["翻译", "translate_filename", "下载文件名为中文", "bool"],
+  ["下载", "download_name_mode", "下载文件命名方式", "select", [["original","原文件名"],["civitai","C站模型名"],["chinese","中文模型名（需要翻译服务）"]]],
+  ["下载", "filename_include_version", "命名附加模型版本号", "bool"],
   ["界面", "theme", "界面主题", "select", [
     ["dark", "深色"],
     ["dark_purple", "暮紫（暗）"],
     ["dark_blue", "深海（暗）"],
     ["dark_green", "森林（暗）"],
     ["dark_red", "熔岩（暗）"],
+    ["dark_graphite", "石墨（暗 · 中性灰蓝）"],
+    ["dark_pink", "夜樱（暗 · 柔和粉色）"],
+    ["dark_rose", "绯夜（暗 · 浓郁玫红）"],
     ["light", "浅色"],
     ["light_blue", "晴空（亮）"],
     ["light_pink", "樱粉（亮）"],
@@ -4083,14 +4353,40 @@ const SETTING_FIELDS = [
   ["界面", "ui_zoom", "界面缩放", "select", ["80", "90", "100", "110", "125", "150"]],
   ["界面", "ui_scheme", "Metro 亮暗", "select", [["light", "亮色"], ["dark", "暗色"], ["auto", "跟随系统"]]],
   ["界面", "metro_accent", "Metro 主题色", "select", [["#0078D4", "Windows 蓝（默认）"], ["#107C10", "翡翠绿"], ["#7A3FF2", "紫罗兰"], ["#B26A00", "琥珀橙"], ["#C42B1C", "绛红"], ["#006E8C", "青碧"], ["system", "跟随系统主题色"]]],
+  ["界面", "show_file_paths", "名称下显示完整路径", "bool"],
+  ["界面", "folder_picker_show_paths", "分类选择器显示详细路径", "bool"],
+  ["界面", "ui_font", "默认字体（本机已安装）", "font"],
+  ["界面", "ui_text_size", "全局字号（不缩放界面）", "select", [["small", "小 · 90%"], ["standard", "标准 · 100%"], ["large", "大 · 110%"], ["xlarge", "较大 · 120%"], ["huge", "最大 · 130%"]]],
+  ["界面", "integrated_titlebar", "隐藏标题栏，仅保留窗口按钮", "bool"],
+  ["界面", "window_appearance", "原生标题栏与材质", "select", [["theme", "跟随软件主题（推荐）"], ["mica", "Mica 标题栏 · Windows 11"], ["mica_alt", "Mica Alt 标题栏 · Windows 11"], ["system", "Windows 系统外观"], ["external", "外部工具控制（需另装 MFE）"]]],
+  ["界面", "shortcuts_enabled", "启用快捷键（默认关闭）", "bool"],
+  ["界面", "model_folder_include_subfolders", "勾选文件夹包含子目录", "bool"],
+  ["界面", "model_list_size", "模型列表大小", "select", [["3","完整 · 最大（当前样式）"],["2","紧凑 · 无封面/作者"],["1","极简 · 名称精简（信息列保留）"]]],
+  ["界面", "masonry_info_mode", "瀑布流卡片介绍", "select", [["always","常驻介绍（当前样式）"],["slide","只看封面 · 悬停滑出介绍"],["fade","只看封面 · 悬停淡入介绍"]]],
+  ["界面", "masonry_overlay_size", "悬浮介绍覆盖范围", "select", [["partial","卡片下方部分"],["full","整个卡片"]]],
+  ["界面", "name_scroll_speed", "名称滚动速度（像素/秒）", "number"],
+  ["界面", "name_scroll_start_pause", "名称滚动：开头停顿（毫秒）", "number"],
+  ["界面", "name_scroll_end_pause", "名称滚动：末尾停顿（毫秒）", "number"],
+  ["界面", "masonry_card_width", "瀑布流图片大小", "range", [140,420,10]],
+  ["界面", "custom_accent_enabled", "自定义强调色（所有主题）", "bool"],
+  ["界面", "custom_accent", "自定义强调色", "color"],
+  ["界面", "ui_density", "列表信息密度", "select", [["compact", "紧凑"], ["standard", "标准"], ["comfortable", "宽松"]]],
+  ["界面", "ui_corners", "控件圆角", "select", [["theme", "跟随主题"], ["square", "直角"], ["soft", "轻圆角"], ["rounded", "柔和圆角"]]],
   ["界面", "rename_menu_default", "改名默认动作", "select", [["custom", "自定义改名"], ["rename_c", "文件名改成C站名"], ["localize", "文件名翻中文"]]],
   ["界面", "confirm_buttons_flip", "确认弹窗按钮翻转", "bool"],
   ["界面", "default_page", "启动默认页", "select", [["models", "模型管理"], ["download", "批量下载"], ["dlmanager", "下载管理"], ["reverse", "反向解析"], ["workflow", "工作流分析"], ["settings", "设置"]]],
   ["界面", "default_view", "模型默认视图", "select", [["waterfall", "瀑布流"], ["list", "列表"]]],
   ["界面", "zebra_rows", "模型列表斑马纹", "bool"],
   ["界面", "ambient_bg", "顶部氛围动态背景", "bool"],
-  ["界面", "ui_mode", "界面模式", "select", [["window", "原生窗口（默认）"], ["browser", "浏览器模式（可托盘 / 关页面退）"]]],
+  ["界面", "ui_mode", "启动界面", "select", [["window", "软件窗口（默认；失败可浏览器兜底）"], ["browser", "浏览器启动（以后不尝试软件窗口）"]]],
   ["界面", "window_wait_seconds", "窗口模式等待秒数", "number"],
+  ["界面", "browser_fallback_enabled", "软件窗口失败时自动浏览器兜底", "bool"],
+  ["界面", "cache_detail_images", "缓存详情在线缩略图", "bool"],
+  ["界面", "pointer_effects", "鼠标交互特效", "select", [["off", "关闭"], ["click", "仅点击波纹"], ["trail", "拖尾 + 点击"]]],
+  ["界面", "pointer_effect_quality", "交互特效性能档", "select", [["low", "轻量 · 少量粒子"], ["high", "精细 · 更多粒子"]]],
+  ["界面", "effects_fps_limit", "动画帧率上限（0 = 跟随屏幕）", "number"],
+  ["界面", "cache_original_images", "缓存已查看原图和生成数据", "bool"],
+  ["界面", "gallery_cache_mb", "原图缓存容量（MB）", "number"],
   ["界面", "close_action", "点窗口关闭按钮时", "select", [["exit", "退出软件（默认）"], ["minimize", "最小化到任务栏（不退出）"]]],
   ["下载", "update_keep_old", "更新后如何处理旧版本", "select", [["keep", "保留旧版文件（默认）"], ["delete", "删除旧版（移入回收站，可还原）"]]],
   ["界面", "webview_disable_gpu", "禁用 GPU 加速（软件渲染）", "bool"],
@@ -4100,6 +4396,56 @@ const SETTING_FIELDS = [
 
 // ===== Metro 外观：亮暗（可跟随系统）+ 主题色（可跟随系统主题色）=====
 let _schemeMQ = null;
+// 以 WCAG 相对亮度选择黑/白前景，亮色强调色不再出现白字看不清的问题。
+function accentForeground(hex) {
+  const channels = hex.slice(1).match(/../g).map((s) => parseInt(s, 16) / 255);
+  const linear = channels.map((v) => v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+  const luminance = linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+  return (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) ? "#000000" : "#ffffff";
+}
+function applyCustomUi() {
+  const cfg = state.cfg || {};
+  const root = document.documentElement;
+  const custom = cfg.custom_accent_enabled && /^#[0-9a-f]{6}$/i.test(cfg.custom_accent || "");
+  root.dataset.customAccent = custom ? "true" : "false";
+  if (custom) {
+    root.style.setProperty("--primary", cfg.custom_accent);
+    root.style.setProperty("--primary-hover", cfg.custom_accent);
+    root.style.setProperty("--primary-fg", accentForeground(cfg.custom_accent));
+    root.style.setProperty("--metro-accent", cfg.custom_accent);
+  } else {
+    root.style.removeProperty("--primary-hover");
+    root.style.removeProperty("--primary-fg");
+    if (root.dataset.theme !== "metro") root.style.removeProperty("--primary");
+  }
+  const primary = getComputedStyle(root).getPropertyValue("--primary").trim();
+  if (/^#[0-9a-f]{6}$/i.test(primary)) {
+    const values = [1,3,5].map(i => parseInt(primary.slice(i,i+2),16)/255).map(v => v <= .04045 ? v/12.92 : Math.pow((v+.055)/1.055,2.4));
+    const lum = .2126*values[0]+.7152*values[1]+.0722*values[2];
+    root.style.setProperty("--primary-fg", lum > .179 ? "#000000" : "#ffffff");
+  }
+  const font = String(cfg.ui_font || "").trim();
+  if (font) root.style.setProperty("--font", JSON.stringify(font) + ', "Microsoft YaHei UI", system-ui, sans-serif');
+  else root.style.removeProperty("--font");
+  const fontCaption = $("#fontPreviewName"); if(fontCaption)fontCaption.textContent = font || "软件默认字体";
+  applyTextAndWindowAppearance();
+  setMasonrySize(cfg.masonry_card_width,false);
+  root.dataset.masonryInfo=["slide","fade"].includes(cfg.masonry_info_mode)?cfg.masonry_info_mode:"always";
+  root.dataset.masonryOverlay=cfg.masonry_overlay_size==="full"?"full":"partial";
+  window.dispatchEvent(new Event("cft:name-scroll-options"));
+  root.dataset.showPaths = cfg.show_file_paths === false ? "false" : "true";
+  root.dataset.density = ["compact", "comfortable"].includes(cfg.ui_density) ? cfg.ui_density : "standard";
+  root.dataset.corners = ["square", "soft", "rounded"].includes(cfg.ui_corners) ? cfg.ui_corners : "theme";
+  root.dataset.sidebar = cfg.sidebar_collapsed ? "collapsed" : "expanded";
+  root.dataset.zebra = cfg.zebra_rows !== false ? "true" : "false";
+  if (typeof applyPointerEffects === "function") applyPointerEffects(cfg);
+  const sidebarButton = $("#toggleSidebar");
+  if (sidebarButton) sidebarButton.setAttribute("aria-expanded", String(!cfg.sidebar_collapsed));
+  const preview = $("#appearancePreview");
+  if (preview) preview.textContent = "实时预览 · " + (custom ? cfg.custom_accent.toUpperCase() : "主题默认强调色");
+  const bg = $("#bg");
+  if (bg) bg.style.display = cfg.ambient_bg === false ? "none" : "";
+}
 function applyUiAppearance() {
   const scheme = String((state.cfg && state.cfg.ui_scheme) || "light");
   const acc = String((state.cfg && state.cfg.metro_accent) || "#0078D4");
@@ -4120,14 +4466,17 @@ function applyUiAppearance() {
     // --primary 只在 Metro 主题下跟随主题色；经典主题必须保持自己的主题主色（否则主按钮变黑底黑字）
     if (root.dataset.theme === "metro") root.style.setProperty("--primary", c);
     else root.style.removeProperty("--primary");
+    applyCustomUi();
   };
   if (/^#([0-9a-f]{6})$/i.test(acc)) {
     _setAcc(acc);
   } else if (acc === "system") {
+    _setAcc("#0078D4");  // 读取系统色期间也清除前一个主题的内联覆盖。
     api.call("get_system_accent").then((c) => {
-      if (c && /^#([0-9a-fA-F]{6})$/.test(c)) _setAcc(c);
+      if (state.cfg && state.cfg.metro_accent === "system" && c && /^#([0-9a-fA-F]{6})$/.test(c)) _setAcc(c);
     }).catch(() => { });
-  }
+  } else _setAcc("#0078D4");
+  applyCustomUi();
   // 主题切换后：代理按钮标签需要按主题重刷（经典带 emoji / Metro 不带）
   try { (window._mmLabelSync || []).forEach((f) => f()); } catch (e) { }
   try { _applyMetroOpts(); } catch (e) { }
@@ -4135,14 +4484,19 @@ function applyUiAppearance() {
 
 // 设置项 hover 说明（鼠标移到标签上显示功能作用）
 const SETTING_TIPS = {
-  "api_key": "Civitai 账号免费生成的 API Key，用于查询模型信息、下载与反向解析。在 civitai.com/user/account 登录后点「New API Key」生成",
+  "show_file_paths": "显示/隐藏下载文件、分类文件夹、反向解析和更新列表名称下的路径；不影响搜索、保存位置列、底部选中目标、详情及右键复制路径",
+  "custom_accent_enabled": "启用后覆盖当前主题的强调色，按钮/选中项/进度条跟随颜色；关闭恢复当前主题默认配色",
+  "custom_accent": "点击色块自由选色，实时预览。黑白文字自动适配；需先开启自定义强调色",
+  "ui_density": "调整下载、模型、更新等列表以及分类窗口的行间距，紧凑模式显示更多内容",
+  "ui_corners": "统一面板、弹窗、输入框和按钮的圆角；跟随主题可恢复原样式",
+  "api_key": "Civitai 账号免费生成的 API Key，用于查询模型信息、下载与反向解析。在 civitai.red/user/account 登录后点「New API Key」生成",
   "download_dir": "模型下载后存放的位置，可填任意文件夹（如 D:\\models）",
   "models_dirs": "本地模型管理目录：软件从这里扫描模型并显示封面/触发词。WebUI 与 ComfyUI 分开存放时每行填一个（如 D:\\sd-webui-forge-neo\\webui\\models 和 D:\\ComfyUI\\models），扫描会合并显示",
   "site_domain": "打开 C 站页面用的域名：网络异常时可在 civitai.red 与 civitai.com 之间切换",
   "proxy_enabled": "开启后所有请求走代理（科学上网工具），解析/下载失败时可尝试开启",
   "ssl_verify": "关闭后跳过 TLS 证书验证：代理软件开了 HTTPS 解密（MITM）导致报证书错误时取消勾选即可恢复",
   "proxy_address": "代理软件地址，如 127.0.0.1:7897（Clash 默认端口）",
-  "max_concurrent_downloads": "同时下载的任务数：越大越快，但占用更多带宽",
+  "max_concurrent_downloads": "1–32 个。前面的等待任务优先；降低数量不强行中断当前下载，只限制后续任务启动。",
   "download_timeout": "单个文件下载无响应超过该秒数判定失败并重试",
   "download_retry": "连接被掐断（SSL EOF / 超时，代理节点不稳定时常见）自动重试次数：每次从已下载的断点续传，不重下。0 = 不重试",
   "rename_clean_rules": "下载命名与「改成 C 站名」一键改名时清理符号：ComfyUI 会把文件名里的逗号当成提示词分隔符，导致找不到 lora（如 py,ill,xl 这种名字）。推荐「去逗号」",
@@ -4150,11 +4504,10 @@ const SETTING_TIPS = {
   "gen_metadata": "下载完成后自动生成 <模型名>.civitai.info / .json 元数据；没有它，模型管理里看不到名称/触发词",
   "download_cover": "下载完成后自动把 C 站预览图保存到模型目录（模型管理显示缩略图用）",
   "ask_move_after_download": "下载完成后询问是否把文件移动到指定文件夹（适合按类型归档；设了「下载目标文件夹」后本项自动不弹）",
-  "window_wait_seconds": "窗口模式下等几秒没出界面就自动改用浏览器模式（默认 12 秒）。机器慢或 WebView2 正在更新时可调大；想固定用浏览器模式就把「界面模式」改成浏览器模式",
+  "window_wait_seconds": "窗口启动默认至少等待 30 秒（范围 30–600 秒），仍有启动活动时继续宽限。旧版过短设置自动按 30 秒处理；真正无法显示时使用浏览器兜底。想直接用浏览器可修改运行方式",
   "update_keep_old": "「更新页面」下载新版完成后的旧版处理：默认【保留旧版文件】（新版和旧版并存，要清理可用「查重 → 删旧留新」）；选【删除旧版】则下载完成后把旧版文件移入回收站（含预览图/元数据，可还原）。只影响「更新下载」，不影响普通批量下载",
   "download_target_dir": "预设下载落地文件夹（在模型目录里选）：下载的模型连 json/封面直接放进它，不再弹窗询问。也可在「批量下载」页临时选择",
   "metadata_format": "sd = WebUI 能直接识别的扁平 json；civitai = C 站原始 info 结构；both = 两个都生成（.civitai.info 始终生成）",
-  "archive_root": "浏览器插件一键归档的封面/配图/评论等文件保存到该目录（模型文件仍走下载目录）。局域网共享可填 UNC 路径如 \\\\192.168.1.10\\models 或映射盘符如 Z:\\models",
   "baidu_appid": "百度翻译开放平台 APP ID（免费申请），用于反向解析自动翻译模型名/简介",
   "baidu_key": "百度翻译开放平台密钥，与 APP ID 配套",
   "auto_translate": "反向解析时自动把模型名/简介翻译成中文",
@@ -4206,110 +4559,13 @@ const BAIDU_LINKS = [
 ];
 
 function buildSettingsForm() {
-  const form = $("#settingsForm");
-  const groups = {};
-  for (const f of SETTING_FIELDS) {
-    const g = f[0];
-    if (!groups[g]) groups[g] = [];
-    groups[g].push(f.slice(1));
-  }
-  form.innerHTML = Object.entries(groups).map(([g, fields]) => {
-    const body = fields.map(([key, label, type, opts]) => {
-      const v = state.cfg[key];
-      let input = "";
-      const tip = SETTING_TIPS[key] || "";
-      if (type === "bool") {
-        input = '<label class="check"' + (tip ? ' data-tip="' + esc(tip) + '"' : "") + '><input type="checkbox" data-key="' + key + '" ' + (v ? "checked" : "") + "/> " + esc(label) + "</label>";
-      } else if (type === "select") {
-        input = '<select data-key="' + key + '">' + opts.map((o) => {
-          const val = Array.isArray(o) ? o[0] : o;
-          const label = Array.isArray(o) ? o[1] : o;
-          return '<option value="' + esc(val) + '" ' + (String(v) === val ? "selected" : "") + ">" + esc(label) + "</option>";
-        }).join("") + "</select>";
-      } else if (type === "number") {
-        input = '<input class="input" type="number" data-key="' + key + '" value="' + esc(v) + '"/>';
-      } else if (type === "password") {
-        input = '<div class="pwd-wrap"><input class="input" type="password" data-key="' + key + '" value="' + esc(v || "") + '"/>' +
-          '<span class="pwd-eye" data-eye="' + key + '"></span></div>';
-      } else if (type === "dirs") {
-        const list = (Array.isArray(v) && v.length) ? v : (state.cfg.models_dir ? [state.cfg.models_dir] : []);
-        input = '<textarea class="input" rows="3" data-key="' + key + '" placeholder="D:\\sd-webui-forge-neo\\webui\\models">' + esc(list.join("\n")) + '</textarea>' +
-          '<div class="tip-inline">每行一个文件夹；WebUI 与 ComfyUI 分开存放时都填进来，扫描会合并显示（推荐填你实际的 webui\\models 和 comfyui\\models 目录）</div>' +
-          '<div><button class="btn" data-dir-test="' + key + '">🔌 测试连接</button> ' +
-          '<button class="btn" data-dir-browse="' + key + '">📁 浏览</button></div>';
-      } else if (type === "dir") {
-        input = '<div class="dir-pick"><input class="input" data-key="' + key + '" value="' + esc(v || "") + '" readonly placeholder="（未设置：用默认下载目录，完成后弹窗询问）"/>' +
-          '<button type="button" class="btn btn-tiny" data-dirpick="' + key + '">选择</button>' +
-          '<button type="button" class="btn btn-tiny" data-dirclear="' + key + '">清除</button></div>';
-      } else {
-        input = '<input class="input" data-key="' + key + '" value="' + esc(v || "") + '"' +
-          (key === "archive_root" ? ' placeholder="\\\\192.168.1.10\\models 或 Z:\\models"' : "") + '/>';
-        if (key === "archive_root") input += '<div><button class="btn" data-dir-test="' + key + '">🔌 测试连接</button></div>';
-      }
-      if (type === "bool") return '<div class="form-item">' + input + "</div>";
-      return '<label' + (tip ? ' data-tip="' + esc(tip) + '"' : "") + ">" + esc(label) + "</label><div>" + input + "</div>";
-    }).join("");
-    // 翻译组追加百度申请链接
-    let extra = "";
-    if (g.indexOf("翻译") >= 0) {
-      extra = '<div class="bd-links"><div class="bd-links-title">百度翻译 API 申请指南：</div>' +
-        BAIDU_LINKS.map((l) =>
-          '<div class="bd-link" data-url="' + esc(l.url) + '"><span class="bd-link-label">' + esc(l.label) + "</span><span class=\"bd-link-desc\">" + esc(l.desc) + "</span></div>"
-        ).join("") + "</div>";
-    }
-    return '<fieldset class="form-section"><legend><span class="fold-btn">▾</span> ' + esc(g) + "</legend><div class=\"form-grid\">" + body + "</div>" + extra + "</fieldset>";
-  }).join("");
-  // 分类规则组（目标环境 + 整理模式 + 自定义规则）
-  form.innerHTML += '<fieldset class="form-section"><legend>分类规则</legend><div class="form-grid">' +
-    '<label>目标环境</label><div><select data-key="target_env">' +
-    [["", "未选择（必须选择才能整理）"], ["webui", "WebUI / Forge（Lora、Stable-diffusion）"], ["comfyui", "ComfyUI（loras、checkpoints）"]]
-      .map((o) => '<option value="' + o[0] + '"' + (String(state.cfg.target_env) === o[0] ? " selected" : "") + ">" + o[1] + "</option>").join("") +
-    "</select></div>" +
-    '<label>整理模式</label><div><select data-key="organize_mode">' +
-    [["manual", "手动分类（逐个选择文件夹）"], ["civitai", "C 站 tags 自动分类（需 info）"], ["rules", "自定义规则分类"]]
-      .map((o) => '<option value="' + o[0] + '"' + (String(state.cfg.organize_mode) === o[0] ? " selected" : "") + ">" + o[1] + "</option>").join("") +
-    "</select></div>" +
-    '<label>整理分类规则</label><div><textarea class="rules" id="organizeRules">' + esc((state.cfg.organize_rules || []).map((r) => (r.keywords || []).join(", ") + " -> " + r.folder).join("\n")) + "</textarea></div>" +
-    "</div></fieldset>";
-  // 维护区块：清理伪 C 站图片缓存
-  form.innerHTML += '<fieldset class="form-section"><legend>维护</legend><div class="form-grid">' +
-    '<label data-tip="删除模型目录下所有「模型名.images」图片缓存文件夹（详情面板里下载的示例图），释放磁盘空间；封面缩略图不受影响">图片缓存清理</label>' +
-    '<div><button class="btn" id="btnCleanImgCache">删除下载的图片文件夹</button></div>' +
-    "</div></fieldset>";
-  // Metro 专属项（亮暗 / 主题色）仅在 Metro 主题下显示；斑马纹在 Metro 下自动关闭（样式不生效，用户要求直接关掉）
-  _applyMetroOpts();
-
+  buildWorkbenchSettings();
 }
 
 
 // Metro 主题的选项联动：亮暗/主题色仅 Metro 显示；斑马纹仅 Metro 下强制关闭
 function _applyMetroOpts() {
-  try {
-    const isMetro = document.documentElement.dataset.theme === "metro";
-    ["ui_scheme", "metro_accent"].forEach((k) => {
-      const el = document.querySelector('#settingsForm [data-key="' + k + '"]');
-      if (!el) return;
-      const cell = el.parentElement; if (cell) cell.classList.add("metro-opt");
-      const lab = cell && cell.previousElementSibling; if (lab) lab.classList.add("metro-opt");
-    });
-    const zb = document.querySelector('#settingsForm [data-key="zebra_rows"]');
-    if (zb) {
-      const zw = zb.closest("div");
-      const zl = zw && zw.previousElementSibling;
-      if (zw) zw.classList.toggle("classic-opt", isMetro);
-      if (zl) zl.classList.toggle("classic-opt", isMetro);
-      const mode = isMetro ? "metro" : "normal";
-      if (zb._lastMode !== mode) {
-        zb._lastMode = mode;
-        zb.disabled = isMetro;
-        if (isMetro) zb.checked = false;
-        else zb.checked = !!(state.cfg && state.cfg.zebra_rows);
-      }
-      const wrap = zb.closest("div");
-      const lab = wrap && wrap.previousElementSibling;
-      if (lab) lab.dataset.tip = isMetro ? "Metro 主题不使用斑马纹：该选项在 Metro 下自动关闭" : "模型列表行间斑马纹，便于横向对齐查看";
-    }
-  } catch (e) { }
+  applyWorkbenchThemeOptions();
 }
 
 // 密码框小眼睛（切换明文显示）
@@ -4333,53 +4589,10 @@ $("#wfModels").addEventListener("click", (e) => {
 // ===== 设置 =====
 $("#settingsForm").addEventListener("click", (e) => {
   const link = e.target.closest(".bd-link");
-  if (link) { api.call("open_url", link.dataset.url); return; }
-  // 目录「测试连接」：逐路径调 check_dir，showToast 回显（可达/可写、网络路径标注、失败原因）；防连点禁用 1 秒
-  const testBtn = e.target.closest("[data-dir-test]");
-  if (testBtn) {
-    const key = testBtn.dataset.dirTest;
-    const inp = document.querySelector('#settingsForm [data-key="' + key + '"]');
-    const paths = (inp ? inp.value : "").split("\n").map((s) => s.trim()).filter(Boolean);
-    if (!paths.length) { showToast("请先填写目录路径"); return; }
-    testBtn.disabled = true;
-    const orig = testBtn.textContent;
-    testBtn.textContent = "测试中…";
-    (async () => {
-      for (const p of paths) {
-        try {
-          const r = await api.call("check_dir", p);
-          if (r && (r.ok || r.exists)) {
-            let msg = p + "：可达（" + (r.writable ? "可写" : "只读") + "）";
-            if (r.is_remote) msg += "【网络路径】";
-            showToast(msg);
-          } else {
-            showToast(p + "：不可达，" + ((r && r.error) || "未知原因"));
-          }
-        } catch (err) {
-          showToast(p + "：测试失败，" + err);
-        }
-      }
-      setTimeout(() => { testBtn.disabled = false; testBtn.textContent = orig; }, 1000);
-    })();
-    return;
-  }
-  // models_dirs「浏览」按钮：复用 pick_dir，追加为 textarea 新行（保存时后端已去重）
-  const browseBtn = e.target.closest("[data-dir-browse]");
-  if (browseBtn) {
-    const key = browseBtn.dataset.dirBrowse;
-    (async () => {
-      const picked = await api.call("pick_dir");
-      if (!picked) return;
-      const inp = document.querySelector('#settingsForm [data-key="' + key + '"]');
-      if (!inp) return;
-      inp.value = (inp.value.trim() ? inp.value.replace(/\s+$/, "") + "\n" : "") + picked;
-      inp.dispatchEvent(new Event("change", { bubbles: true }));
-    })();
-    return;
-  }
+  if (link) api.call("open_url", link.dataset.url);
 });
 
-$("#btnSaveSettings").addEventListener("click", async () => {
+async function saveSettings() {
   const cfg = {};
   Object.assign(cfg, state.cfg);
   $$("#settingsForm [data-key]").forEach((el) => {
@@ -4390,28 +4603,79 @@ $("#btnSaveSettings").addEventListener("click", async () => {
     else cfg[k] = el.value;
   });
   updateOrganizeBtns();
-  cfg.organize_rules = $("#organizeRules").value.split("\n").map((l) => {
-    const m = l.match(/^\s*(.+?)\s*(?:->|=>|→)\s*(.+?)\s*$/);
-    return m ? { keywords: m[1].split(",").map((s) => s.trim()).filter(Boolean), folder: m[2].trim() } : null;
-  }).filter(Boolean);
-  await api.call("save_config", cfg);
+  const parsedRules = parseOrganizeRules($("#organizeRules").value);
+  if (parsedRules.errors.length || (cfg.organize_mode === "rules" && !parsedRules.rules.length)) {
+    showSettingsCategory("organize");
+    const msg = parsedRules.errors.length ? parsedRules.errors.join("；") : "自定义规则模式至少需要一条规则";
+    $("#ruleValidation").textContent = msg;
+    setStatus("未保存：" + msg);
+    $("#organizeRules").focus();
+    return;
+  }
+  cfg.organize_rules = parsedRules.rules;
+  const folderModeChanged=(state.cfg.model_folder_include_subfolders!==false)!==(cfg.model_folder_include_subfolders!==false);
+  if (!(await api.call("save_config", cfg))) { setStatus("设置保存失败，请检查目录写入权限"); return; }
   state.cfg = await api.call("get_config");
   setStatus("设置已保存");
+  updateOrganizeBtns();
   // 不刷新页面：直接应用主题/缩放/表单（避免白屏闪烁）
   applyZoom(Number(state.cfg.ui_zoom) || 100);
   document.documentElement.dataset.theme = state.cfg.theme || "modern";
   applyUiAppearance();
   buildSettingsForm();
-});
+  if(folderModeChanged){foldersState=null;mmScan();}
+  return true;
+}
+$("#btnSaveSettings").addEventListener("click",()=>saveSettings().catch(()=>setStatus("设置保存失败，请重试")));
 
 // 设置里「下载目标文件夹」的选择/清除（点击即时保存，不依赖底部「保存设置」）
 $("#settingsForm").addEventListener("click", async (e) => {
+  if (e.target.closest("#resetAppearance")) {
+    const defaults = { custom_accent_enabled: false, custom_accent: "#60A5FA", ui_density: "standard", ui_corners: "theme", ui_font: "", ui_text_size: "standard", window_appearance: "theme", masonry_card_width:220, model_list_size:3 };
+    Object.assign(state.cfg, defaults);
+    setModelListSize(3,false);
+    for (const [key, value] of Object.entries(defaults)) {
+      const input = $('#settingsForm [data-key="' + key + '"]');
+      if (input) { if (input.type === "checkbox") input.checked = value; else input.value = value; }
+    }
+    applyUiAppearance();
+    try { const ok = await api.call("save_config", defaults); setStatus(ok ? "已恢复当前主题默认外观" : "恢复已预览，保存失败，请重试"); }
+    catch (err) { setStatus("恢复已预览，保存失败，请重试"); }
+    return;
+  }
+  const dirtest = e.target.closest("[data-dirtest]");
+  if (dirtest) {
+    const key = dirtest.dataset.dirtest;
+    const inp = $('#settingsForm [data-key="' + key + '"]');
+    if (!inp) return;
+    const paths = (inp.tagName === "TEXTAREA" ? inp.value.split("\n") : [inp.value])
+      .map((s) => s.trim()).filter(Boolean);
+    if (!paths.length) { showToast("请先填写目录路径"); return; }
+    dirtest.disabled = true;
+    try {
+      const results = [];
+      for (const p of paths) {
+        try { results.push({ path: p, ...(await api.call("check_dir", p)) }); }
+        catch (err) { results.push({ path: p, ok: false, error: String(err) }); }
+      }
+      const bad = results.filter((r) => !r.ok);
+      if (!bad.length) {
+        const remote = results.some((r) => r.is_remote);
+        showToast("全部可达（" + results.length + " 个" + (remote ? "，含网络路径" : "") +
+          (results.every((r) => r.writable) ? "，均可写）" : "；部分只读）"));
+      } else {
+        showToast("不可达 " + bad.length + "/" + results.length + "：" +
+          bad.map((r) => r.path + "（" + (r.error || "未知原因") + "）").join("；"));
+      }
+    } finally { dirtest.disabled = false; }
+    return;
+  }
   const pick = e.target.closest("[data-dirpick]");
   if (pick) {
     const p = await pickFolderModal();
     if (p && await applyDownloadTarget(p)) {
       const inp = $('#settingsForm [data-key="' + pick.dataset.dirpick + '"]');
-      if (inp) inp.value = p;
+      if (inp) {inp.value = p;markSettingSaved(pick.dataset.dirpick);}
     }
     return;
   }
@@ -4419,7 +4683,7 @@ $("#settingsForm").addEventListener("click", async (e) => {
   if (clr) {
     if (await applyDownloadTarget("")) {
       const inp = $('#settingsForm [data-key="' + clr.dataset.dirclear + '"]');
-      if (inp) inp.value = "";
+      if (inp) {inp.value = "";markSettingSaved(clr.dataset.dirclear);}
     }
   }
 });
@@ -4429,16 +4693,48 @@ $("#settingsForm").addEventListener("change", (e) => {
   const el = e.target.closest("[data-key]");
   if (!el) return;
   const key = el.dataset.key;
-  const val = el.type === "checkbox" ? el.checked : (el.type === "number" ? Number(el.value) : el.value);
-  if (key === "theme") {
+  let val = el.type === "checkbox" ? el.checked : (el.type === "number" ? Number(el.value) : el.value);
+  if(key.startsWith("shortcuts_")){applyShortcutPreference(key,val);return;}
+  if(key==="model_list_size"){setModelListSize(val,true);return;}
+  if(key==="name_scroll_speed"){val=Math.max(10,Math.min(240,Math.round(Number.isFinite(Number(val))?Number(val):70)));el.value=val;}
+  if(["name_scroll_start_pause","name_scroll_end_pause"].includes(key)){val=Math.max(0,Math.min(5000,Math.round(Number(val)||0)));el.value=val;}
+  if(key==="effects_fps_limit"){val=val===0?0:Math.max(15,Math.min(360,Math.round(Number(val)||60)));el.value=val;}
+  if(key==="gallery_cache_mb"){val=Math.max(64,Math.min(8192,Math.round(Number(val)||1024)));el.value=val;}
+  if(key==='ui_mode' || key==='browser_fallback_enabled'){
+    const previous=state.cfg[key];state.cfg[key]=val;
+    api.call('save_config',{[key]:val}).then(ok=>{
+      if(!ok){state.cfg[key]=previous;if(el.type==='checkbox')el.checked=previous;else el.value=previous;setStatus('启动方式保存失败，请重试');return;}
+      setStatus(key==='ui_mode'?(val==='browser'?'已保存：以后直接用浏览器启动，不尝试软件窗口；重启生效':'已保存：以后先启动软件窗口；失败时按兜底开关处理；重启生效'):'浏览器兜底开关已保存；不会改变正常启动方式');
+    }).catch(()=>{state.cfg[key]=previous;if(el.type==='checkbox')el.checked=previous;else el.value=previous;setStatus('启动方式保存失败，请重试');});
+  } else if (key === "theme") {
     state.cfg.theme = val;
     document.documentElement.dataset.theme = val || "modern";
     applyUiAppearance();   // 主题切换：重算 --primary/主题色 + 重刷代理按钮标签（经典 emoji / Metro 无）
+  } else if (["show_file_paths", "custom_accent_enabled", "custom_accent", "ui_density", "ui_corners", "ambient_bg"].includes(key)) {
+    if (state.cfg) state.cfg[key] = val;
+    applyUiAppearance();
+    api.call("save_config", { [key]: val }).then((ok) => {
+      if (!ok) setStatus("外观已预览，保存失败，请重试");
+    }).catch(() => setStatus("外观已预览，保存失败，请重试"));
+  } else if (["effects_fps_limit", "cache_original_images", "gallery_cache_mb", "zebra_rows", "masonry_info_mode", "masonry_overlay_size", "name_scroll_speed", "name_scroll_start_pause", "name_scroll_end_pause", "pointer_effects", "pointer_effect_quality", "cache_detail_images", "ui_font", "ui_text_size", "window_appearance", "integrated_titlebar", "folder_picker_show_paths"].includes(key)) {
+    state.cfg[key] = val;
+    if(key==="cache_original_images" && val===false && typeof clearViewerImageCache==="function")clearViewerImageCache();
+    applyUiAppearance();
+    api.call("save_config", { [key]: val }).catch(() => setStatus("设置保存失败"));
+  } else if (key === "masonry_card_width") {
+    setMasonrySize(val,true);
   } else if (key === "ui_scheme" || key === "metro_accent") {
     if (state.cfg) state.cfg[key] = val;
     applyUiAppearance();
   } else if (key === "ui_zoom") {
     applyZoom(Number(val) || 100);
+  }
+});
+$("#settingsForm").addEventListener("input", (e) => {
+  if(e.target.dataset.key === "masonry_card_width") {setMasonrySize(e.target.value,true);return;}
+  if (e.target.dataset.key === "custom_accent") {
+    state.cfg.custom_accent = e.target.value;
+    applyUiAppearance();
   }
 });
 
@@ -4483,6 +4779,7 @@ $("#settingsForm").addEventListener("click", async (e) => {
 // ================= 启动 =================
 async function init() {
   state.cfg = await api.call("get_config");
+  refreshApiKeyGates();
   window.__ready = true;
   refreshDlTarget();
   // 应用主题（dark / light / modern）
@@ -4509,18 +4806,19 @@ async function init() {
   setInterval(rpRefresh, 2000);
   setStatus("就绪");
   // 首次使用引导（未配置 API key 时自动弹出）
-  if (!state.cfg.api_key) {
+  if (!state.cfg.api_key && !state.cfg.onboarding_done) {
     showOnboarding();
   }
 }
 
 // ===== 首次使用引导（主题 / 下载目录 / API key / 模型目录 / 反向解析） =====
-const OB_STEPS = ["功能", "主题", "下载目录", "API Key", "模型目录", "反向解析"];
+const OB_STEPS = ["申请 API Key", "页面介绍", "主题", "下载目录", "模型目录", "反向解析"];
 let obStep = 0;
 let obTheme = "dark";
 let obDirVal = "";   // 跨步骤保存（输入框只在对应步骤渲染）
 let obKeyVal = "";
 let obModelDirs = []; // 模型管理目录（多目录）
+let obStartPage = "models";
 let obMini = false;   // 迷你模式：引导缩小悬浮右侧，不中断
 
 // 迷你模式切换：全屏 ⇄ 右下角小窗
@@ -4538,7 +4836,8 @@ $("#obMiniClose").addEventListener("click", async () => {
   await finishOnboarding();
 });
 function showOnboarding() {
-  obStep = 0;
+  if(typeof settingsHaveChanges==="function"&&settingsHaveChanges()){requestSettingsLeave(showOnboarding);return;}
+  obStep = 0;obStartPage=document.querySelector(".nav-tab.active")?.dataset.page||"models";
   obTheme = state.cfg.theme || "dark";
   obDirVal = state.cfg.download_dir || "";
   obKeyVal = state.cfg.api_key || "";
@@ -4553,96 +4852,56 @@ function renderOnboarding() {
   $("#obSteps").innerHTML = OB_STEPS.map((s, i) =>
     '<div class="ob-step ' + (i === obStep ? "active" : i < obStep ? "done" : "") + '">' + s + "</div>").join("");
   $("#obPrev").style.display = obStep === 0 ? "none" : "inline-block";
+  $("#obNext").disabled=obStep===0&&!obKeyVal.trim();
   $("#obNext").textContent = obStep === OB_STEPS.length - 1 ? "完成 " : "下一步";
   const body = $("#obBody");
-  if (obStep === 0) {
-    // 第一页：功能介绍 —— 六个按钮对应六个页面，hover 显示功能简介
-    const feats = [
-      ["", "批量下载", "download", "粘贴 C 站 / HuggingFace 链接，批量解析并下载；支持付费模型到期提醒"],
-      ["", "下载管理", "dlmanager", "查看下载进度、断点续传、暂停/重试/移除任务，完成后自动写元数据"],
-      ["", "模型管理", "models", "扫描本地模型、缩略图瀑布流、改名/整理/校验完整性/一键清理"],
-      ["", "反向解析", "reverse", "把已下载的模型文件识别出 C 站信息：名字、触发词、类型、封面"],
-      ["", "工作流分析", "workflow", "拖入 ComfyUI 的 json/png 工作流，解析节点、模型引用与参数"],
-      ["", "设置", "settings", "下载目录、API Key、主题缩放、分类规则、清理缓存、新手引导"],
+  if (obStep === 1) {
+    const pages=[
+      ['download','download','批量下载','粘贴模型链接，解析后选择文件和保存位置，再开始下载。'],
+      ['dlmanager','list','下载管理','查看进度，暂停或重试；已结束任务可收进历史，打开实际文件位置。'],
+      ['models','layers','模型管理','扫描本地目录；单击选中并更新右侧详情，星标收藏置顶。'],
+      ['updates','refresh','检查更新','检查已有模型的新版本，选择需要更新的文件，不会自动删除旧版。'],
+      ['reverse','search','反向解析','已有文件但缺少封面、名称或触发词？从这里识别 C站模型信息。'],
+      ['workflow','workflow','工作流分析','打开 ComfyUI 的 JSON / PNG，查看节点、参数与缺少的模型。'],
+      ['settings','settings','设置','目录、账号、字体、主题、启动方式与分类规则；关键词可搜索。']
     ];
-    body.innerHTML =
-      '<div class="ob-label">六个页面，各司其职（鼠标移上去查看功能介绍，点击直接进入）：</div>' +
-      '<div class="ob-feat-grid">' +
-      feats.map((f) =>
-        '<div class="ob-feat-btn" data-page="' + f[2] + '" data-tip="' + esc(f[3]) + '"><span>' + f[0] + "</span><span>" + f[1] + "</span></div>"
-      ).join("") +
-      "</div>" +
-      '<div style="margin-top:10px;text-align:center">' +
-      '<a class="ob-github" id="obGithub">GitHub 仓库（源码 / 更新 / 反馈）</a></div>' +
-      '<div style="color:var(--text-dim);font-size:12px;margin-top:8px;text-align:center">免费 · 全功能 · 无付费墙</div>';
-    document.querySelectorAll(".ob-feat-btn").forEach((el) => {
-      el.addEventListener("click", async () => {
-        const page = el.dataset.page;
-        // 切换页面但不结束引导：引导缩小悬浮在画面右侧继续
-        const tab = document.querySelector('.nav-tab[data-page="' + page + '"]');
-        if (tab) tab.click();
-        setObMini(true);
-      });
-    });
-    $("#obGithub").addEventListener("click", () => api.call("open_url", "https://github.com/ADVICEsama/CivitaiFreeTool"));
-  } else if (obStep === 1) {
-    body.innerHTML =
-      '<div class="ob-label">选择界面主题（可随时在设置页更换）</div>' +
-      '<div class="ob-themes" id="obThemes">' +
-      '<div class="ob-theme" data-t="dark"><div class="sw" style="background:#171221;border:2px solid #0a84ff"></div>深色</div>' +
-      '<div class="ob-theme" data-t="dark_purple"><div class="sw" style="background:#16112b;border:2px solid #a06bff"></div>暮紫</div>' +
-      '<div class="ob-theme" data-t="dark_blue"><div class="sw" style="background:#0d1524;border:2px solid #38bdf8"></div>深海</div>' +
-      '<div class="ob-theme" data-t="dark_green"><div class="sw" style="background:#0e1a14;border:2px solid #34d399"></div>森林</div>' +
-      '<div class="ob-theme" data-t="dark_red"><div class="sw" style="background:#1d1010;border:2px solid #ff7a59"></div>熔岩</div>' +
-      '<div class="ob-theme" data-t="light"><div class="sw" style="background:#f2f2f2;border:1px solid #ddd"></div>浅色</div>' +
-      '<div class="ob-theme" data-t="light_blue"><div class="sw" style="background:#eef4fb;border:1px solid #2f7cf6"></div>晴空</div>' +
-      '<div class="ob-theme" data-t="light_pink"><div class="sw" style="background:#fdf2f4;border:1px solid #ec5d7a"></div>樱粉</div>' +
-      '<div class="ob-theme" data-t="light_green"><div class="sw" style="background:#f0f8f3;border:1px solid #2e9e63"></div>薄荷</div>' +
-      '<div class="ob-theme" data-t="modern"><div class="sw" style="background:#efefef;border:1px solid #ddd"></div>现代浅色</div></div>';
-    document.querySelectorAll("#obThemes .ob-theme").forEach((el) => {
-      if (el.dataset.t === obTheme) el.classList.add("sel");
-      el.addEventListener("click", () => {
-        obTheme = el.dataset.t;
-        // 立即写入 state + 同步设置页下拉：中途保存设置不会把刚选的主题覆盖回旧值
-        if (state.cfg) state.cfg.theme = obTheme;
-        document.querySelectorAll('select[data-key="theme"]').forEach((sel) => { sel.value = obTheme; });
-        document.documentElement.dataset.theme = obTheme;
-        applyUiAppearance();
-        document.querySelectorAll("#obThemes .ob-theme").forEach((x) => x.classList.remove("sel"));
-        el.classList.add("sel");
-      });
-    });
+    body.innerHTML='<p class="ob-label">先认识这些页面。点击任意页面直接体验，引导会缩到右下角，随时可以继续。</p><div class="ob-page-grid">'+pages.map(([page,icon,title,text])=>'<button class="ob-page-card" data-page="'+page+'">'+_icon(icon)+'<span><b>'+title+'</b><small>'+text+'</small></span></button>').join('')+'</div>';
+    body.querySelectorAll('[data-page]').forEach(button=>button.onclick=()=>{obStartPage=button.dataset.page;switchPage(obStartPage);setObMini(true);});
   } else if (obStep === 2) {
+    const options=SETTING_FIELDS.find(field=>field[1]==='theme')[4];
+    body.innerHTML='<p class="ob-label">选择喜欢的主题，设置里还能调整字体、字号和强调色。</p><div class="ob-themes">'+options.map(([value,label])=>'<button class="btn ob-theme" data-t="'+esc(value)+'">'+esc(label)+'</button>').join('')+'</div>';
+    body.querySelectorAll('[data-t]').forEach(button=>{button.classList.toggle('sel',button.dataset.t===obTheme);button.onclick=()=>{obTheme=button.dataset.t;state.cfg.theme=obTheme;document.documentElement.dataset.theme=obTheme;applyUiAppearance();body.querySelectorAll('[data-t]').forEach(b=>b.classList.toggle('sel',b===button));};});
+  } else if (obStep === 3) {
     body.innerHTML =
       '<div class="ob-label">下载目录（模型下载后存放位置，可修改）</div>' +
       '<div style="display:flex;gap:8px"><input class="input" id="obDir" style="flex:1" value="' + esc(obDirVal) + '"/>' +
       '<button class="btn" id="obBrowse">浏览</button></div>' +
-      '<div style="color:var(--text-dim);font-size:12px;margin-top:6px">默认：软件根目录下的 downloads/models 文件夹</div>';
+      '<div style="color:var(--text-dim);font-size:calc(12px * var(--type-scale, 1));margin-top:6px">默认：软件根目录下的 downloads/models 文件夹</div>';
     $("#obDir").addEventListener("input", () => { obDirVal = $("#obDir").value; });
     $("#obBrowse").addEventListener("click", async () => {
       const picked = await api.call("pick_dir");
       if (picked) { obDirVal = picked; $("#obDir").value = picked; }
     });
     $("#obBrowse2") && null;
-  } else if (obStep === 3) {
+  } else if (obStep === 0) {
     body.innerHTML =
-      '<div class="ob-label">Civitai API Key（免费申请，用于查询模型信息与下载）</div>' +
+      '<div class="ob-label">第一步：先申请 Civitai API Key（免费申请，用于查询模型信息与下载）</div>' +
       '<input class="input" id="obKey" type="password" value="' + esc(obKeyVal) + '" placeholder="粘贴你的 API Key"/>' +
-      '<div class="ob-guide" id="obGuide" style="display:none">' +
+      '<div class="ob-guide" id="obGuide">' +
       '<div style="font-weight:600;margin-bottom:6px">如何注册 API Key：</div>' +
-      '<div>1. 打开 <a class="ob-link" id="obApiPage">civitai.com/user/account</a>（登录后点 Account Settings 生成 API Keys）</div>' +
+      '<div>1. 打开 <a class="ob-link" id="obApiPage">civitai.red/user/account</a>（登录后点 Account Settings 生成 API Keys）</div>' +
       '<div>2. 登录账号后点击「New API Key」生成</div>' +
       '<div>3. 复制生成的 Key 粘贴到上方输入框即可</div></div>' +
       '<div class="ob-actions2"><button class="btn" id="obToggleGuide">如何注册 API？</button>' +
       '<button class="btn" id="obOpenApi">打开注册页</button></div>' +
-      '<div style="color:var(--text-dim);font-size:12px;margin-top:6px">不填也能用，但模型查询与部分下载功能受限。</div>';
-    $("#obKey").addEventListener("input", () => { obKeyVal = $("#obKey").value; });
+      '<div style="color:var(--text-dim);font-size:calc(12px * var(--type-scale, 1));margin-top:6px">请先完成申请并填写 API Key，再进入页面介绍；Key 仅保存到你的本地配置。</div>';
+    $("#obKey").addEventListener("input", () => { obKeyVal = $("#obKey").value;$("#obNext").disabled=!obKeyVal.trim();$("#obSkipAll").disabled=!obKeyVal.trim(); });
     $("#obToggleGuide").addEventListener("click", () => {
       const g = $("#obGuide");
       g.style.display = g.style.display === "none" ? "block" : "none";
     });
-    $("#obOpenApi").addEventListener("click", () => api.call("open_url", "https://civitai.com/user/account"));
-    $("#obApiPage").addEventListener("click", () => api.call("open_url", "https://civitai.com/user/account"));
+    $("#obOpenApi").addEventListener("click", () => api.call("open_url", "https://civitai.red/user/account"));
+    $("#obApiPage").addEventListener("click", () => api.call("open_url", "https://civitai.red/user/account"));
   } else if (obStep === 4) {
     // 模型管理目录：手把手选择（可多目录）
     body.innerHTML =
@@ -4651,7 +4910,7 @@ function renderOnboarding() {
       '<textarea class="input" id="obModelDirs" rows="3" style="width:100%;box-sizing:border-box">' + esc(obModelDirs.join("\n")) + '</textarea>' +
       '<div class="ob-actions2"><button class="btn" id="obBrowseModels">选择文件夹</button>' +
       '<button class="btn" id="obBrowseModels2">再添加一个</button></div>' +
-      '<div style="color:var(--text-dim);font-size:12px;margin-top:6px">常见路径：D:\\sd-webui-forge-neo\\webui\\models（WebUI）、D:\\ComfyUI\\models（ComfyUI）</div>';
+      '<div style="color:var(--text-dim);font-size:calc(12px * var(--type-scale, 1));margin-top:6px">常见路径：D:\\sd-webui-forge-neo\\webui\\models（WebUI）、D:\\ComfyUI\\models（ComfyUI）</div>';
     const sync = () => { obModelDirs = $("#obModelDirs").value.split("\n").map((s) => s.trim()).filter(Boolean); };
     $("#obModelDirs").addEventListener("input", sync);
     const addDir = async () => {
@@ -4677,26 +4936,23 @@ function renderOnboarding() {
       '<div class="ob-actions2"><button class="btn btn-primary" id="obGoRp">立即体验（推荐）</button>' +
       '<button class="btn" id="obSkipRp">跳过（以后在 反向解析 页随时可用）</button></div>';
     $("#obGoRp").addEventListener("click", async () => {
-      await finishOnboarding();
-      document.querySelector(".nav-tab[data-page=\"reverse\"]").click();
-      setStatus("已进入反向解析页，拖入或选择模型文件即可开始");
+      if(await finishOnboarding()!==true)return;
+      startReverseTutorial();
     });
     $("#obSkipRp").addEventListener("click", async () => {
       await finishOnboarding();
     });
   }
-  // 每一步底部都有「跳过引导」：不填剩余项，直接保存已填内容并关闭
-  // 注意：必须用 insertAdjacentHTML 追加——innerHTML += 会重建整个 body、清空上面绑定的
-  // 功能卡/主题点击监听器（曾导致「点击无法进入」「主题切换无效」）
-  body.insertAdjacentHTML("beforeend",
-    '<div class="ob-skip-row"><button class="btn" id="obSkipAll">跳过引导（剩余步骤不填，以后可随时在设置页重开）</button></div>');
-  $("#obSkipAll").addEventListener("click", async () => {
-    await finishOnboarding();
-  });
+  body.scrollTop=0;
+  $('#obSkipAll')?.remove();$('#obNext').insertAdjacentHTML('beforebegin','<button class="btn" id="obSkipAll">跳过引导，直接使用</button>');
+  $('#obSkipAll').disabled=!obKeyVal.trim();$('#obSkipAll').title=obKeyVal.trim()?'跳过后续介绍':'请先申请并填写 API Key';
+  $('#obSkipAll').onclick=finishOnboarding;
 }
 
 // 引导完成：保存全部配置
 async function finishOnboarding() {
+  if(!obKeyVal.trim()){obStep=0;renderOnboarding();showToast("请先申请并填写 Civitai API Key");return false;}
+  state.cfg.onboarding_done = true;
   state.cfg.api_key = (obKeyVal || "").trim();
   state.cfg.download_dir = (obDirVal || state.cfg.download_dir || "").trim();
   state.cfg.theme = obTheme;
@@ -4705,31 +4961,24 @@ async function finishOnboarding() {
   if (dirs.length) state.cfg.models_dir = dirs[0];
   document.documentElement.dataset.theme = obTheme;
         applyUiAppearance();
-  await api.call("save_config", state.cfg);
+  if(!await api.call("save_config", state.cfg)){showToast("设置保存失败，请重试");return;}
   state.cfg = await api.call("get_config");
   buildSettingsForm();
   applyZoom(Number(state.cfg.ui_zoom) || 100);
   document.documentElement.dataset.theme = state.cfg.theme || "modern";
   $("#obMask").style.display = "none";
-  setStatus("设置完成，欢迎使用！");
+  switchPage(obStartPage);
+  setStatus('引导已完成。可在设置里随时重新打开。');
+  return true;
 }
-$("#obNext").addEventListener("click", async () => {
-  if (obStep === 0) {
-    obStep = 1;
-  } else if (obStep === 1) {
-    obStep = 2;
-  } else if (obStep === 2) {
-    obStep = 3;
-  } else if (obStep === 3) {
-    obStep = 4;
-  } else if (obStep === 4) {
-    obStep = 5;
-  } else {
-    // 完成：保存配置（obDirVal/obKeyVal/obModelDirs 跨步骤保存，输入框已不在 DOM）
-    await finishOnboarding();
-    return;
+$("#obNext").addEventListener("click",async()=>{
+  if(obStep===0){
+    if(!obKeyVal.trim()){showToast('请先申请并填写 API Key');return;}
+    try{if(!await api.call('save_config',{api_key:obKeyVal.trim(),site_domain:state.cfg.site_domain||'civitai.red'})){showToast('API Key 保存失败，请重试');return;}state.cfg=await api.call('get_config');buildSettingsForm();}
+    catch(_){showToast('API Key 保存失败，请重试');return;}
   }
-  renderOnboarding();
+  if(obStep===OB_STEPS.length-1){await finishOnboarding();return;}
+  obStep++;renderOnboarding();
 });
 $("#obPrev").addEventListener("click", () => { obStep--; renderOnboarding(); });
 
@@ -4864,11 +5113,12 @@ function _mmOpenMenu(grp, menu, btn) {
 }
 
 function bindMmMetro() {
-  const _sec = (name, fn) => { try { fn(); } catch (e) { console.error("[bindMmMetro]", name, e); try { api.call("log_ui_error", "bindMmMetro/" + name + ": " + (e && e.message || e)); } catch (e2) { } } };
+  const _sec = (name, fn) => { try { fn(); } catch (e) { console.error("[bindMmMetro]", name, e); try { api.call("log_ui_error", "bindMmMetro/" + name + ": " + (e && e.message || e)).catch(() => {}); } catch (e2) { } } };
   // 1) 代理按钮：点击 → 原按钮 click()
   document.querySelectorAll(".mm-metro [data-proxy]").forEach((el) => {
     if (el._px) return; el._px = 1;
-    el.addEventListener("click", () => {
+    el.addEventListener("click", (e) => {
+      if (el.dataset.proxy === "mmFolders") e.stopPropagation();
       _closeMmMenus();
       const src = document.getElementById(el.dataset.proxy);
       if (src && !src.disabled) src.click();
@@ -4930,6 +5180,8 @@ function bindMmMetro() {
   _sec("filters", () => {
   const bf = document.getElementById("mmBaseF"), sf = document.getElementById("mmStF"),
         so = document.getElementById("mmSortF"), sd = document.getElementById("mmSortDir");
+  const tf = document.getElementById("mmTypeF");
+  if (tf) tf.addEventListener("change", () => { state.mmTypeF = tf.value; applyMmFilter(); });
   const ff = document.getElementById("mmFolderF");
   if (ff) ff.addEventListener("change", () => { state.mmFolderF = ff.value; applyMmFilter(); });
   if (bf) bf.addEventListener("change", () => { state.mmBaseF = bf.value; applyMmFilter(); });
@@ -4962,8 +5214,8 @@ function bindMmMetro() {
     const _isMetro = () => document.documentElement.dataset.theme === "metro";
     const sync = () => {
       const raw = String(src.textContent || "");
-      const lbl = _isMetro() ? _clean(raw) : raw.trim();       // 经典主题：保留 emoji（原样）
-      const ic = (_isMetro() && el.dataset.icon) ? _icon(el.dataset.icon) : "";
+      const lbl = _clean(raw);       // 经典主题：保留 emoji（原样）
+      const ic = el.dataset.icon ? _icon(el.dataset.icon) : "";
       if (el.innerHTML !== (ic + lbl)) el.innerHTML = ic + lbl;
       el.disabled = !!src.disabled;
       el.style.display = (src.style.display === "none") ? "none" : "";
@@ -5010,3 +5262,7 @@ document.addEventListener("click", (e) => {
 }, true);
 
 // 门户菜单挂在 body 后仍可点（portal 出去的菜单也走上面的委托）
+
+// Escape 先关闭右键菜单，不同时关闭背后的模型详情。
+document.addEventListener('keydown',e=>{const menu=$('#ctxMenu');if(e.key==='Escape' && menu.style.display==='block'){menu.style.display='none';e.preventDefault();e.stopImmediatePropagation();}},true);
+window.addEventListener('resize',()=>{const menu=$('#ctxMenu');if(menu)menu.style.display='none';});

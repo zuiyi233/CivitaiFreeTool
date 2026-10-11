@@ -3,15 +3,34 @@
 前端（web/index.html）通过 window.pywebview.api 调用；耗时任务后台线程 + 前端轮询进度。
 业务逻辑复用 civitai_api / downloader / model_manager / reverse_parse / translator / config。"""
 import json
+import math
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 
 import webview
 
-APP_VERSION = "2.2.7"
+APP_VERSION = "2.6.26"
+
+from functools import wraps
+
+API_KEY_REQUIRED_MSG = "请先在设置 → 目录与账号填写并保存 Civitai API Key"
+
+def requires_civitai_key(kind="dict"):
+    """Block new online work without changing local models, histories or running tasks."""
+    def decorate(fn):
+        @wraps(fn)
+        def guarded(self, *args, **kwargs):
+            if not str((getattr(self, "cfg", None) or {}).get("api_key") or "").strip():
+                if kind == "bool": return False
+                result = {"ok": False, "started": False, "requires_api_key": True, "msg": API_KEY_REQUIRED_MSG}
+                return json.dumps(result, ensure_ascii=False) if kind == "json" else result
+            return fn(self, *args, **kwargs)
+        return guarded
+    return decorate
 
 import civitai_api
 import config
@@ -22,8 +41,19 @@ import posix_compat
 import reverse_parse
 import translator
 import browser_bridge
+from download_selection import FileChoiceBroker
+import model_naming
+import model_filters
 from gui import (_download_image, _recycle_to_trash, _text_to_rules, _rules_to_text,
                  _folder_visible, _friendly_api_error)
+
+
+def _json_safe(value):
+    """兼容旧元数据 NaN/Infinity，但不改用户原文件，不编造数值。"""
+    if isinstance(value,float) and not math.isfinite(value):return None
+    if isinstance(value,dict):return {str(k):_json_safe(v) for k,v in value.items()}
+    if isinstance(value,(list,tuple)):return [_json_safe(v) for v in value]
+    return value
 
 
 def _todo_label(url):
@@ -51,11 +81,12 @@ def _vkey(name):
 
 class Api:
     def __init__(self):
+        self._file_choices = FileChoiceBroker()
         self.cfg = config.load()
         self.api = self._new_api()
         self.dl = downloader.Downloader(self.cfg, on_update=self._on_dl_update)
         # 浏览器桥：Chrome 扩展一键下载当前页面（127.0.0.1 本地 HTTP，静默失败）
-        browser_bridge.set_download_handler(self.dl_enqueue_url_sync)
+        browser_bridge.set_download_handler(self.dl_submit_url)
         browser_bridge.set_api(self)     # 浏览器模式：/api/rpc 的方法调用目标
         browser_bridge.set_archive_handlers(config_fn=self.archive_config,
                                             write_fn=self.archive_write,
@@ -77,9 +108,12 @@ class Api:
         self._updates = self._load_updates()
         self.mm_scan_state = {"running": False, "rows": [], "msg": ""}
         self.rp_rows = []
+        self._rp_launch_lock = threading.RLock()
         self._rp_state = {"running": False, "paused": False, "done": 0, "total": 0}
         self._rp_pause_ev = threading.Event()
         self._rp_stop_ev = threading.Event()
+        # 所有回调依赖都初始化后再恢复。重启只恢复记录，不擅自开始网络下载。
+        self.dl.load_tasks(resume=False)
 
     def _new_api(self):
         return civitai_api.CivitaiAPI(
@@ -90,8 +124,14 @@ class Api:
     # ---------------- 下载完成回调 ----------------
     def _on_dl_update(self, task):
         """Downloader 状态回调：任务完成时后台生成 metadata + 下载封面"""
-        if task.status != downloader.ST_DONE:
+        if task.status in (downloader.ST_ERROR, downloader.ST_CANCELED):
+            if getattr(task, "_history_status_cached", None) != task.status:
+                task._history_status_cached = task.status
+                threading.Thread(target=self._cache_history_task, args=(task,), daemon=True).start()
             return
+        if task.status != downloader.ST_DONE or getattr(task, "_metadata_started", False):
+            return
+        task._metadata_started = True
         threading.Thread(target=self._handle_dl_done, args=(task,), daemon=True).start()
 
     def _handle_dl_done(self, task):
@@ -101,6 +141,17 @@ class Api:
                 return
             base = os.path.splitext(dest)[0]
             meta = (task.info or {}).get("meta") or {}
+            # A later strict, verified re-download is not the formerly associated mismatched file.
+            if task.verification_status == 'verified' and (task.info or {}).get('manual_binding'):
+                import copy
+                meta = copy.deepcopy(meta)
+                m = meta.get('info') or {}
+                m.pop('association', None); m.pop('localSha256', None)
+                for f in m.get('files') or []:
+                    if isinstance(f,dict) and 'civitaiHashes' in f:
+                        f['hashes'] = f.pop('civitaiHashes')
+                task.info['meta'] = meta
+                task.info.pop('manual_binding', None)
             # 1) metadata 文件（按配置）
             if self.cfg.get("gen_metadata", True):
                 fmt = self.cfg.get("metadata_format", "sd")
@@ -128,16 +179,8 @@ class Api:
                                         verify=self.cfg.get("ssl_verify", True))
                     except Exception:
                         pass
-            # 3) 「当前目标」与任务实际落地目录不一致时自动归位（不再弹窗询问）：
-            #    - 没被单独指定过的任务：跟当前全局目标（HF 任务带相对子目录，不丢结构）
-            #    - 单独指定过的任务：以其指定目录为准，这里不动它
-            try:
-                want = self._task_intended_dir(task)
-                if want and os.path.abspath(os.path.dirname(dest)) != os.path.abspath(want):
-                    os.makedirs(want, exist_ok=True)
-                    self.move_file_to(dest, want)
-            except Exception:
-                pass
+            # Completed files stay where the user classified them. Global target only affects
+            # future downloads; relocation is exclusively an explicit move action.
             # 4) 「更新下载」完成：按设置处理旧版本（默认保留；删除走回收站，可还原）
             try:
                 old = str((task.info or {}).get("replace_old") or "")
@@ -172,29 +215,42 @@ class Api:
 
         except Exception:
             pass
+        finally:
+            self._cache_history_task(task)
 
     def move_file_to(self, path, dest_dir):
         """把模型（含 json/预览图等附属）移动到目标文件夹，并更新任务持久化"""
         path = (path or "").strip()
         dest_dir = (dest_dir or "").strip()
-        if not path or not os.path.exists(path):
+        if not path or not os.path.isfile(path):
             return {"ok": False, "msg": "文件不存在"}
         if not os.path.isdir(dest_dir):
             return {"ok": False, "msg": "目标目录无效"}
         if os.path.abspath(os.path.dirname(path)) == os.path.abspath(dest_dir):
             return {"ok": True, "msg": "文件已在目标目录"}
+        tasks=getattr(getattr(self,'dl',None),'tasks',[])
+        for task in tasks if isinstance(tasks,(list,tuple)) else []:
+            if (task.status==downloader.ST_DOWNLOADING or (isinstance(getattr(self.dl,'_active_ids',None),set) and task.id in self.dl._active_ids)) and task.filename==os.path.basename(path) and os.path.normcase(os.path.abspath(task.dest_dir or ''))==os.path.normcase(os.path.abspath(os.path.dirname(path))):
+                return {"ok":False,"msg":"该模型正在下载，请先暂停再移动"}
         base = os.path.splitext(os.path.basename(path))[0]
         src_dir = os.path.dirname(path)
+        candidates = [path] + [os.path.join(src_dir,base+suffix) for suffix in model_manager._SIDE_EXTS+(".images",)]
+        if any(os.path.lexists(os.path.join(dest_dir, os.path.basename(f))) for f in candidates if os.path.lexists(f)):
+            return {"ok": False, "msg": "目标存在同名模型或附属文件，请先处理冲突"}
         moved = []
         try:
-            for f in [path] + [os.path.join(src_dir, base + s) for s in
-                               (".preview.png", ".preview.jpg", ".preview.webp", ".preview.gif",
-                                ".txt", ".json", ".civitai.info")]:
+            for f in candidates:
                 if os.path.exists(f):
                     shutil.move(f, os.path.join(dest_dir, os.path.basename(f)))
-                    moved.append(os.path.basename(f))
+                    moved.append((f,os.path.join(dest_dir,os.path.basename(f))))
         except Exception as e:
-            return {"ok": False, "msg": "移动失败: %s" % e}
+            rollback_errors=[]
+            for source,target in reversed(moved):
+                try:
+                    if os.path.exists(target) and not os.path.exists(source):shutil.move(target,source)
+                except Exception:rollback_errors.append(target)
+            return {"ok": False, "msg": ("移动失败，部分文件回退失败，请检查原目录与目标目录: " if rollback_errors else "移动失败，已回退已移动文件: ")+str(e)}
+        self._relocate_model(path, os.path.join(dest_dir, os.path.basename(path)))
         # 更新任务持久化路径
         try:
             for t in self.dl.tasks:
@@ -204,7 +260,7 @@ class Api:
             self.dl.save_tasks()
         except Exception:
             pass
-        return {"ok": True, "msg": "已移动 %d 个文件到 %s" % (len(moved), dest_dir)}
+        return {"ok": True, "msg": "已移动 %d 个文件到 %s" % (len(moved), dest_dir), "path": os.path.join(dest_dir, os.path.basename(path))}
 
     # ---------------- 下载目标文件夹（下载页选择 / 设置里预设） ----------------
     def _dest_dir(self):
@@ -248,24 +304,8 @@ class Api:
             config.save(self.cfg)
         except Exception:
             pass
-        # 顺带把「已完成但落在别处」的任务文件搬过去：用户选文件夹的预期就是文件到那儿去
         moved = 0
-        if p:
-            for t in list(self.dl.tasks):
-                if t.status != downloader.ST_DONE:
-                    continue
-                if os.path.abspath(t.dest_dir or "") == os.path.abspath(p):
-                    continue
-                src = os.path.join(t.dest_dir or "", t.filename)
-                if os.path.exists(src):
-                    try:
-                        if self.move_file_to(src, p).get("ok"):
-                            moved += 1
-                    except Exception:
-                        pass
-        msg = "下载目标已设为：%s" % (p or "默认下载目录")
-        if moved:
-            msg += "（顺带移动了 %d 个已完成的文件）" % moved
+        msg = "后续下载目标已设为：%s（已有模型不会移动）" % (p or "默认下载目录")
         return json.dumps({"ok": True, "target": p, "msg": msg, "moved": moved}, ensure_ascii=False)
 
     def _task_intended_dir(self, task):
@@ -410,7 +450,61 @@ class Api:
     def get_config(self):
         return self.cfg
 
+    def set_window_appearance(self, options=None):
+        handler = getattr(self, "_window_appearance_handler", None)
+        if handler is None:
+            return {"ok": False, "msg": "当前为浏览器模式，标题栏由浏览器管理"}
+        return handler(options)
+
+    def get_window_appearance(self):
+        controller = getattr(self, "_window_appearance_controller", None)
+        return dict(controller.status, maximized=bool(getattr(controller.chrome,"maximized",False))) if controller else {"ok": False, "msg": "当前无原生窗口"}
+
+    def window_control(self, action):
+        controller = getattr(self, "_window_appearance_controller", None)
+        return controller.control(action) if controller else {"ok": False, "msg": "当前无原生窗口"}
+
+    def window_resize(self, direction):
+        controller=getattr(self,"_window_appearance_controller",None)
+        return controller.resize(direction) if controller else {"ok":False,"msg":"当前无原生窗口"}
+
+    def get_local_fonts(self):
+        import local_fonts
+        try:
+            cached=getattr(self,"_local_font_families",None)
+            if cached is None: cached=local_fonts.enumerate_fonts();self._local_font_families=cached
+            return {"ok":bool(cached),"fonts":cached,"msg":"" if cached else "未能枚举本地字体，使用默认字体"}
+        except Exception:
+            return {"ok":False,"fonts":[],"msg":"字体列表读取失败，使用默认字体"}
+
+    def get_data_storage_info(self):
+        import data_storage
+        return {"current":config.APP_DIR,"default":config.INSTALL_DIR,"suggested":str(data_storage.suggested_directory()),
+                "warning":config.STORAGE_WARNING,"migrating":getattr(self,"_storage_migrating",False)}
+
+    def pick_data_directory(self):
+        return self.pick_dir()
+
+    def migrate_data_storage(self, directory, replace_existing=False):
+        import data_storage
+        if getattr(self,"_storage_migrating",False): return {"ok":False,"msg":"数据正在迁移，请稍候"}
+        if any(t.status in (downloader.ST_PENDING,downloader.ST_DOWNLOADING) for t in self.dl.tasks) or self.dl._active_ids \
+           or self.mm_progress.get("running") or self.mm_scan_state.get("running") or self._rp_state.get("running") \
+           or getattr(self,"_history_migration_running",False):
+            return {"ok":False,"msg":"请先结束下载、扫描、整理和缓存处理；可重启后在未开始任务时迁移"}
+        self._storage_migrating=True
+        try:
+            with self.dl._lock:
+                snapshot={"user_config.json":dict(self.cfg),"download_tasks.json":[t.to_dict() for t in self.dl.tasks],
+                          "download_history.json":[dict(row) for row in self.dl.history.values()]}
+            with data_storage.LOCK:
+                result=data_storage.migrate(config.APP_DIR,directory,config.INSTALL_DIR,bool(replace_existing),use_global=bool(getattr(sys,"frozen",False)),snapshot=snapshot)
+                if result.get("ok") and result.get("changed"):config.use_data_directory(result["directory"])
+            return result
+        finally:self._storage_migrating=False
+
     def save_config(self, new_cfg):
+        previous=dict(self.cfg)
         # 真 merge：只更新传入字段，绝不回退未传入的已保存设置
         for k, v in (new_cfg or {}).items():
             self.cfg[k] = v
@@ -430,10 +524,107 @@ class Api:
         elif self.cfg.get("models_dir") not in out:
             self.cfg["models_dir"] = out[0]
         self.cfg["api_key"] = str(self.cfg.get("api_key") or "").strip()
+        config.normalize_ui_preferences(self.cfg)
         ok = config.save(self.cfg)
+        if not ok:
+            self.cfg.clear();self.cfg.update(previous);return False
         self.api = self._new_api()
         self.dl.cfg = self.cfg
+        if self.cfg["max_concurrent_downloads"] > previous.get("max_concurrent_downloads",3):
+            self.dl._ensure_workers()
         return ok
+
+    def _resolve_model_path(self, path):
+        if not isinstance(path,str) or not path.strip():return ""
+        path=os.path.abspath(os.path.normpath(path.strip()))
+        aliases=getattr(self,"_model_path_aliases",{})
+        seen=set()
+        while os.path.normcase(path) in aliases and os.path.normcase(path) not in seen:
+            seen.add(os.path.normcase(path));path=aliases[os.path.normcase(path)]
+        return path
+
+    def _selected_model_rows(self, paths):
+        rows=list(self.model_rows)
+        if paths is None:return rows
+        selected={os.path.normcase(self._resolve_model_path(p)) for p in paths if isinstance(p,str)}
+        return [r for r in rows if os.path.normcase(self._resolve_model_path(r.get("path",""))) in selected]
+
+    def _relocate_model(self, old, new):
+        old=os.path.abspath(os.path.normpath(old));new=os.path.abspath(os.path.normpath(new))
+        norm=lambda p:os.path.normcase(os.path.abspath(p))
+        if norm(old)!=norm(new):
+            aliases=getattr(self,"_model_path_aliases",{})
+            aliases[norm(old)]=new;self._model_path_aliases=aliases
+        self.dl.relocate(old,new)
+        # Synchronize all cached path users; never rename/move files here.
+        seen=set()
+        for row in list(getattr(self,"model_rows",[]))+list(getattr(self,"mm_scan_state",{}).get("rows",[]))+list(getattr(self,"rp_rows",[])):
+            if id(row) in seen:continue
+            seen.add(id(row))
+            if row.get("path") and norm(row["path"])==norm(old):
+                row["path"]=new
+                if "name" in row:row["name"]=os.path.basename(new)
+                if row.get("status")=="失败":row["status"]="等待";row["model"]=""
+        updates=getattr(self,"_updates",None)
+        if isinstance(updates,dict):
+            items=updates.get("items") or {};moved=[key for key in list(items) if norm(key)==norm(old)]
+            for key in moved:
+                prior=items.pop(key);items[new]={**prior,**items.get(new,{})}
+            if moved:self._save_updates(updates)
+        favorites=getattr(self,'cfg',{}).get('model_favorites') or []
+        updated=[new if norm(p)==norm(old) else p for p in favorites if isinstance(p,str)]
+        if updated!=favorites:self.cfg['model_favorites']=updated;config.save(self.cfg)
+
+    def toggle_model_favorite(self, path):
+        if not isinstance(path,str) or not path:return {'ok':False,'msg':'模型路径无效'}
+        favorites=list(self.cfg.get('model_favorites') or [])
+        norm=lambda p:os.path.normcase(os.path.abspath(p))
+        found=any(norm(p)==norm(path) for p in favorites)
+        updated=[p for p in favorites if norm(p)!=norm(path)] if found else favorites+[path]
+        old=self.cfg.get('model_favorites',[]);self.cfg['model_favorites']=updated
+        if not config.save(self.cfg):self.cfg['model_favorites']=old;return {'ok':False,'msg':'收藏保存失败'}
+        return {'ok':True,'favorites':updated,'favorite':not found}
+
+    def clear_gallery_cache(self):
+        import image_gallery
+        try:
+            count=image_gallery.clear_cache();self._gallery_metadata_cache={};self._gallery_detail_cache.clear() if hasattr(self,'_gallery_detail_cache') else None
+            return {'ok':True,'msg':'已清理 '+str(count)+' 个缓存文件'}
+        except Exception:return {'ok':False,'msg':'清理失败，请检查目录权限'}
+
+    def open_gallery_resource(self, resource):
+        import image_gallery
+        if not isinstance(resource, dict): return {'ok':False,'msg':'资源信息无效'}
+        from urllib.parse import urlsplit, parse_qs
+        mid, vid = image_gallery.resource_ids(resource)
+        rows = getattr(self, 'model_rows', [])
+        if not mid and vid:
+            ids = {str(r.get('modelId') or '') for r in rows if str(r.get('verId') or (r.get('info') or {}).get('versionId') or '') == str(vid)}
+            ids = {v for v in ids if v.isdigit() and int(v)>0}
+            if len(ids)==1: mid=ids.pop()
+        name=str(resource.get('modelName') or resource.get('name') or '')[:300]
+        if not mid and name:
+            target=os.path.splitext(os.path.basename(name.replace('\\','/')))[0].casefold()
+            matches=[r for r in rows if os.path.splitext(os.path.basename(r.get('name','')))[0].casefold()==target]
+            ids={str(r.get('modelId') or (r.get('info') or {}).get('modelId') or '') for r in matches}
+            ids={v for v in ids if v.isdigit() and int(v)>0}
+            if len(ids)==1: mid=ids.pop()
+        if (not str(mid or '').isdigit() or int(mid)<=0) and not vid:
+            return {'ok':False,'msg':'来源缺少可解析的模型/版本 ID 或模型地址，无法直达；不会猜测或按 ID 搜索'}
+        site=str(self.cfg.get('site_domain') or 'civitai.red').strip().rstrip('/')
+        if '://' not in site: site='https://'+site
+        parsed=urlsplit(site)
+        if parsed.scheme not in ('https','http') or not parsed.hostname or parsed.username or parsed.password:
+            return {'ok':False,'msg':'设置中的 C站网址无效，请先修正站点设置'}
+        base=parsed.scheme+'://'+parsed.netloc
+        if str(mid or '').isdigit() and int(mid)>0:
+            url=base+'/models/'+str(mid)
+            if vid:url+='?modelVersionId='+str(vid)
+        else:
+            # Civitai 自己的版本路由会重定向到所属模型页，不依赖额外 API 查询。
+            url=base+'/model-versions/'+str(vid)
+        self.open_url(url)
+        return {'ok':True,'direct':True,'msg':'已打开 '+parsed.hostname+' 的模型页面'}
 
     # ---------------- 对话框 ----------------
     def pick_dir(self):
@@ -452,6 +643,33 @@ class Api:
             return []
 
     # ---------------- 批量下载 ----------------
+    def _variant_suffix(self, version, file):
+        files = self.api.model_files(version)
+        def cleaned(f):
+            return model_manager.clean_model_name(model_manager.sanitize_filename(os.path.splitext(f.get("name") or "")[0]), self.cfg.get("rename_clean_rules"))
+        if sum(cleaned(f).lower() == cleaned(file).lower() for f in files) > 1:
+            index = next((i for i, f in enumerate(files) if f is file or f.get("id") == file.get("id")), 0)
+            return "-file-" + str(file.get("id") if file.get("id") is not None else index + 1)
+        return ""
+
+    def _choose_model_files(self, version):
+        if not hasattr(self, "_file_choices"): self._file_choices = FileChoiceBroker()
+        return self._file_choices.choose(self.api.model_files(version), version.get("name") or "模型版本",
+                                         self.cfg.get("multi_file_download", "ask"))
+
+    def get_download_file_choice(self):
+        broker = getattr(self, "_file_choices", None)
+        return broker.get() if broker else None
+
+    def respond_download_file_choice(self, identity, indices=None, pause=False):
+        broker = getattr(self, "_file_choices", None)
+        return broker.respond(identity, indices, pause) if broker else {"ok": False, "msg": "没有待选择的下载"}
+
+    def acknowledge_download_file_choice(self, identity):
+        broker = getattr(self, '_file_choices', None)
+        return broker.acknowledge(identity) if broker else {'ok': False, 'msg': '没有待选择的下载'}
+
+    @requires_civitai_key("dict")
     def parse_urls(self, urls):
         """解析 URL 并加入下载队列（后台线程），返回任务 id 用于轮询进度"""
         urls = [u for u in (urls or []) if u and u.strip()]
@@ -488,58 +706,48 @@ class Api:
                                                "msg": "需付费（Early Access）"})
                         state["done"] += 1
                         continue
-                    f, _ = api.pick_file(version)
-                    hashes = f.get("hashes") or {}
-                    model_obj = None
-                    model_name = ""
-                    if model_id:
-                        try:
-                            model_obj = api.get_model(model_id)
-                            model_name = model_obj.get("name") or ""
-                        except civitai_api.CivitaiError:
-                            pass
-                    src_ext = os.path.splitext(f.get("name") or "")[1] or ".safetensors"
-                    base_name = os.path.splitext(f.get("name") or "")[0]
-                    base_name = model_manager.sanitize_filename(base_name) or model_name
-                    if self.cfg.get("translate_filename", False) and model_name:
-                        if translator._is_cjk(model_name):
-                            base_name = model_manager.sanitize_filename(model_name)
-                        else:
+                    files = self._choose_model_files(version)
+                    if not files:
+                        state["items"].append({"url": u, "ok": False, "cancelled": True, "msg": "已取消文件下载"})
+                        state["done"] += 1
+                        continue
+                    for f in files:
+                        hashes = f.get("hashes") or {}
+                        model_obj = None
+                        model_name = ""
+                        if model_id:
                             try:
-                                zh = translator.translate(
-                                    model_name,
-                                    appid=(self.cfg.get("baidu_appid") or "").strip(),
-                                    key=(self.cfg.get("baidu_key") or "").strip())
-                                if zh and zh != model_name:
-                                    base_name = model_manager.sanitize_filename(zh) or base_name
-                            except Exception:
+                                model_obj = api.get_model(model_id)
+                                model_name = model_obj.get("name") or ""
+                            except civitai_api.CivitaiError:
                                 pass
-                    ver = (version.get("name") or "").strip()
-                    if ver:
-                        base_name = "%s %s" % (base_name, model_manager.sanitize_filename(ver))
-                    # 按设置清理逗号/括号等符号（防 ComfyUI 提示词解析把逗号当分隔导致找不到 lora）
-                    base_name = model_manager.clean_model_name(
-                        base_name, self.cfg.get("rename_clean_rules")) or base_name
-                    fname = base_name + src_ext
-                    sd_d = (self.cfg.get("site_domain", "civitai.red") or "civitai.red").strip("/")
-                    site_base = sd_d if "://" in sd_d else "https://" + sd_d
-                    meta = {}
-                    try:
-                        meta = {
-                            "info": reverse_parse.build_info(model_obj, version, site_base),
-                            "sd": reverse_parse.build_sd_metadata(model_obj, version, site_base),
-                        }
-                    except Exception:
-                        pass
-                    task = downloader.DownloadTask(
-                        url=api.build_download_url(version_id, f.get("id")),
-                        dest_dir="",   # 下载开始时才解析落地目录（入队后再换文件夹也生效）
-                        filename=fname,
-                        expected_sha256=hashes.get("SHA256") or "",
-                        info={"modelName": model_name,
-                              "versionName": version.get("name", ""), "url": u, "meta": meta})
-                    self.dl.add_task(task)
-                    state["items"].append({"url": u, "ok": True, "msg": "已加入: %s" % fname})
+                        fname = model_naming.download_name(self.cfg, f, model_name, version.get("name", ""), multi=len(api.model_files(version)) > 1)
+                        if self._variant_suffix(version, f) and self.cfg.get("download_name_mode", "original") == "original":
+                            base, ext = os.path.splitext(fname)
+                            suffix=model_manager.sanitize_filename(version.get("name", "")) if version.get("name") else ""
+                            if self.cfg.get("filename_include_version") and suffix and base.endswith("-"+suffix):base=base[:-(len(suffix)+1)]
+                            fname=model_naming.append_version(base+self._variant_suffix(version,f),suffix,self.cfg.get("filename_include_version"))+ext
+                        sd_d = (self.cfg.get("site_domain", "civitai.red") or "civitai.red").strip("/")
+                        site_base = sd_d if "://" in sd_d else "https://" + sd_d
+                        meta = {}
+                        selected_version = dict(version, files=[dict(f, primary=True)] + [dict(other, primary=False) for other in version.get("files", []) if other is not f])
+                        try:
+                            meta = {
+                                "info": reverse_parse.build_info(model_obj, selected_version, site_base),
+                                "sd": reverse_parse.build_sd_metadata(model_obj, selected_version, site_base),
+                            }
+                        except Exception:
+                            pass
+                        task = downloader.DownloadTask(
+                            url=api.file_download_url(version, f),
+                            dest_dir="",   # 下载开始时才解析落地目录（入队后再换文件夹也生效）
+                            filename=fname,
+                            expected_sha256=hashes.get("SHA256") or "",
+                            info={"fileId": f.get("id"), "modelName": model_name,
+                                  "versionName": version.get("name", ""), "url": u, "meta": meta})
+                        self._prefetch_task_cover(task)
+                        self.dl.add_task(task)
+                        state["items"].append({"url": u, "ok": True, "msg": "已加入: %s" % fname})
                 except Exception as e:
                     state["items"].append({"url": u, "ok": False, "msg": str(e)[:120]})
                 state["done"] += 1
@@ -555,7 +763,8 @@ class Api:
     # ---------------- 下载管理 ----------------
     def get_tasks(self):
         """精简任务列表（不含 meta/info 大对象）"""
-        with self.lock:
+        import download_binding
+        with self.dl._lock:
             out = []
             for t in self.dl.tasks:
                 out.append({
@@ -563,11 +772,316 @@ class Api:
                     "progress": t.progress, "speed": t.speed,
                     "downloaded": t.downloaded, "total": t.total,
                     "error": t.error, "dest_dir": t.dest_dir,
+                    "hash_mismatch": t.status == downloader.ST_ERROR and "SHA256 校验失败" in t.error,
+                    "manual_binding": download_binding.binding_matches(t),
                     "url": (t.info or {}).get("url", ""),
                     "modelName": (t.info or {}).get("modelName", ""),
                     "versionName": (t.info or {}).get("versionName", ""),
+                    "created_at": t.created_at, "finished_at": t.finished_at,
                 })
             return out
+
+    def inspect_download_binding(self, task_id):
+        import download_binding
+        task = next((t for t in list(self.dl.tasks) if t.id == task_id), None)
+        if not task or task.id in self.dl._active_ids:
+            return {"ok": False, "msg": "任务不存在或仍在下载，不能关联"}
+        try: return download_binding.inspect(task)
+        except (OSError, ValueError, TypeError) as e: return {"ok": False, "msg": str(e)}
+
+    def bind_download_metadata(self, task_id, actual_sha256, confirmed=False):
+        """Only explicit association: not a successful-download callback, never delete old models."""
+        import download_binding
+        try:
+            with self.dl._lock:
+                task = next((t for t in self.dl.tasks if t.id == task_id), None)
+                if not task or task.id in self.dl._active_ids:
+                    return {"ok": False, "msg": "任务不存在或仍在下载，不能关联"}
+                result = download_binding.associate(task, actual_sha256, confirmed, self.cfg)
+            saved = self.dl.save_tasks()
+            result['record_saved'] = saved
+            if not saved: result['msg'] += '；下载记录保存失败，关联信息文件已写入'
+            # Reuse already downloaded history thumbnail. Never overwrite a custom cover.
+            source = self._history_asset(task.id, '.jpg')
+            cover = os.path.splitext(result['path'])[0] + '.preview.jpg'
+            if self.cfg.get('download_cover', True) and os.path.isfile(source) and not model_manager.find_cover(result['path']):
+                try:
+                    with open(source, 'rb') as inp, open(cover, 'xb') as out: shutil.copyfileobj(inp, out)
+                except OSError: pass
+            threading.Thread(target=self._cache_history_task, args=(task,), daemon=True).start()
+            return result
+        except (OSError, ValueError, TypeError) as e:
+            return {"ok": False, "msg": str(e)}
+
+    def _prefetch_task_cover(self, task):
+        """Fetch thumbnail before enqueuing model data. Never write into model folders."""
+        if not self.cfg.get("download_cover", True): return
+        images = ((task.info or {}).get("meta", {}).get("info") or {}).get("images") or []
+        url = images[0].get("url") if images and isinstance(images[0], dict) else ""
+        if not url: return
+        try:
+            import base64,tempfile
+            thumb = self.get_cover_b64(url, 512, timeout=3)
+            if not isinstance(thumb, str) or not thumb: return
+            target = self._history_asset(task.id, ".jpg");os.makedirs(os.path.dirname(target),exist_ok=True)
+            fd,tmp=tempfile.mkstemp(dir=os.path.dirname(target),suffix=".tmp")
+            try:
+                with os.fdopen(fd,"wb") as f:f.write(base64.b64decode(thumb))
+                os.replace(tmp,target)
+            finally:
+                if os.path.exists(tmp):os.unlink(tmp)
+        except Exception: pass  # Missing covers / network timeout must not block downloading.
+
+    def get_task_thumbnails(self, task_ids):
+        import base64
+        requested = set(str(i) for i in (task_ids or [])[:40])
+        with self.dl._lock: tasks = [t for t in self.dl.tasks if t.id in requested]
+        result = {}
+        for task in tasks:
+            try:
+                with open(self._history_asset(task.id, ".jpg"), "rb") as f: result[task.id] = base64.b64encode(f.read()).decode()
+            except OSError:
+                if task.status != downloader.ST_DONE and self.cfg.get("download_cover",True):
+                    with self.dl._lock:
+                        attempted=getattr(self,"_thumb_attempted",None)
+                        if attempted is None:self._thumb_attempted=attempted=set()
+                        if task.id in attempted:continue
+                        attempted.add(task.id)
+                        pool=getattr(self,"_thumb_pool",None)
+                        if pool is None:
+                            from concurrent.futures import ThreadPoolExecutor
+                            self._thumb_pool=pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix="cft-cover")
+                    pool.submit(self._prefetch_task_cover,task)
+        return result
+
+    def _history_asset(self, task_id, suffix):
+        import hashlib
+        return os.path.join(config.APP_DIR, "history_assets", hashlib.sha256(str(task_id).encode()).hexdigest() + suffix)
+
+    def get_task_hover_cover(self, task_id):
+        """Separate high-quality hover source; never enlarge the queue's small icon."""
+        import base64, io, image_gallery
+        from PIL import Image
+        task=next((t for t in self.dl.tasks if t.id==task_id),None)
+        history=next((r for r in self.dl.get_history() if r.get("id")==task_id),None)
+        if task is None and history is None:return ""
+        path=(os.path.join(task.dest_dir,task.filename) if task else history.get("file_path") or os.path.join(history.get("dest_dir",""),history.get("filename","")))
+        info=(task.info or {}).get("meta",{}).get("info",{}) if task else {}
+        if not info:
+            try:
+                with open(self._history_asset(task_id,".json"),encoding="utf-8") as f:info=json.load(f)
+            except (OSError,ValueError):info={}
+        images=info.get("images") or []
+        url=images[0].get("url") if images and isinstance(images[0],dict) else ""
+        if url:
+            cached=image_gallery.cache_load({"url":url},self.cfg,"original")
+            if cached:
+                try:
+                    with Image.open(io.BytesIO(cached)) as im:
+                        im=im.convert("RGB");im.thumbnail((1536,1536));buf=io.BytesIO();im.save(buf,"JPEG",quality=96,subsampling=0)
+                    return base64.b64encode(buf.getvalue()).decode()
+                except (OSError,ValueError):pass
+            from urllib.parse import urlsplit
+            if urlsplit(url).scheme=="https" and urlsplit(url).hostname=="image.civitai.com":
+                high=self.get_cover_b64(url,1024,timeout=8)
+                if high:return high
+        cover=model_manager.find_cover(path)
+        if cover and os.path.isfile(cover):
+            try:
+                with Image.open(cover) as im:
+                    im=im.convert("RGB");im.thumbnail((1536,1536));buf=io.BytesIO();im.save(buf,"JPEG",quality=96,subsampling=0)
+                return base64.b64encode(buf.getvalue()).decode()
+            except (OSError,ValueError):pass
+        return ""
+
+    def _cache_history_task(self, task):
+        """历史图文独立于模型文件存储；不保留临时签名下载地址。"""
+        try:
+            info = (task.info or {}).get("meta", {}).get("info") or {}
+            path = os.path.join(task.dest_dir, task.filename)
+            if not info:
+                source = model_manager.find_info_file(path)
+                if source:
+                    with open(source, encoding="utf-8") as f: info = json.load(f)
+            def clean(value):
+                if isinstance(value, dict):
+                    return {k: clean(v) for k,v in value.items() if k.lower() not in ("downloadurl", "apikey", "token", "authorization")}
+                if isinstance(value, list): return [clean(v) for v in value]
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+                    u = urlsplit(value)
+                    q = [(k,v) for k,v in parse_qsl(u.query) if not any(x in k.lower() for x in ("token", "signature", "credential", "key", "auth"))]
+                    return urlunsplit((u.scheme,u.netloc,u.path,urlencode(q),""))
+                return value
+            info = clean(info)
+            with config._json_write_lock:
+                snapshot = self._history_asset(task.id, ".json")
+                os.makedirs(os.path.dirname(snapshot), exist_ok=True)
+                if info: config._save_json_atomic(snapshot, info)
+            import base64, io
+            cover = model_manager.find_cover(path)
+            thumb = ""
+            if cover:
+                from PIL import Image
+                with Image.open(cover) as im:
+                    im = im.convert("RGB"); im.thumbnail((512,512))
+                    buf = io.BytesIO(); im.save(buf, "JPEG", quality=80)
+                    thumb = base64.b64encode(buf.getvalue()).decode()
+            elif info.get("images"):
+                thumb = self.get_cover_b64(info["images"][0].get("url", ""), 512)
+            if thumb:
+                with config._json_write_lock:
+                    import tempfile
+                    target = self._history_asset(task.id, ".jpg")
+                    os.makedirs(os.path.dirname(target),exist_ok=True)
+                    fd, temp = tempfile.mkstemp(dir=os.path.dirname(target),suffix=".tmp")
+                    try:
+                        with os.fdopen(fd,"wb") as f: f.write(base64.b64decode(thumb))
+                        os.replace(temp,target)
+                    finally:
+                        if os.path.exists(temp): os.unlink(temp)
+            mid = info.get("modelId") or info.get("model_id") or info.get("id")
+            url = "https://civitai.com/models/%s" % mid if str(mid or "").isdigit() else ""
+            if not url:
+                import urllib.parse
+                candidate = (task.info or {}).get("url", "")
+                u = urllib.parse.urlsplit(candidate)
+                if u.hostname in ("civitai.com", "civitai.red") and u.path.startswith("/models/"):
+                    url = urllib.parse.urlunsplit(("https", u.hostname, u.path, "", ""))
+            with self.dl._lock:
+                row = self.dl.history.get(task.id)
+                if row is not None:
+                    row.update(model_url=url, cached_info=os.path.isfile(self._history_asset(task.id, ".json")), cached_thumb=os.path.isfile(self._history_asset(task.id, ".jpg")))
+            self.dl.save_tasks()
+        except Exception:
+            pass
+
+    def _run_history_migration(self):
+        self._history_migration_running=True
+        try:self._migrate_history_cache()
+        finally:self._history_migration_running=False
+
+    def _migrate_history_cache(self):
+        """旧记录按唯一文件名，或模型/版本/大小身份恢复；绝不改动模型文件。"""
+        from types import SimpleNamespace
+        items = self.dl.get_history()
+        with self.dl._lock:
+            saved = {t.id: dict(t.info or {}) for t in self.dl.tasks}
+        metadata = {}
+        missing = []
+        for row in items:
+            info = saved.get(row["id"], {}).get("meta", {}).get("info") or {}
+            if not info:
+                try:
+                    with open(self._history_asset(row["id"], ".json"), encoding="utf-8") as f: info = json.load(f)
+                except (OSError, ValueError): pass
+            metadata[row["id"]] = info
+            path = row.get("file_path") or os.path.join(row.get("dest_dir", ""), row.get("filename", ""))
+            if row.get("status") == downloader.ST_DONE and not os.path.isfile(path): missing.append((row,path))
+        def identity(info, size):
+            if not isinstance(info,dict): return None
+            version_info = info.get("version") or {}
+            version = info.get("versionId") or info.get("version_id") or (version_info.get("id") if isinstance(version_info,dict) else None)
+            model = info.get("modelId") or info.get("model_id") or info.get("id")
+            try: return (str(model),str(version),int(size)) if model and version and size else None
+            except (ValueError,TypeError): return None
+        filenames, identities = {}, {}
+        if missing:
+            for root in self._models_roots():
+                for candidate in model_manager.scan_models(root):
+                    path = candidate["path"]
+                    filenames.setdefault(candidate["name"].lower(), set()).add(path)
+                    source = model_manager.find_info_file(path)
+                    if source:
+                        try:
+                            with open(source,encoding="utf-8") as f: info = json.load(f)
+                            key = identity(info,candidate["size"])
+                            if key: identities.setdefault(key,set()).add(path)
+                        except (OSError,ValueError,TypeError,AttributeError): pass
+            for row,old_path in missing:
+                matches = filenames.get(row["filename"].lower(),set())
+                # 改名后文件名不可匹配时，用完整版本身份和实际大小；多个候选时保持原记录。
+                if not matches:
+                    key = identity(metadata.get(row["id"],{}),row.get("total") or row.get("downloaded"))
+                    matches = identities.get(key,set()) if key else set()
+                if len(matches) == 1: self._relocate_model(old_path,next(iter(matches)))
+        for row in self.dl.get_history():
+            path = row.get("file_path") or os.path.join(row.get("dest_dir", ""),row.get("filename", ""))
+            info = saved.get(row["id"]) or {"meta":{"info":metadata.get(row["id"],{})}}
+            if not row.get("cached_info") or not row.get("cached_thumb") or not row.get("model_url"):
+                if info.get("meta",{}).get("info") or model_manager.find_info_file(path):
+                    self._cache_history_task(SimpleNamespace(id=row["id"],filename=row["filename"],dest_dir=os.path.dirname(path),info=info))
+
+    def get_download_history(self):
+        pending={t.id for t in getattr(self.dl,"tasks",[]) if t.status in (downloader.ST_PENDING,downloader.ST_DOWNLOADING,downloader.ST_RETRYING,downloader.ST_PAUSED)}
+        active=getattr(self.dl,"_active_ids",set());pending.update(active if isinstance(active,set) else [])
+        items = [row for row in self.dl.get_history() if row.get("id") not in pending]
+        if not getattr(self, "_history_migration_started", False) and not getattr(self,"_storage_migrating",False):
+            self._history_migration_started = True
+            self._history_migration_running = True
+            threading.Thread(target=self._run_history_migration, daemon=True).start()
+        for row in items:
+            path = row.get("file_path") or os.path.join(row.get("dest_dir", ""), row.get("filename", ""))
+            row["file_path"], row["file_exists"] = path, os.path.isfile(path)
+            thumb=self._history_asset(row["id"], ".jpg")
+            row["cached_thumb"] = os.path.isfile(thumb)
+            try:row["thumb_revision"]=os.stat(thumb).st_mtime_ns
+            except OSError:row["thumb_revision"]=0
+        return {"items": items, "error": self.dl.persistence_error}
+
+    def get_history_thumbnail(self, task_id):
+        import base64
+        if not any(row["id"] == task_id for row in self.dl.get_history()): return ""
+        try:
+            with open(self._history_asset(task_id, ".jpg"), "rb") as f: return base64.b64encode(f.read()).decode()
+        except OSError: return ""
+
+    def get_history_detail(self, task_id):
+        row = next((r for r in self.dl.get_history() if r["id"] == task_id), None)
+        if not row: return json.dumps({"ok":False})
+        path = row.get("file_path") or os.path.join(row.get("dest_dir", ""), row.get("filename", ""))
+        live = json.loads(self.get_model_detail(path)) if os.path.isfile(path) else None
+        if live and live.get("info") and live.get("covers"): return json.dumps(live,ensure_ascii=False)
+        try:
+            with open(self._history_asset(task_id, ".json"), encoding="utf-8") as f: info = json.load(f)
+        except (OSError, ValueError): info = {}
+        info=_json_safe(info) if isinstance(info,dict) else {}
+        thumb = self.get_history_thumbnail(task_id)
+        if live:
+            if not live.get("info"): live["info"] = info
+            if not live.get("covers") and thumb: live["covers"] = [{"b64":thumb,"local":False}]
+            return json.dumps(live,ensure_ascii=False)
+        return json.dumps({"ok":True,"path":path,"name":row["filename"],"info":info,"cached_history":True,
+                           "covers":[{"b64":thumb,"local":False}] if thumb else []},ensure_ascii=False)
+
+    def history_move_to(self, task_id, dest_dir):
+        row = next((r for r in self.dl.get_history() if r["id"] == task_id), None)
+        if not row: return {"ok":False,"msg":"历史记录不存在"}
+        if row.get("status") != downloader.ST_DONE: return {"ok":False,"msg":"仅已完成且仍存在的文件可移动"}
+        path = row.get("file_path") or os.path.join(row.get("dest_dir", ""), row.get("filename", ""))
+        return self.move_file_to(path, dest_dir)
+
+    def remove_download_task(self, task_id):
+        task = next((t for t in list(self.dl.tasks) if t.id == task_id), None)
+        if not task: return {'ok': False, 'msg': '任务已不存在'}
+        result = self.dl.remove_task(task)
+        if not self.dl.save_tasks(): result['msg'] += '；下载记录保存失败'
+        return result
+
+    def archive_download_task(self, task_id):
+        task = next((t for t in list(self.dl.tasks) if t.id == task_id),None)
+        if not task: return {"ok":False,"msg":"任务不存在"}
+        if task.status not in (downloader.ST_DONE,downloader.ST_ERROR,downloader.ST_CANCELED):
+            return {"ok":False,"msg":"仅结束任务可以移入历史"}
+        self.dl.remove_task(task, cleanup_partial=False)
+        return {"ok":True,"msg":"已移入下载历史，模型文件保留"}
+
+    def activate_browser_ui(self):
+        """启动器绑定的原地浏览器兜底：复用本实例，不重启下载后台。"""
+        handler = getattr(self, "_browser_ui_handler", None)
+        if not callable(handler):
+            return {"ok": False, "msg": "当前实例未注册浏览器兜底入口"}
+        return handler()
 
     def copy_text(self, text):
         """写入系统剪贴板（Windows: Win32，64 位安全 argtypes；其他: wl-copy/xclip）"""
@@ -704,8 +1218,13 @@ class Api:
             except Exception:
                 return {"ok": False, "msg": "无法打开"}
 
-    def dl_action(self, action, filenames=None):
-        tasks = [t for t in self.dl.tasks if t.filename in (filenames or [])]
+    def set_download_order(self, task_ids):
+        ok=self.dl.reorder_tasks(task_ids)
+        return {"ok":ok,"msg":"队列顺序已保存；前面的等待任务优先，正在下载的任务不中断" if ok else "排序请求无效，任务未改变"}
+
+    def dl_action(self, action, filenames=None, task_ids=None):
+        if action in ("start", "start_all", "retry") and not str((getattr(self,"cfg",None) or {}).get("api_key") or "").strip(): return False
+        tasks = [t for t in self.dl.tasks if (t.id in task_ids if task_ids is not None else t.filename in (filenames or []))]
         if action == "start_all":
             for t in list(self.dl.tasks):
                 if t.status in (downloader.ST_PENDING, downloader.ST_PAUSED, downloader.ST_ERROR):
@@ -713,6 +1232,15 @@ class Api:
                         self.dl.retry_task(t)
                     else:
                         self.dl.resume_task(t)
+        elif action in ("pause_all", "remove_all"):
+            for t in list(self.dl.tasks):
+                if action == "pause_all":self.dl.pause_task(t)
+                else:self.dl.remove_task(t)
+        elif action == "start":
+            for t in tasks:
+                if t.status == downloader.ST_ERROR: self.dl.retry_task(t)
+                elif t.status == downloader.ST_PAUSED: self.dl.resume_task(t)
+                elif t.status == downloader.ST_PENDING: self.dl._ensure_workers()
         elif action == "pause":
             for t in tasks:
                 self.dl.pause_task(t)
@@ -722,10 +1250,12 @@ class Api:
         elif action == "remove":
             for t in tasks:
                 self.dl.remove_task(t)
+        elif action == "remove_completed":
+            return self.dl.clear_completed()
         elif action == "clear_done":
             self.dl.clear_finished()
         elif action == "save":
-            self.dl.save_tasks()
+            return self.dl.save_tasks()
         return True
 
     # ---------------- 模型管理 ----------------
@@ -750,7 +1280,7 @@ class Api:
                         continue
                 hidden = set(self.cfg.get("hidden_model_folders", []))
                 show_root = self.cfg.get("show_root_models", True)
-                files = [f for f in files if _folder_visible(f["rel"], hidden, show_root)]
+                files = [f for f in files if model_filters.folder_visible(f["rel"], self.cfg)]
                 rows = []
                 for f in files:
                     info_path = model_manager.find_info_file(f["path"])
@@ -769,7 +1299,9 @@ class Api:
                     if isinstance(_cre, dict):
                         _cre = _cre.get("username") or _cre.get("name") or ""
                     _cre = str(_cre or "").strip()
+                    category, category_source = model_filters.model_category(meta.get("type") or (meta.get("model").get("type") if isinstance(meta.get("model"),dict) else ""), f["path"])
                     rows.append({
+                        "type_filter": category, "type_source": category_source,
                         "path": f["path"], "name": f["name"], "size": f["size"],
                         "mtime": f.get("mtime") or 0,
                         "type": meta.get("type", ""),
@@ -809,6 +1341,8 @@ class Api:
                 "path": r.get("path", ""), "name": r.get("name", ""),
                 "size": r.get("size", 0), "mtime": r.get("mtime") or 0,
                 "type": r.get("type", ""), "base": r.get("base", ""),
+                "type_filter": r.get("type_filter") or model_filters.model_category(r.get("type"), r.get("path"))[0],
+                "type_source": r.get("type_source", ""),
                 "ver": r.get("ver", ""), "verId": r.get("verId", ""),
                 "modelId": r.get("modelId", ""), "url": r.get("url", ""),
                 "trainedWords": r.get("trainedWords", []),
@@ -828,10 +1362,16 @@ class Api:
                     info = json.load(f)
             except Exception:
                 info = {}
+        if not isinstance(info,dict):info={}
+        info=_json_safe(info)
         # 字段归一化：扁平 json（trained_words/trigger_words）→ 全结构 trainedWords
         if info and not info.get("trainedWords"):
             info["trainedWords"] = info.get("trained_words") or info.get("trigger_words") or []
         images = info.get("images") or []
+        images=[x if isinstance(x,dict) else {} for x in images] if isinstance(images,list) else []
+        for image in images:
+            if not isinstance(image.get('meta'),dict):image['meta']={}
+        if info:info['images']=images
 
         def _img_prompt(idx):
             """按 C 站 images 序号取 (正面, 负面) 提示词（下载图按 image_%02d 命名，一一对应）"""
@@ -848,8 +1388,8 @@ class Api:
             返回 (正面, 负面)，无元数据返回 (None, None)"""
             try:
                 from PIL import Image
-                im = Image.open(fp)
-                params = (im.info or {}).get("parameters") or (im.info or {}).get("prompt") or ""
+                with Image.open(fp) as im:
+                    params = (im.info or {}).get("parameters") or (im.info or {}).get("prompt") or ""
                 if not params:
                     return None, None
                 neg = ""
@@ -925,13 +1465,163 @@ class Api:
                                "prompt": _p, "negative": _n})
             except Exception:
                 pass
-        return json.dumps({
-            "ok": True,
-            "path": path,
-            "name": os.path.basename(path),
-            "info": info,
-            "covers": covers,
-        }, ensure_ascii=False)
+        import image_gallery
+        for c in covers:
+            idx = 0
+            if c.get('local_path'):
+                match = re.search(r'image_(\d+)', os.path.basename(c['local_path']), re.I)
+                if match:idx = int(match.group(1))-1
+            else:
+                idx = next((i for i,image in enumerate(images) if image.get('url')==c.get('url')), -1)
+            image = images[idx] if 0<=idx<len(images) else {}
+            c.update(image_gallery.generation(image,c.get('local_path')))
+            if isinstance(c.get('meta',{}).get('comfyPrompt'),dict):
+                c['prompt']=c['meta'].get('prompt') or '';c['negative']=c['meta'].get('negativePrompt') or ''
+            if c.get('local_path') and not re.search(r'image_\d+',os.path.basename(c['local_path']),re.I) and c.get('metadata_source')=='C站模型信息缓存':
+                c['metadata_source']='模型缓存首图参数；自定义封面可能不对应'
+        covers=self._remember_gallery_detail(path,covers)
+        return json.dumps(_json_safe({
+            "ok": True,"path": path,"name": os.path.basename(path),"info": info,"covers": covers,
+        }),ensure_ascii=False,allow_nan=False)
+
+    def _gallery_detail_stamp(self,path,covers):
+        import image_gallery
+        info=model_manager.find_info_file(path)
+        try:
+            st=os.stat(info);info_stamp=(st.st_mtime_ns,st.st_size)
+        except (OSError,TypeError):info_stamp=None
+        return (getattr(self,'cfg',{}).get('api_key',''),info_stamp,tuple(image_gallery.source_revision(c) for c in covers))
+
+    def _remember_gallery_detail(self,path,covers):
+        from collections import OrderedDict
+        import hashlib
+        covers=_json_safe(covers);stamp=self._gallery_detail_stamp(path,covers)
+        for c,revision in zip(covers,stamp[2]):
+            c['source_revision']=hashlib.sha256((revision+repr(stamp[1])).encode()).hexdigest()
+        cache=getattr(self,'_gallery_detail_cache',None)
+        if cache is None:cache=OrderedDict();self._gallery_detail_cache=cache
+        key=os.path.normcase(os.path.abspath(path));cache[key]={'covers':covers,'stamp':stamp};cache.move_to_end(key)
+        while len(cache)>32:cache.popitem(last=False)
+        return covers
+
+    def _gallery_item(self, path, index, history_id=''):
+        if not isinstance(index,int) or isinstance(index,bool) or index<0:raise ValueError('图片索引无效')
+        cache=getattr(self,'_gallery_detail_cache',{});key=os.path.normcase(os.path.abspath(path))
+        cached=cache.get(key) if not history_id else None
+        if cached and cached['stamp']==self._gallery_detail_stamp(path,cached['covers']):
+            if index>=len(cached['covers']):raise ValueError('图片已不存在')
+            return cached['covers'][index]
+        detail = json.loads(self.get_history_detail(history_id) if history_id else self.get_model_detail(path))
+        covers=detail.get('covers') or []
+        if not detail.get('ok') or not isinstance(index,int) or isinstance(index,bool) or index<0 or index>=len(covers):
+            raise ValueError('图片已不存在，请重新打开详情')
+        return covers[index]
+
+    def get_gallery_cached(self,path,index,history_id='',allow_local=True):
+        """仅准备用户之前查看过的本地高清缓存，不访问网络或预下载其他图片。"""
+        import image_gallery
+        try:
+            item=self._gallery_item(path,index,history_id)
+            full=image_gallery.cache_load(item,self.cfg,'preview')
+            if not isinstance(full,dict) or not full.get('ok') or not full.get('b64'):
+                # 已有本地原图可以直接准备；没有本地文件时绝不在后台请求 CDN。
+                if not allow_local or self.cfg.get('cache_original_images') is not True or not item.get('local_path') or not os.path.isfile(item['local_path']):return {'ok':False,'cached':False}
+                full=image_gallery.preview(item,self.cfg)
+            metadata=image_gallery.cache_load(item,self.cfg,'metadata')
+            # 源图内嵌参数也在高清预览缓存中；没有数据时不假装已获取在线信息。
+            if not isinstance(metadata,dict) or not metadata.get('ok'):
+                metadata={'ok':True,'meta':full.get('meta') or {},'resources':full.get('resources') or [],'metadata_source':full.get('metadata_source')} if full.get('meta') or full.get('resources') else None
+            return {'ok':True,'full':{**full,'cache_hit':True},'metadata':metadata}
+        except Exception:return {'ok':False,'cached':False}
+
+    def get_gallery_image(self, path, index, history_id=''):
+
+        import image_gallery
+        try:return image_gallery.preview(self._gallery_item(path,index,history_id),self.cfg)
+        except Exception:return {'ok':False,'msg':'图片读取失败；在线图片可能无权限或网络不可用，可打开 C站原图页'}
+
+    def get_gallery_metadata(self,path,index,history_id=''):
+        import image_gallery
+        try:
+            item=self._gallery_item(path,index,history_id)
+            persisted=image_gallery.cache_load(item,self.cfg,'metadata')
+            if isinstance(persisted,dict) and persisted.get('ok') and (persisted.get('meta') or persisted.get('resources')):return {**persisted,'metadata_cache_hit':True}
+            result=image_gallery.generation(item,item.get('local_path'));result['online_metadata']=False
+            image_id=item.get('image_id')
+            if str(image_id or '').isdigit() and '自定义封面' not in item.get('metadata_source',''):
+                cache=getattr(self,'_gallery_metadata_cache',None)
+                if cache is None:cache={};self._gallery_metadata_cache=cache
+                import hashlib
+                cache_id=(str(image_id),hashlib.sha256(str(self.cfg.get('api_key','')).encode()).hexdigest())
+                cached=cache.get(cache_id);now=time.monotonic()
+                if cached and now-cached[0]<600:online=cached[1]
+                else:
+                    proxy=self.cfg.get('proxy_address') if self.cfg.get('proxy_enabled') else None
+                    client=civitai_api.CivitaiAPI(self.cfg.get('api_key',''),timeout=10,proxy=proxy,verify=self.cfg.get('ssl_verify',True))
+                    try:online=client.get_image_metadata(image_id)
+                    except Exception:online={}
+                    if len(cache)>=256:cache.pop(next(iter(cache)))
+                    cache[cache_id]=(now,online)
+                if online:
+                    fresh=image_gallery.generation(online)
+                    result['meta']={**result['meta'],**fresh['meta']}
+                    if fresh['resources']:result['resources']=fresh['resources']
+                    if fresh['meta'] or fresh['resources']:result['metadata_source']='C站图片接口（withMeta=true）';result['online_metadata']=True
+            if not result.get('meta') and not result.get('resources'):
+                result['metadata_note']='缓存没有图片 ID，无法按图查询 C站；原图或本地缓存也未记录生成参数。可同步模型信息或打开 C站原图页查看。' if not image_id else 'C站未返回可读取的生成参数：可能未保存、当前账户不可见或在线查询失败。'
+            result=_json_safe({'ok':True,**result})
+            if result.get('meta') or result.get('resources'):image_gallery.cache_store(item,self.cfg,'metadata',result)
+            return result
+        except Exception:return {'ok':False,'msg':'生成数据不可用，保留原图参数；可打开 C站原图页查看'}
+
+    def copy_gallery_image(self, path, index, history_id=''):
+        import image_gallery,base64
+        try:
+            controller=getattr(self,'_window_appearance_controller',None)
+            form=getattr(getattr(controller,'window',None),'native',None)
+            if form is None:return {'ok':False,'msg':'当前模式请使用网页图片复制'}
+            owner=form.Handle.ToInt64()
+            preview=self.get_gallery_image(path,index,history_id)
+            if not preview.get('ok') or not preview.get('b64'):return {"ok":False,"msg":"图片未加载，无法复制"}
+            result=image_gallery.copy_clipboard_image(base64.b64decode(preview['b64'],validate=True),owner)
+            return {"ok":bool(result),"msg":"当前图片已复制，可直接粘贴" if result else "系统剪贴板不可用，可改用保存图片"}
+        except Exception:return {"ok":False,"msg":"图片复制失败，可改用保存图片"}
+
+    def save_gallery_image(self, path, index, history_id=''):
+        import image_gallery
+        try:
+            item=self._gallery_item(path,index,history_id)
+            data,fmt,w,h,original=image_gallery.read_bytes(item,self.cfg)
+            if not webview.windows:return {'ok':False,'msg':'浏览器模式请使用“保存当前预览”或 C站原图页下载'}
+            ext={'JPEG':'jpg','PNG':'png','WEBP':'webp','GIF':'gif'}[fmt]
+            name=os.path.splitext(os.path.basename(path or 'image'))[0]+'_image_'+str(index+1)+'.'+ext
+            result=webview.windows[0].create_file_dialog(webview.SAVE_DIALOG,save_filename=name,file_types=('图片 (*.'+ext+')',))
+            if not result:return {'ok':False,'canceled':True,'msg':'已取消保存'}
+            target=result[0] if isinstance(result,(list,tuple)) else result
+            # 显式选择覆盖由系统保存对话框确认，先写临时文件避免中途留下损坏图片。
+            import tempfile
+            fd,tmp=tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(target)),prefix='.cft-image-',suffix='.tmp')
+            try:
+                with os.fdopen(fd,'wb') as f:f.write(data)
+                os.replace(tmp,target)
+            finally:
+                if os.path.exists(tmp):os.unlink(tmp)
+            return {'ok':True,'msg':'已保存原图片' if original else '已保存历史预览图（原图不可用）'}
+        except Exception:return {'ok':False,'msg':'图片保存失败，请检查网络、文件权限或打开原图页下载'}
+
+    def rename_detail_to_civitai(self, path, preview=True):
+        try:
+            if not os.path.isfile(path):return {'ok':False,'msg':'模型文件不存在'}
+            info_path=model_manager.find_info_file(path)
+            if not info_path:return {'ok':False,'msg':'缺少 C站信息，请先识别模型信息'}
+            with open(info_path,encoding='utf-8') as f:info=json.load(f)
+            new,msgs=model_manager.rename_to_civitai(path,info,dry_run=bool(preview),clean_rules=self.cfg.get('rename_clean_rules') or '', include_version=self.cfg.get('filename_include_version',False))
+            if not preview and new!=path:
+                self._relocate_model(path,new)
+                for row in self.model_rows:
+                    if row.get('path')==path:row['path']=new;row['name']=os.path.basename(new)
+            return {'ok':True,'old_path':path,'path':new,'same':new==path,'msg':'；'.join(msgs)}
+        except Exception:return {'ok':False,'msg':'改名失败，请检查名称冲突或文件权限；不会改动其他模型'}
 
     def set_model_cover(self, path, img_path, img_url=""):
         """把图片设为模型缩略图。img_path 为本地图；本地没有时用 img_url 自动下载到 <名>.images/ 再设置。"""
@@ -1050,6 +1740,10 @@ class Api:
             except Exception:
                 info = {}
         images = info.get("images") or []
+        images=[x if isinstance(x,dict) else {} for x in images] if isinstance(images,list) else []
+        for image in images:
+            if not isinstance(image.get('meta'),dict):image['meta']={}
+        if info:info['images']=images
         if not images:
             return json.dumps({"ok": False, "msg": "no images in info"})
         base = os.path.splitext(path)[0]
@@ -1114,7 +1808,8 @@ class Api:
         st = getattr(self, "_img_dl_state", None)
         return json.dumps(st or {"total": 0, "done": 0})
 
-    def _enqueue_one(self, url, dest_subdir="", dest_dir=None, skip_if_exists=False):
+    @requires_civitai_key("dict")
+    def _enqueue_one(self, url, dest_dir=None, skip_if_exists=False, _version=None, _file=None, _model_id=None, dest_subdir=""):
         """同步解析单条 URL 并入队（忽略付费状态）。返回 item dict：{url, ok, msg, task_id?}
 
         dest_subdir 非空时落盘到归档根下该子目录（逃逸校验复用 _safe_archive_path），为空保持下载目录。
@@ -1126,6 +1821,8 @@ class Api:
         item = {"url": u, "ok": False, "msg": ""}
         try:
             model_id, version_id = api.resolve_url(u)
+            if _version is not None:
+                model_id, version_id = _model_id, _version["id"]
             if not version_id:
                 m = api.get_model(model_id)
                 vs = m.get("modelVersions") or []
@@ -1133,8 +1830,27 @@ class Api:
                     item["msg"] = "模型没有可用版本"
                     return item
                 version_id = vs[0]["id"]
-            version = api.get_model_version(version_id)
-            f, _ = api.pick_file(version)
+            version = _version if _version is not None else api.get_model_version(version_id)
+            if _file is None:
+                from urllib.parse import urlsplit, parse_qs
+                query = parse_qs(urlsplit(u).query, keep_blank_values=True)
+                explicit = [v for k, values in query.items() if k.lower() == 'fileid' for v in values]
+                if explicit:
+                    if len(set(explicit)) != 1 or not explicit[0].isdigit():
+                        raise civitai_api.CivitaiError('下载链接的文件 ID 无效，未退回下载主文件')
+                    files = [f for f in api.model_files(version) if str(f.get('id')) == explicit[0]]
+                    if not files:
+                        raise civitai_api.CivitaiError('指定文件不属于这个版本，未退回下载主文件')
+                else:
+                    files = self._choose_model_files(version)
+                if not files:
+                    return {**item, "cancelled": True, "msg": "已取消文件下载"}
+                results = [self._enqueue_one(u, dest_dir, skip_if_exists, version, file, model_id, dest_subdir=dest_subdir) for file in files]
+                if len(results) == 1: return results[0]
+                return {**item, "ok": any(r.get("ok") for r in results), "items": results,
+                        "task_ids": [r["task_id"] for r in results if r.get("task_id")],
+                        "msg": "；".join(r.get("msg", "") for r in results)}
+            f = _file if _file is not None else api.pick_file(version)[0]
             hashes = f.get("hashes") or {}
             model_obj = None
             model_name = ""
@@ -1144,16 +1860,14 @@ class Api:
                     model_name = model_obj.get("name") or ""
                 except civitai_api.CivitaiError:
                     pass
-            src_ext = os.path.splitext(f.get("name") or "")[1] or ".safetensors"
-            base_name = os.path.splitext(f.get("name") or "")[0]
-            base_name = model_manager.sanitize_filename(base_name) or model_name
-            ver = (version.get("name") or "").strip()
-            if ver:
-                base_name = "%s %s" % (base_name, ver)
-            # 按设置清理逗号/括号等符号（防 ComfyUI 提示词解析把逗号当分隔导致找不到 lora）
-            base_name = model_manager.clean_model_name(
-                base_name, self.cfg.get("rename_clean_rules")) or base_name
-            info = {"source": "civitai", "model_name": model_name or base_name,
+            filename = model_naming.download_name(self.cfg, f, model_name, version.get("name", ""), multi=len(api.model_files(version)) > 1)
+            base_name, src_ext = os.path.splitext(filename)
+            selected_version = dict(version, files=[dict(f, primary=True)] + [dict(other, primary=False) for other in version.get("files", []) if other is not f])
+            if self.cfg.get("download_name_mode", "original") == "original" and self._variant_suffix(version,f):
+                suffix=model_manager.sanitize_filename(version.get("name", "")) if version.get("name") else ""
+                if self.cfg.get("filename_include_version") and suffix and base_name.endswith("-"+suffix):base_name=base_name[:-(len(suffix)+1)]
+                base_name=model_naming.append_version(base_name+self._variant_suffix(version,f),suffix,self.cfg.get("filename_include_version"))
+            info = {"fileId": f.get("id"), "source": "civitai", "model_name": model_name or base_name,
                     "modelName": model_name, "versionName": version.get("name", "")}
             if model_id:
                 info["model_id"] = model_id
@@ -1166,8 +1880,8 @@ class Api:
             meta = {}
             try:
                 meta = {
-                    "info": reverse_parse.build_info(model_obj, version, site_base),
-                    "sd": reverse_parse.build_sd_metadata(model_obj, version, site_base),
+                    "info": reverse_parse.build_info(model_obj, selected_version, site_base),
+                    "sd": reverse_parse.build_sd_metadata(model_obj, selected_version, site_base),
                 }
             except Exception:
                 pass
@@ -1183,7 +1897,7 @@ class Api:
                 # 归档桥指定子目录：落盘到归档根下该子目录（逃逸校验复用 _safe_archive_path）
                 dest_dir = self._safe_archive_path(self._archive_root(), dest_subdir)
                 info["dest_explicit"] = True      # 同样标记，不被全局目标/自动归位搬走
-            dl_url = api.build_download_url(version_id, f.get("id")) if version_id else (f.get("downloadUrl") or "")
+            dl_url = api.file_download_url(version, f)
             if not dl_url:
                 item["msg"] = "无下载链接"
                 return item
@@ -1201,6 +1915,7 @@ class Api:
             task = downloader.DownloadTask(
                 url=dl_url, dest_dir=dest_dir, filename=base_name + src_ext,
                 expected_sha256=hashes.get("SHA256") or "", info=info)
+            self._prefetch_task_cover(task)
             self.dl.add_task(task)
             item.update({"ok": True, "msg": "已加入队列: %s" % (base_name + src_ext), "task_id": task.id})
         except civitai_api.CivitaiError as e:
@@ -1209,6 +1924,7 @@ class Api:
             item["msg"] = str(e)[:200]
         return item
 
+    @requires_civitai_key("dict")
     def dl_enqueue_url(self, url):
         """强制解析单条 URL 并入队（忽略付费状态，用于「仍要下载」，后台执行）"""
         state = {"running": True, "total": 1, "done": 0, "items": [], "finished": False}
@@ -1224,12 +1940,22 @@ class Api:
         threading.Thread(target=work, daemon=True).start()
         return {"started": True}
 
+    @requires_civitai_key("dict")
     def dl_enqueue_url_sync(self, url, dest_subdir=""):
-        """同步解析并入队（Chrome 扩展桥用）：返回 {ok, msg, task_id?}，失败立即返回具体原因"""
-        item = self._enqueue_one(url, dest_subdir)
-        if item.get("ok"):
-            self._notify_ext_download_started()
-        return {"ok": item.get("ok"), "msg": item.get("msg"), "task_id": item.get("task_id")}
+        """Legacy synchronous caller (archive bridge passes dest_subdir); extension endpoint uses dl_submit_url to avoid timeout."""
+        item = self._enqueue_one(url, dest_subdir=dest_subdir)
+        if item.get("ok"): self._notify_ext_download_started()
+        return item
+
+    @requires_civitai_key("dict")
+    def dl_submit_url(self, url):
+        """Extension bridge acknowledges submission immediately; selection continues in CFT."""
+        try: self.api.resolve_url(url)
+        except Exception: return {"ok": False, "msg": "不是有效的 Civitai 模型链接"}
+        result = self.dl_enqueue_url(url)
+        if result.get("started"): self._notify_ext_download_started()
+        return {"ok": bool(result.get("started")), "started": bool(result.get("started")),
+                "msg": "已提交解析，请在 CivitaiFreeTool 下载管理选择文件或查看结果"}
 
     @staticmethod
     def _notify_ext_download_started():
@@ -1416,6 +2142,7 @@ class Api:
                     return r
         return None
 
+    @requires_civitai_key("json")
     def download_image_models(self, url):
         """图片页全部模型批量入队：本地已存在同名文件则跳过"""
         import downloader
@@ -1472,6 +2199,15 @@ class Api:
                            "total": len(res.get("resources") or []), "detail": detail},
                           ensure_ascii=False)
 
+    def get_rename_default(self, path):
+        info = {}
+        try:
+            source=model_manager.find_info_file(path)
+            if source:
+                with open(source,encoding="utf-8") as f:info=json.load(f)
+        except Exception: pass
+        return model_naming.download_name(self.cfg, {"name":os.path.basename(path)}, info.get("name") or "", model_naming.version_name(info))
+
     def rename_file(self, path, new_name):
         """右键自定义重命名：主文件 + 附属（preview/json/info/txt）同步改名"""
         import model_manager as mm
@@ -1491,6 +2227,15 @@ class Api:
             new_name = os.path.splitext(new_name)[0]
         else:
             new_base = new_name + ext
+        if self.cfg.get("filename_include_version"):
+            meta = {}
+            try:
+                info_path=mm.find_info_file(path)
+                if info_path:
+                    with open(info_path,encoding="utf-8") as f:meta=json.load(f)
+            except Exception: pass
+            new_name=model_naming.append_version(new_name,model_naming.version_name(meta),True)
+            new_base=new_name+ext
         new_name = mm.sanitize_filename(new_name) or old_base
         new_base = mm.sanitize_filename(new_base) or (old_base + ext)
         new_path = os.path.join(d, new_base)
@@ -1498,19 +2243,10 @@ class Api:
             return {"ok": False, "msg": "文件名未变化"}
         if os.path.exists(new_path):
             return {"ok": False, "msg": "目标文件已存在"}
-        try:
-            os.rename(path, new_path)
-        except Exception as e:
-            return {"ok": False, "msg": "重命名失败: %s" % e}
-        for side in (".preview.png", ".preview.jpg", ".preview.webp", ".preview.gif",
-                     ".txt", ".json", ".civitai.info"):
-            old_side = os.path.join(d, old_base + side)
-            if os.path.exists(old_side):
-                try:
-                    os.rename(old_side, os.path.join(d, new_name + side))
-                except Exception:
-                    pass
-        return {"ok": True, "msg": "已重命名为 " + new_base}
+        ok,messages=mm.rename_model_bundle(path,new_path)
+        if not ok:return {"ok":False,"msg":"；".join(messages)}
+        self._relocate_model(path,new_path)
+        return {"ok":True,"path":new_path,"msg":"已重命名为 "+new_base}
 
     def rm_file(self, path):
         """右键删除：移入回收站（含附属文件）"""
@@ -1543,46 +2279,88 @@ class Api:
             pass
         return {"ok": True, "msg": "已移入回收站"}
 
-    def get_cover_b64(self, url, size=512):
-        """按 URL 下载图片返回 base64（详情画廊多图用）"""
+    def _detail_cache_path(self, url, size=512):
+        import hashlib
+        key = hashlib.sha256((str(size) + ":" + url).encode()).hexdigest()
+        return os.path.join(config.APP_DIR, "detail_thumb_cache", key + ".jpg")
+
+    def get_cover_b64(self, url, size=512, timeout=15):
+        """详情只缓存缩略图，关闭选项后不读写缓存，不自动保存原图。"""
         import io
-        import base64 as _b64
+        import base64
         import urllib.request
+        from urllib.parse import urlsplit, urlunsplit
+        size = max(64, min(1024, int(size)))
         try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
-                "Referer": "https://civitai.com/",
-                "Accept": "image/webp,image/*,*/*;q=0.8",
-            })
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = resp.read()
+            parsed = urlsplit(str(url))
+            if parsed.scheme not in ("http", "https"):
+                return ""
+            cache = self._detail_cache_path(url, size)
+            enabled = self.cfg.get("cache_detail_images", True)
+            if enabled and os.path.isfile(cache):
+                with open(cache, "rb") as f:
+                    return base64.b64encode(f.read()).decode()
+            # C 站 CDN 直接请求缩略版本，其他图片也只落盘压缩后的 512px 图。
+            request_url = url
+            if parsed.hostname == "image.civitai.com":
+                request_url = re.sub(r"/(?:width|original=true)[^/]*/", "/width=%d/" % size, url)
+            req = urllib.request.Request(request_url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://civitai.com/"})
+            handlers = []
+            if self.cfg.get("proxy_enabled") and self.cfg.get("proxy_address"):
+                proxy = self.cfg["proxy_address"]
+                handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as resp:
+                data = resp.read(25 * 1024 * 1024 + 1)
+            if len(data) > 25 * 1024 * 1024:
+                return ""
             from PIL import Image
-            im = Image.open(io.BytesIO(data)).convert("RGB")
-            im.thumbnail((size, size))
-            buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=85)
-            return _b64.b64encode(buf.getvalue()).decode()
+            with Image.open(io.BytesIO(data)) as image:
+                image = image.convert("RGB")
+                image.thumbnail((size, size))
+                buf = io.BytesIO()
+                image.save(buf, "JPEG", quality=(96 if size>=1024 else 82), subsampling=(0 if size>=1024 else 2))
+            data = buf.getvalue()
+            if enabled:
+                with config._json_write_lock:
+                    cache = self._detail_cache_path(url, size)
+                    os.makedirs(os.path.dirname(cache), exist_ok=True)
+                    import tempfile
+                    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cache), suffix=".tmp")
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(data)
+                        os.replace(tmp, cache)
+                    finally:
+                        if os.path.exists(tmp): os.unlink(tmp)
+            return base64.b64encode(data).decode()
         except Exception:
             return ""
 
     def workflow_model_matches(self, refs):
         """工作流引用的模型名 → 本地模型库匹配（返回路径 + SHA256 前缀）"""
         refs = refs or []
-        root = self.cfg.get("models_dir") or self.cfg.get("download_dir") or ""
+        roots = self.cfg.get("models_dirs") or [self.cfg.get("models_dir") or self.cfg.get("download_dir") or ""]
+        if isinstance(roots, str): roots = [roots]
+        roots = [r for r in roots if isinstance(r, str) and os.path.isdir(r)]
         out = []
-        if not root or not os.path.isdir(root) or not refs:
-            return json.dumps(out, ensure_ascii=False)
+        if not roots or not refs:
+            return json.dumps([{"ref": str(ref), "local": False, "path": ""} for ref in refs], ensure_ascii=False)
         # 本地模型文件索引（名字 → 路径）
         index = {}
-        for dp, dn, fns in os.walk(root):
-            dn[:] = [d for d in dn if not d.lower().endswith(".images")]
-            for fn in fns:
-                if fn.lower().endswith((".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin", ".onnx")):
-                    index[fn.lower()] = os.path.join(dp, fn)
+        for root in roots:
+            for dp, dn, fns in os.walk(root):
+                dn[:] = [d for d in dn if not d.lower().endswith(".images")]
+                for fn in fns:
+                    if fn.lower().endswith((".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin", ".onnx")):
+                        index[fn.lower()] = os.path.join(dp, fn)
         import model_manager as _mm
         for ref in refs:
             base = os.path.basename(str(ref)).lower()
+            base = base.replace("\\", "/").split("/")[-1]
             hit = index.get(base)
+            if not hit and not base.endswith((".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin", ".onnx", ".sft")):
+                candidates = [p for name,p in index.items() if os.path.splitext(name)[0] == base]
+                if len(candidates)==1:hit=candidates[0]
             item = {"ref": str(ref), "local": bool(hit), "path": hit or ""}
             if hit:
                 try:
@@ -1605,7 +2383,7 @@ class Api:
         if ext in (".png", ".webp"):
             # PNG tEXt / WebP 内嵌 chunk 提取 workflow / prompt
             try:
-                data = open(path, "rb").read()
+                with open(path, "rb") as handle: data = handle.read()
                 if ext == ".png":
                     import struct
                     i = 8
@@ -1638,17 +2416,35 @@ class Api:
                     data = json.load(f)
                 if isinstance(data, dict) and "nodes" in data:
                     wf = json.dumps(data, ensure_ascii=False)
-                elif isinstance(data, dict) and ("3" in data or "6" in data or "prompt" in data):
+                elif isinstance(data, dict) and ("prompt" in data or any(isinstance(v, dict) and v.get("class_type") for v in data.values())):
                     # API 格式 prompt：{"节点id": {...}} 或 {"prompt": {...}}
                     prompt = json.dumps(data, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({"ok": False, "msg": "JSON 解析失败: %s" % e})
-        if not wf and not prompt:
-            return json.dumps({"ok": False, "msg": "未找到工作流或提示词信息"})
+        forge_meta = {}
+        if ext in (".png", ".webp"):
+            try:
+                from PIL import Image
+                with Image.open(path) as im: image_info=dict(im.info)
+                wf=image_info.get("workflow") or wf;prompt=image_info.get("prompt") or prompt
+                if not wf and not prompt and image_info.get("parameters"):
+                    import image_gallery
+                    forge_meta=image_gallery.generation(local_path=path).get("meta") or {}
+            except Exception: pass
+        if not wf and not prompt and not forge_meta:
+            return json.dumps({"ok": False, "msg": "未找到 ComfyUI 工作流或 Forge / A1111 生成参数"})
         nodes = []
         models = set()
         pos_prompt = ""
         neg_prompt = ""
+        if forge_meta:
+            pos_prompt=str(forge_meta.get("prompt") or "");neg_prompt=str(forge_meta.get("negativePrompt") or "")
+            model=forge_meta.get("Model")
+            if isinstance(model,str) and model:models.add(model.strip())
+            for name in re.findall(r'<(?:lora|lyco):([^:>]+):',pos_prompt,re.I):models.add(name.strip())
+        wobj = None
+        pobj = None
+        prompt_notes = ""
         try:
             if wf:
                 wobj = json.loads(wf)
@@ -1656,46 +2452,74 @@ class Api:
                     ntype = n.get("type", "")
                     title = n.get("title", "") or n.get("properties", {}).get("Node name for S&R", "")
                     widgets = n.get("widgets_values") or []
-                    nodes.append({"type": ntype, "title": title,
-                                  "widgets": [str(w) for w in widgets if isinstance(w, (str, int, float))][:6]})
+                    inputs = n.get("inputs") or []
+                    links = {str(link[0]): link for link in wobj.get("links", []) if isinstance(link, list) and len(link) >= 6}
+                    ports = []
+                    for port in inputs if isinstance(inputs, list) else []:
+                        if not isinstance(port, dict): continue
+                        item = {"name": port.get("name", "输入"), "type": port.get("type", ""), "link": port.get("link")}
+                        link = links.get(str(port.get("link")))
+                        if link: item.update(source=link[1], slot=link[2])
+                        ports.append(item)
+                    nodes.append({"id": n.get("id"), "type": ntype, "title": title, "position": n.get("pos"),
+                                  "widgets": [str(w) for w in widgets if isinstance(w, (str, int, float))],
+                                  "parameter_names_known": False, "inputs": ports,
+                                  "outputs": [{"name": o.get("name", "输出"), "type": o.get("type", "")} for o in n.get("outputs", []) if isinstance(o, dict)]})
                     # 引用的模型文件
                     for wv in widgets:
                         if isinstance(wv, str) and wv.lower().endswith((".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin", ".onnx")):
                             models.add(wv)
-                # CLIPTextEncode 的提示词（ConnectTo 前的 inputs）
-                for n in wobj.get("nodes", []) or []:
-                    if n.get("type") == "CLIPTextEncode":
-                        ws = n.get("widgets_values") or []
-                        for wv in ws:
-                            if isinstance(wv, str) and len(wv) > 2:
-                                if not pos_prompt:
-                                    pos_prompt = wv
-                                elif "negative" in str(n.get("title", "")).lower() or not neg_prompt:
-                                    neg_prompt = wv
             if prompt:
                 pobj = json.loads(prompt)
+                if isinstance(pobj, dict) and isinstance(pobj.get("prompt"), dict): pobj = pobj["prompt"]
+                # PNG may carry both UI workflow and API prompt; enrich by actual node ID, not duplicates.
                 for k, v in (pobj.items() if isinstance(pobj, dict) else []):
                     cls = (v or {}).get("class_type", "")
                     if cls:
-                        nodes.append({"type": cls, "title": "", "widgets": []})
-                    if cls == "CLIPTextEncode":
-                        t = ((v or {}).get("inputs") or {}).get("text", "")
-                        if isinstance(t, str) and t.strip():
-                            if not pos_prompt:
-                                pos_prompt = t
-                            elif not neg_prompt:
-                                neg_prompt = t
+                        ins = v.get("inputs") or {}
+                        params = [{"name": name, "value": value} for name, value in ins.items() if not isinstance(value, list)]
+                        ports = [{"name": name, "source": value[0], "slot": value[1]} for name, value in ins.items() if isinstance(value, list) and len(value) == 2]
+                        known = next((n for n in nodes if str(n.get("id")) == str(k)), None)
+                        detail = {"parameters": params, "parameter_names_known": True, "inputs": ports}
+                        if known: known.update(detail)
+                        else: nodes.append({"id": k, "type": cls, "title": (v.get("_meta") or {}).get("title", ""), "widgets": [], **detail})
+                        for value in ins.values():
+                            if isinstance(value, str) and value.lower().endswith((".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin", ".onnx")): models.add(value)
         except Exception:
             pass
+        if not forge_meta:
+            from comfy_metadata import extract_prompts, extract_model_references
+            model_refs = extract_model_references(pobj, wobj)
+            models = set(model_refs["models"])
+            extracted = extract_prompts(pobj, wobj)
+            pos_prompt = extracted.get("prompt", "")
+            neg_prompt = extracted.get("negativePrompt", "")
+            prompt_notes = extracted.get("promptExtractionNote", "")
+        preview_b64 = ""
+        if ext in (".png", ".webp"):
+            try:
+                from PIL import Image
+                import io,base64
+                with Image.open(path) as image:
+                    image=image.convert("RGB");image.thumbnail((512,512));buf=io.BytesIO();image.save(buf,"JPEG",quality=82)
+                    preview_b64=base64.b64encode(buf.getvalue()).decode()
+            except Exception: pass
         return json.dumps({
             "ok": True,
             "file": os.path.basename(path),
+            "source_path": path,
+            "preview_b64": preview_b64,
             "has_workflow": bool(wf),
-            "nodes": nodes[:40],
+            "source": "forge" if forge_meta else "comfyui",
+            "generation_parameters": {k:v for k,v in forge_meta.items() if k not in ("prompt","negativePrompt")},
+            "edges": [{"source":port["source"], "target":n.get("id"), "input":port.get("name", ""), "slot":port.get("slot",0)} for n in nodes for port in n.get("inputs",[]) if port.get("source") is not None],
+            "nodes": nodes,
             "node_count": len(nodes),
-            "models": sorted(models)[:20],
-            "pos_prompt": pos_prompt[:800],
-            "neg_prompt": neg_prompt[:400],
+            "models": sorted(models),
+            "disabled_models": model_refs["disabled_models"] if not forge_meta else [],
+            "pos_prompt": pos_prompt,
+            "neg_prompt": neg_prompt,
+            "prompt_notes": prompt_notes,
         }, ensure_ascii=False)
 
     def get_covers(self, paths, size=64, cache_dir=None):
@@ -1751,7 +2575,7 @@ class Api:
                 im = Image.open(cover).convert("RGB")
                 im.thumbnail((size, size))
                 buf = io.BytesIO()
-                im.save(buf, "JPEG", quality=(88 if int(size) > 320 else 82))
+                im.save(buf, "JPEG", quality=(96 if int(size)>=1024 else 88 if int(size)>320 else 82), subsampling=(0 if int(size)>=1024 else 2))
                 raw = buf.getvalue()
                 # 未命中：写入磁盘缓存（写失败/磁盘满静默，不破坏原逻辑）
                 if cache_path:
@@ -1770,7 +2594,21 @@ class Api:
                 continue
         return json.dumps(out, ensure_ascii=False)
 
+    def get_settings_dirty(self):
+        return bool(getattr(self,"_settings_dirty",False))
+
+    def set_settings_dirty(self, dirty):
+        self._settings_dirty=bool(dirty)
+        return True
+
     def open_url(self, url):
+        from urllib.parse import urlsplit, urlunsplit
+        original=urlsplit(str(url or ''))
+        if original.hostname in ('civitai.com','civitai.red','www.civitai.com','www.civitai.red'):
+            site=str(self.cfg.get('site_domain') or 'civitai.red').strip()
+            preferred=urlsplit(site if '://' in site else 'https://'+site)
+            if preferred.scheme in ('http','https') and preferred.hostname and not preferred.username and not preferred.password:
+                url=urlunsplit((preferred.scheme,preferred.netloc,original.path,original.query,original.fragment))
         if not posix_compat.IS_WINDOWS:
             return posix_compat.open_url(url)
         try:
@@ -1828,14 +2666,52 @@ class Api:
                 })
         return tree
 
+    def folder_picker_status(self, paths):
+        """只检查目录状态，不创建目录、不删除文件。"""
+        if not isinstance(paths, list): return []
+        return [{"path": p, "exists": os.path.isdir(p), "valid": os.path.isdir(p) and self._target_allowed(p)}
+                for p in paths[:10000] if isinstance(p,str) and p.strip()]
+
+    def forget_folder_record(self, path):
+        """删除收藏/失效记录；绝不删除磁盘目录或修改下载任务/历史。"""
+        if not isinstance(path,str) or not path.strip(): return {"ok":False,"msg":"目录记录无效"}
+        norm=lambda p:os.path.normcase(os.path.abspath(p))
+        parent=norm(path);missing=not os.path.isdir(path)
+        within=lambda p:isinstance(p,str) and (norm(p)==parent or (missing and norm(p).startswith(parent+os.sep)))
+        changes={"folder_picker_favorites":[p for p in self.cfg.get("folder_picker_favorites",[]) if not within(p)]}
+        if missing:
+            changes['folder_picker_folded']=[p for p in self.cfg.get('folder_picker_folded',[]) if not within(p)]
+            target=self.cfg.get('download_target_dir') or ''
+            if target and within(target): changes['download_target_dir']=''
+        if not self.save_config(changes):return {"ok":False,"msg":"记录保存失败，未移除，请重试"}
+        return {"ok":True,"missing":missing,"preferences":changes,"msg":"已删除失效目录记录（未删除磁盘文件）" if missing else "已取消该目录收藏（未删除磁盘文件）"}
+
+    def open_folder_location(self, path):
+        """打开目录所在的父目录；失效路径回退到最近仍存在的祖先目录。"""
+        if not isinstance(path,str) or not path.strip():return {"ok":False,"msg":"目录路径无效"}
+        folder=os.path.dirname(os.path.abspath(path))
+        while folder and not os.path.isdir(folder):
+            parent=os.path.dirname(folder)
+            if parent==folder:return {"ok":False,"msg":"找不到可打开的上级目录"}
+            folder=parent
+        if not folder:return {"ok":False,"msg":"找不到可打开的上级目录"}
+        return self.open_in_folder(folder)
+
     def get_folders(self):
         root = self.cfg.get("models_dir") or self.cfg.get("download_dir") or ""
+        if not root or not os.path.isdir(root):
+            roots=self._models_roots()
+            fallback=self.cfg.get('download_dir') or ''
+            root=roots[0] if roots else (fallback if os.path.isdir(fallback) else root)
         tree = self._collect_tree(root) if root and os.path.isdir(root) else []
         hidden = list(self.cfg.get("hidden_model_folders") or [])
         return json.dumps({
             "root": root,
+            "exists": bool(root and os.path.isdir(root)),
             "tree": tree,
             "hidden": hidden,
+            "visibility": model_filters.folder_choices(self.cfg),
+            "include_subfolders": self.cfg.get("model_folder_include_subfolders", True) is not False,
             "show_root": bool(self.cfg.get("show_root_models", True)),
         }, ensure_ascii=False)
 
@@ -1897,14 +2773,21 @@ class Api:
                 pass
         return {"ok": True, "added": n}
 
-    def save_folders(self, hidden, show_root):
-        """保存文件夹显示设置并更新当前扫描结果"""
+    def save_folders(self, hidden, show_root, visibility=None):
+        """保存文件夹显示设置；写盘失败不改变当前筛选。"""
+        if not isinstance(hidden, list) or any(not isinstance(p,str) for p in hidden): return False
+        if visibility is not None and (not isinstance(visibility,dict) or any(not model_filters.folder_key(p) or not isinstance(v,bool) for p,v in visibility.items())): return False
+        previous = dict(self.cfg)
+        self.cfg["model_folder_visibility"] = ({model_filters.folder_key(p):v for p,v in visibility.items()} if visibility is not None else {model_filters.folder_key(p):False for p in hidden if model_filters.folder_key(p)})
         self.cfg["hidden_model_folders"] = list(hidden or [])
         self.cfg["show_root_models"] = bool(show_root)
         try:
-            config.save(self.cfg)
+            if config.save(self.cfg) is False:
+                raise OSError("folder settings were not saved")
         except Exception:
-            pass
+            self.cfg.clear()
+            self.cfg.update(previous)
+            return False
         # 立即应用：重算显示行（_folder_visible 需要相对路径，多目录按各自根计算）
         if self.model_rows:
             hidden_set = set(self.cfg["hidden_model_folders"])
@@ -1913,8 +2796,7 @@ class Api:
                 p2 = p.replace("\\", "/")
                 return p2[len(root) + 1:] if root and p2.startswith(root + "/") else p2
             rows = [r for r in self.model_rows
-                    if _folder_visible(_rel(r.get("path", "")), hidden_set,
-                                       self.cfg["show_root_models"])]
+                    if model_filters.folder_visible(_rel(r.get("path", "")), self.cfg)]
             self.mm_scan_state["rows"] = rows
         return True
 
@@ -2432,11 +3314,7 @@ class Api:
         return {"checked_at": 0, "items": {}}
 
     def _save_updates(self, data):
-        try:
-            with open(self._updates_path(), "w", encoding="utf-8", newline="") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-        except Exception:
-            pass
+        return config._save_json_atomic(self._updates_path(),data)
 
     def _sidecar_brief(self, path):
         """从侧车文件读出「模型名 / 版本名 / 底模 / 版本日期」（纯本地，不发网络）。
@@ -2509,13 +3387,49 @@ class Api:
             self._enrich_upd_records()
         except Exception:
             pass
+        configured=self.cfg.get("models_dirs") or [self.cfg.get("models_dir") or self.cfg.get("download_dir") or ""]
+        roots=[os.path.normcase(os.path.abspath(p)).rstrip(os.sep) for p in configured if isinstance(p,str) and p]
+        def in_library(path):
+            p=os.path.normcase(self._resolve_model_path(path))
+            return os.path.isfile(p) and (not roots or any(p.startswith(root+os.sep) for root in roots))
         return {"checked_at": int(self._updates.get("checked_at") or 0),
                 "v": int(self._updates.get("v") or 1),
-                "items": self._updates.get("items") or {}}
+                "items": {self._resolve_model_path(path):record for path,record in (self._updates.get("items") or {}).items()
+                          if in_library(path)}}
+
+
+    def sync_local_model_updates(self):
+        """Local-only synchronization. Missing roots preserve all cached records."""
+        if getattr(self,"_updates_sync_running",False) or self.mm_scan_state.get("running") or self._mm_upd_state.get("running"):
+            return {"ok":False,"msg":"扫描 / 更新检查正在运行，请稍后同步"}
+        configured=list(self.cfg.get("models_dirs") or [])+[self.cfg.get("models_dir") or self.cfg.get("download_dir") or ""]
+        configured=list(dict.fromkeys(str(p).strip() for p in configured if str(p or "").strip()))
+        if not configured or any(not os.path.isdir(p) for p in configured):
+            return {"ok":False,"msg":"模型目录不可用或离线，保留全部更新记录，请检查模型目录"}
+        self._updates_sync_running=True
+        try:
+            self.scan_models()
+            deadline=time.monotonic()+120
+            while self.mm_scan_state.get("running") and time.monotonic()<deadline:time.sleep(.05)
+            if self.mm_scan_state.get("running"):return {"ok":False,"msg":"扫描尚未完成，未清理更新记录"}
+            if str(self.mm_scan_state.get("msg", "")).startswith("扫描失败") or any(not os.path.isdir(p) for p in configured):
+                return {"ok":False,"msg":"扫描失败或目录已离线，保留原更新记录"}
+            # OS existence is authoritative; scan-hidden records are not treated as deleted files.
+            norm=lambda p:os.path.normcase(os.path.abspath(p))
+            alive={norm(r["path"]):r["path"] for r in self.model_rows}
+            current=self._updates.get("items") or {};kept={}
+            for path,item in current.items():
+                if norm(path) in alive and os.path.isfile(alive[norm(path)]):kept[alive[norm(path)]]=item
+            data=dict(self._updates,items=kept)
+            if not config._save_json_atomic(self._updates_path(),data):return {"ok":False,"msg":"更新记录保存失败，旧记录仍保留"}
+            self._updates=data;self._mm_upd_state["items"]=kept
+            return {"ok":True,"removed":len(current)-len(kept),"count":len(self.model_rows),"msg":"同步完成：本地 %d 个模型，清理 %d 个失效更新记录（未删除模型文件）"%(len(self.model_rows),len(current)-len(kept))}
+        finally:self._updates_sync_running=False
 
     def get_mm_update_state(self):
         return self._mm_upd_state
 
+    @requires_civitai_key("dict")
     def mm_check_updates(self, force=False, paths=None):
         """检查更新（后台，不会自动下载）。
 
@@ -2525,8 +3439,8 @@ class Api:
 
         paths 非空时**只检查勾选的这几个**（显式选择 → 忽略 24h 缓存与更新白名单，立即查）。
         """
-        if self._mm_upd_state.get("running"):
-            return {"started": False, "msg": "正在检查中…"}
+        if self._mm_upd_state.get("running") or getattr(self,"_updates_sync_running",False):
+            return {"started": False, "msg": "正在检查或同步中…"}
         only = [p for p in (paths or []) if p]
         if only:
             want = set(only)
@@ -2713,6 +3627,7 @@ class Api:
         threading.Thread(target=work, daemon=True).start()
         return {"started": True, "total": len(groups)}
 
+    @requires_civitai_key("dict")
     def mm_update_models(self, paths=None):
         """把「有新版」的模型加入下载队列（下载新版；默认落在旧版所在文件夹，不被全局目标搬走）。
 
@@ -2775,7 +3690,8 @@ class Api:
     def mm_rename_preview(self, act="rename_c", paths=None):
         """批量改名「只读试算」：算出新旧文件名给用户预览，绝不修改任何文件。
         act: rename_c（文件名→C站名） / localize（文件名→中文，需要翻译时走百度翻译，不落盘）"""
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        rows = self._selected_model_rows(paths)
+        if not rows:return {"started":False,"msg":"当前选择没有可处理的模型，请刷新列表重新选择"}
         out = []
         appid = self.cfg.get("baidu_appid", "").strip()
         key = self.cfg.get("baidu_key", "").strip()
@@ -2788,7 +3704,7 @@ class Api:
                     if nm and not translator._is_cjk(nm):
                         info["name"] = translator.translate(nm, appid, key) or nm
                 newp, msgs = model_manager.rename_to_civitai(
-                    r["path"], info, dry_run=True, clean_rules=self.cfg.get("rename_clean_rules") or "")
+                    r["path"], info, dry_run=True, clean_rules=self.cfg.get("rename_clean_rules") or "", include_version=self.cfg.get("filename_include_version",False))
                 out.append({"path": r["path"], "old": old,
                             "new": os.path.basename(newp) if newp else "",
                             "same": os.path.normpath(newp or "") == os.path.normpath(r["path"]),
@@ -2799,7 +3715,11 @@ class Api:
 
     def mm_rename(self, paths=None):
         """重命名为 C 站模型名（后台线程）；按设置里的清理规则去掉逗号/括号等符号"""
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        if getattr(self,"mm_progress",{}).get("running"):return {"started":False,"msg":"已有模型操作正在进行"}
+        if paths is not None:
+            selected={os.path.normcase(self._resolve_model_path(p)) for p in paths if isinstance(p,str)}
+            rows=[r for r in self.model_rows if os.path.normcase(self._resolve_model_path(r["path"])) in selected]
+        else:rows=list(self.model_rows)
         if not rows:
             return {"started": False, "msg": "没有可重命名的模型"}
         self.mm_progress = {"running": True, "total": len(rows), "done": 0, "msg": "", "result": []}
@@ -2808,8 +3728,9 @@ class Api:
         def work():
             for r in rows:
                 try:
-                    _, msgs = model_manager.rename_to_civitai(
-                        r["path"], r.get("info") or {}, clean_rules=_clean)
+                    renamed, msgs = model_manager.rename_to_civitai(
+                        r["path"], r.get("info") or {}, clean_rules=_clean, include_version=self.cfg.get("filename_include_version",False))
+                    if renamed != r["path"]: self._relocate_model(r["path"], renamed)
                     self.mm_progress["result"].append({"path": r["path"], "msgs": msgs})
                 except Exception as e:
                     self.mm_progress["result"].append({"path": r["path"], "msgs": [str(e)]})
@@ -2824,7 +3745,12 @@ class Api:
         """汉化文件名（后台线程）"""
         appid = self.cfg.get("baidu_appid", "").strip()
         key = self.cfg.get("baidu_key", "").strip()
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        if getattr(self,"mm_progress",{}).get("running"):return {"started":False,"msg":"已有模型操作正在进行"}
+        if paths is not None:
+            selected={os.path.normcase(self._resolve_model_path(p)) for p in paths if isinstance(p,str)}
+            rows=[r for r in self.model_rows if os.path.normcase(self._resolve_model_path(r["path"])) in selected]
+        else:rows=list(self.model_rows)
+        if not rows:return {"started":False,"msg":"没有可重命名的模型"}
         self.mm_progress = {"running": True, "total": len(rows), "done": 0, "msg": "", "result": []}
 
         def work():
@@ -2838,8 +3764,9 @@ class Api:
                     if zh and zh != name:
                         meta2 = dict(info)
                         meta2["name"] = zh
-                        model_manager.rename_to_civitai(
-                            r["path"], meta2, clean_rules=self.cfg.get("rename_clean_rules") or "")
+                        renamed, _ = model_manager.rename_to_civitai(
+                            r["path"], meta2, clean_rules=self.cfg.get("rename_clean_rules") or "", include_version=self.cfg.get("filename_include_version",False))
+                        if renamed != r["path"]: self._relocate_model(r["path"], renamed)
                         self.mm_progress["result"].append({"path": r["path"], "ok": True})
                 except Exception:
                     pass
@@ -2852,7 +3779,8 @@ class Api:
 
     def mm_gen_json(self, paths=None, overwrite=False):
         """生成 SD json（后台线程）"""
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        rows = self._selected_model_rows(paths)
+        if not rows:return {"started":False,"msg":"当前选择没有可处理的模型，请刷新列表重新选择"}
         self.mm_progress = {"running": True, "total": len(rows), "done": 0, "msg": "", "result": []}
 
         def work():
@@ -2885,7 +3813,8 @@ class Api:
         return {"started": True}
 
     def mm_download_covers(self, paths=None):
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        rows = self._selected_model_rows(paths)
+        if not rows:return {"started":False,"msg":"当前选择没有可处理的模型，请刷新列表重新选择"}
         self.mm_progress = {"running": True, "total": len(rows), "done": 0, "msg": "", "result": 0}
 
         def work():
@@ -2932,7 +3861,8 @@ class Api:
         只翻译简介，不翻译触发词——触发词需保持英文原文用于提示词。"""
         appid = self.cfg.get("baidu_appid", "").strip()
         key = self.cfg.get("baidu_key", "").strip()
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        rows = self._selected_model_rows(paths)
+        if not rows:return {"started":False,"msg":"当前选择没有可处理的模型，请刷新列表重新选择"}
         self.mm_progress = {"running": True, "total": len(rows), "done": 0, "msg": "", "result": 0}
 
         def work():
@@ -3018,8 +3948,10 @@ class Api:
             return True
         return False
 
+    @requires_civitai_key("dict")
     def mm_check_update(self, paths=None):
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        rows = self._selected_model_rows(paths)
+        if not rows:return {"started":False,"msg":"当前选择没有可处理的模型，请刷新列表重新选择"}
         rows = [r for r in rows if r.get("modelId")]
         self.mm_progress = {"running": True, "total": len(rows), "done": 0, "msg": "", "result": None}
 
@@ -3068,6 +4000,7 @@ class Api:
             if os.path.exists(dst):
                 return {"ok": False, "msg": "目标文件夹已有同名文件，已放弃（请先重命名或处理冲突）"}
             shutil.move(src, dst)
+            self._relocate_model(src, dst)
             base_src, _ = os.path.splitext(src)
             base_dst, _ = os.path.splitext(dst)
             side_n = 0
@@ -3092,7 +4025,8 @@ class Api:
             return {"ok": False, "msg": "移动失败: %s" % str(e)[:140]}
 
     def mm_organize(self, paths=None):
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        rows = self._selected_model_rows(paths)
+        if not rows:return {"started":False,"msg":"当前选择没有可处理的模型，请刷新列表重新选择"}
         rules = self.cfg.get("organize_rules") or None
         env = self.cfg.get("target_env") or ""
         mode = self.cfg.get("organize_mode") or "manual"
@@ -3104,8 +4038,10 @@ class Api:
             for r in rows:
                 try:
                     root = self._root_of(r["path"])
-                    _, msgs = model_manager.organize_model(
+                    new_path, msgs = model_manager.organize_model(
                         r["path"], root, dry_run=False, rules=rules, env=env, mode=mode)
+                    if new_path != r["path"]:
+                        self._relocate_model(r["path"], new_path)
                     self.mm_progress["result"].append(msgs)
                 except Exception as e:
                     self.mm_progress["result"].append([str(e)])
@@ -3420,6 +4356,7 @@ class Api:
                 if os.path.exists(it["dest"]):
                     continue
                 shutil.move(it["src"], it["dest"])
+                self._relocate_model(it["src"], it["dest"])
                 base_src, _ = os.path.splitext(it["src"])
                 base_dst, _ = os.path.splitext(it["dest"])
                 for ext in mm._SIDE_EXTS:
@@ -3440,7 +4377,8 @@ class Api:
         return config.APP_DIR
 
     def mm_cleanup(self, paths=None):
-        rows = [r for r in self.model_rows if r["path"] in (paths or [])] or list(self.model_rows)
+        rows = self._selected_model_rows(paths)
+        if not rows:return {"started":False,"msg":"当前选择没有可处理的模型，请刷新列表重新选择"}
         self.mm_progress = {"running": True, "total": len(rows), "done": 0, "msg": "", "result": 0}
 
         def work():
@@ -3460,9 +4398,13 @@ class Api:
 
     # ---------------- 反向解析 ----------------
     def rp_add_paths(self, paths):
-        for p in paths or []:
-            if not any(r["path"] == p for r in self.rp_rows):
-                self.rp_rows.append({"path": p, "sha": "", "status": "等待", "model": "", "version": ""})
+        if not isinstance(paths,list):return False
+        for p in paths:
+            p=self._resolve_model_path(p)
+            if not p:continue
+            if not any(os.path.normcase(self._resolve_model_path(r["path"]))==os.path.normcase(p) for r in self.rp_rows):
+                exists=os.path.isfile(p)
+                self.rp_rows.append({"path":p,"sha":"","status":"等待" if exists else "文件不存在","model":"" if exists else "文件已改名、移动或删除，请刷新模型列表后重新发送。","version":""})
         return True
 
     def rp_add_dir(self, d):
@@ -3474,10 +4416,24 @@ class Api:
         return self._rp_state
 
     def rp_remove(self, paths):
-        self.rp_rows = [r for r in self.rp_rows if r["path"] not in (paths or [])]
+        active=set(self._rp_state.get("active_paths") or []) if self._rp_state.get("running") else set()
+        self.rp_rows = [r for r in self.rp_rows if r["path"] not in (paths or []) or r["path"] in active]
         return True
 
+    def rp_remove_selected(self, paths):
+        """Only remove list entries; never delete models or remove an active lookup."""
+        if not isinstance(paths, list): return {"ok": False, "msg": "请选择列表记录"}
+        with self._rp_launch_lock:
+            before = len(self.rp_rows)
+            active = set(self._rp_state.get("active_paths") or []) if self._rp_state.get("running") else set()
+            targets = set(p for p in paths if isinstance(p, str))
+            skipped = sum(r["path"] in targets and r["path"] in active for r in self.rp_rows)
+            self.rp_remove(list(targets))
+            return {"ok": True, "removed": before - len(self.rp_rows), "skipped": skipped,
+                    "msg": "已移除 %d 条列表记录，保留 %d 条进行中的记录；模型文件不变" % (before-len(self.rp_rows), skipped)}
+
     def rp_clear(self):
+        if self._rp_state.get("running"):return False
         self.rp_rows = []
         self._rp_state = {"running": False, "paused": False, "done": 0, "total": 0}
         return True
@@ -3485,69 +4441,105 @@ class Api:
     def rp_get_rows(self):
         return self.rp_rows
 
-    def rp_start(self):
-        if self._rp_state["running"]:
-            return False
-        if not self.rp_rows:
-            return False
-        self._rp_pause_ev.clear()
-        self._rp_stop_ev.clear()
-        self._rp_state = {"running": True, "paused": False, "done": 0, "total": len(self.rp_rows)}
-        n = max(1, int(self.cfg.get("hash_threads", 4)))
-        lock = threading.Lock()
-        idx = [0]
+    @requires_civitai_key("dict")
+    def rp_identify_model(self, path):
+        """详情入口只启动当前模型，不启动队列中其它待反查模型。"""
+        if not isinstance(path,str) or not os.path.isfile(path): return {'started':False,'msg':'当前模型文件不存在'}
+        with self._rp_launch_lock:
+            if self._rp_state.get('running'): return {'started':False,'msg':'已有反查正在运行，请结束后再识别当前模型'}
+            self.rp_add_paths([path])
+            return {'started':self.rp_start([path]),'path':path,'msg':'已开始识别当前模型'}
 
-        def worker():
-            api = self._new_api()
-            while True:
-                if self._rp_stop_ev.is_set():
-                    return
-                if self._rp_pause_ev.is_set():
-                    self._rp_state["paused"] = True
-                    while self._rp_pause_ev.is_set() and not self._rp_stop_ev.is_set():
-                        time.sleep(0.2)
-                    self._rp_state["paused"] = False
+    @requires_civitai_key("bool")
+    def rp_start(self, paths=None, only_failed=False):
+        with self._rp_launch_lock:
+            if self._rp_state["running"]:
+                return False
+            if paths is not None and not isinstance(paths, list): return False
+            selected = {os.path.normcase(self._resolve_model_path(p)) for p in paths if isinstance(p,str)} if paths is not None else None
+            tasks = [r for r in self.rp_rows if selected is None or os.path.normcase(os.path.abspath(r['path'])) in selected]
+            if only_failed:
+                tasks = [r for r in tasks if re.search(r"失败|错误|未收录|文件不存在", str(r.get("status", "")))]
+            if not tasks:
+                return False
+            self._rp_pause_ev.clear()
+            self._rp_stop_ev.clear()
+            self._rp_state = {"running": True, "paused": False, "done": 0, "total": len(tasks), "scope": "single" if selected is not None and len(tasks)==1 else "batch", "path": tasks[0]["path"] if len(tasks)==1 else "", "progress": 0, "msg": "等待反查", "active_paths": [r["path"] for r in tasks]}
+            n = max(1, int(self.cfg.get("hash_threads", 4)))
+            lock = threading.Lock()
+            idx = [0]
+
+            def worker():
+                api = self._new_api()
+                while True:
                     if self._rp_stop_ev.is_set():
                         return
-                with lock:
-                    i = idx[0]
-                    idx[0] += 1
-                if i >= len(self.rp_rows):
-                    return
-                r = self.rp_rows[i]
-                r["status"] = "反查中"
-                try:
-                    res = reverse_parse.reverse_by_hash(
-                        r["path"], api, self.cfg,
-                        translate_desc=bool(self.cfg.get("auto_translate", True)),
-                        cancel_ev=self._rp_stop_ev)
-                    if self._rp_stop_ev.is_set() and res.get("error") == "已取消":
-                        r["status"] = "已取消"
-                    else:
-                        r["sha"] = (res["sha256"] or "")[:16] + "…" if res["sha256"] else ""
-                        if res["found"]:
-                            r["status"] = "成功"
-                            r["model"] = (res["model"] or {}).get("name", "")
-                            r["version"] = (res["version"] or {}).get("name", "")
+                    if self._rp_pause_ev.is_set():
+                        self._rp_state["paused"] = True
+                        while self._rp_pause_ev.is_set() and not self._rp_stop_ev.is_set():
+                            time.sleep(0.2)
+                        self._rp_state["paused"] = False
+                        if self._rp_stop_ev.is_set():
+                            return
+                    with lock:
+                        i = idx[0]
+                        idx[0] += 1
+                    if i >= len(tasks):
+                        return
+                    r = tasks[i]
+                    r["path"]=self._resolve_model_path(r["path"])
+                    if not os.path.isfile(r["path"]):
+                        r["status"]="文件不存在";r["model"]="文件已改名、移动或删除，请刷新模型列表后重新发送。"
+                        with lock:self._rp_state["done"]+=1
+                        continue
+                    r["status"] = "反查中"
+                    try:
+                        def progress(read, total):
+                            if len(tasks)==1:
+                                self._rp_state['progress']=min(90,round(90*read/max(1,total)))
+                                self._rp_state['msg']='正在计算哈希' if read<total else '正在查询 C站模型信息'
+                        res = reverse_parse.reverse_by_hash(
+                            r["path"], api, self.cfg,
+                            translate_desc=bool(self.cfg.get("auto_translate", True)), progress_cb=progress,
+                            cancel_ev=self._rp_stop_ev)
+                        if self._rp_stop_ev.is_set() and res.get("error") == "已取消":
+                            r["status"] = "已取消"
                         else:
-                            r["status"] = "未收录" if "404" in res.get("error", "") else "失败"
-                            r["model"] = res.get("error", "")
-                except Exception as e:
-                    r["status"] = "失败"
-                    r["model"] = str(e)[:80]
-                with lock:
-                    self._rp_state["done"] += 1
+                            r["sha"] = (res["sha256"] or "")[:16] + "…" if res["sha256"] else ""
+                            if res["found"]:
+                                r["status"] = "成功"
+                                r["model"] = (res["model"] or {}).get("name", "")
+                                r["version"] = (res["version"] or {}).get("name", "")
+                                try:
+                                    with open(res['info_path'],encoding='utf-8') as f: info=json.load(f)
+                                    creator=info.get('creator');creator=creator.get('username','') if isinstance(creator,dict) else creator or ''
+                                    version=info.get('version');version=version.get('name','') if isinstance(version,dict) else version or ''
+                                    for row in self.model_rows:
+                                        if os.path.normcase(os.path.abspath(row.get('path','')))==os.path.normcase(os.path.abspath(r['path'])):
+                                            row.update(info=info,civitai_name=info.get('name',''),author=creator,ver=version,modelId=info.get('modelId') or info.get('id') or '',verId=info.get('versionId') or '',type=info.get('type',''),base=info.get('baseModel',''),trainedWords=info.get('trainedWords') or [])
+                                except (OSError,ValueError,KeyError,TypeError): pass
+                            else:
+                                r["status"] = "未收录" if "404" in res.get("error", "") else "失败"
+                                r["model"] = res.get("error", "")
+                    except Exception as e:
+                        r["status"] = "失败"
+                        r["model"] = str(e)[:80]
+                    with lock:
+                        self._rp_state["done"] += 1
 
-        def run_all():
-            pool = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
-            for t in pool:
-                t.start()
-            for t in pool:
-                t.join()
-            self._rp_state["running"] = False
+            def run_all():
+                pool = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
+                for t in pool:
+                    t.start()
+                for t in pool:
+                    t.join()
+                self._rp_state["progress"] = 100
+                self._rp_state["msg"] = "反查结束"
+                self._rp_state["running"] = False
 
-        threading.Thread(target=run_all, daemon=True).start()
-        return True
+            threading.Thread(target=run_all, daemon=True).start()
+            return True
+
 
     def rp_pause(self):
         if self._rp_pause_ev.is_set():
