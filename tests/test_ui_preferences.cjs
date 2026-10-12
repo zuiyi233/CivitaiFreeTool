@@ -94,6 +94,8 @@ function ok(name) { passed++; console.log('OK ' + name); }
         if (method === 'get_scan_rows') return JSON.stringify(window.fixtureScanRows||[]);
         if (method === 'get_scan_state') return {running:false};
         if (method === 'get_covers') return '{}';
+        // 瀑布流多图帧：fixtureMultiCovers = {path: [[src,isVideo],...]}，未列出的路径按"无多图"返回空
+        if (method === 'get_covers_multi') { const want=window.fixtureMultiCovers||{}; const out={}; (args[0]||[]).forEach(p=>{ if(want[p]) out[p]=want[p]; }); return JSON.stringify(out); }
         if (method === 'get_system_accent') return '#107C10';
         if (method === 'log_ui_error') throw new Error('UI error: ' + args[0]);
         return {};

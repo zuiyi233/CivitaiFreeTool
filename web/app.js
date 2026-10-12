@@ -1830,7 +1830,8 @@ async function loadMasonryThumbs(start) {
   loadMasonryThumbs(start + 40);
 }
 // ===== 瀑布流多图预取（渲染批 + 滚动节流共用）与卡片 hover 轮播：仅用已缓存 dataURI 叠层淡入（不发新请求），列表视图不参与 =====
-let _multiPrefetching = false, _multiScrollTimer = null;
+let _multiPrefetching = false, _multiScrollTimer = null, _multiPending = null;
+const _multiTried = new Set();   // 本轮会话已请求过的路径：没有多图可给的模型也不该被反复问（滚动一次问一次就是刷屏）
 function _visibleMasonryCards() {
   const vh = window.innerHeight || document.documentElement.clientHeight;
   return Array.prototype.filter.call(
@@ -1838,9 +1839,11 @@ function _visibleMasonryCards() {
     (c) => { const b = c.getBoundingClientRect(); return b.top < vh && b.bottom > 0; });
 }
 async function prefetchMultiForCards(cards) {
-  if (_multiPrefetching || !cards || !cards.length) return;
-  const need = cards.map((c) => c.dataset.path).filter((p) => p && !state.coverCacheMulti.has(p));
+  if (!cards || !cards.length) return;
+  if (_multiPrefetching) { _multiPending = cards; return; }   // 在途时合并成最后一次请求，不丢弃（丢弃会让 hover 永远等不到帧）
+  const need = cards.map((c) => c.dataset.path).filter((p) => p && !state.coverCacheMulti.has(p) && !_multiTried.has(p));
   if (!need.length) return;
+  need.forEach((p) => _multiTried.add(p));
   _multiPrefetching = true;
   try {
     const raw = await api.call("get_covers_multi", need);
@@ -1861,16 +1864,22 @@ async function prefetchMultiForCards(cards) {
         document.querySelectorAll("#mmMasonry .ms-card:hover").forEach((cd) => { if (cd.dataset.path === p) _startCarousel(cd, p); });
       }
     }
-  } catch (e) { /* 多图预取失败静默：无 hover 轮播，单图链路不受影响 */ }
-  finally { _multiPrefetching = false; }
+  } catch (e) { /* 多图预取失败静默：无 hover 轮播，单图链路不受影响；失败的路径放回待请求，下次滚动/hover 还能补上 */
+    need.forEach((p) => _multiTried.delete(p));
+  }
+  finally {
+    _multiPrefetching = false;
+    if (_multiPending) { const again = _multiPending; _multiPending = null; prefetchMultiForCards(again); }
+  }
 }
 function _onMmScroll() {
   if (_multiScrollTimer) return;
   _multiScrollTimer = setTimeout(() => { _multiScrollTimer = null; prefetchMultiForCards(_visibleMasonryCards()); }, 300);
 }
-window.addEventListener("scroll", _onMmScroll, { passive: true });
-const _mmScrollEl = document.getElementById("mmMasonry");
-if (_mmScrollEl) _mmScrollEl.addEventListener("scroll", _onMmScroll, { passive: true });
+// 必须用 capture：真正滚动的是 main.content（html/body 与 #mmMasonry 自己都不滚，scrollHeight==clientHeight），
+// 而元素上的 scroll 事件不冒泡——挂在 window 的冒泡监听和挂在 #mmMasonry 的监听历史上一次都没触发过，
+// 于是首屏之后多图帧再也不会预取，hover 无帧可轮。捕获阶段能收到任意滚动容器的 scroll。
+window.addEventListener("scroll", _onMmScroll, { passive: true, capture: true });
 const _masonryCarousel = new WeakMap(); // card → {timer, cur}
 const _MM_CAROUSEL_MS = 3000;   // 轮换间隔：用户约定 ~3 秒
 function _startCarousel(card, path) {
@@ -1939,6 +1948,7 @@ function _startCarousel(card, path) {
       return;
     }
   };
+  st.timer = setInterval(tick, _MM_CAROUSEL_MS);  // 心跳先挂上：原来只有挂载成功才 rearm，首帧预载一失败就再也没有下一拍，轮播永久停摆
   show();
 }
 function _stopCarousel(card) {
@@ -1951,7 +1961,11 @@ function _stopCarousel(card) {
 document.addEventListener("mouseover", (e) => {
   const card = e.target && e.target.closest ? e.target.closest("#mmMasonry .ms-card") : null;
   if (!card || _masonryCarousel.has(card)) return;
-  _startCarousel(card, card.dataset.path || "");
+  const path = card.dataset.path || "";
+  // 首屏预取只覆盖当时可见的卡片；滚下来之前先 hover 到那张卡时就地补一次请求，
+  // 拿到帧后 prefetchMultiForCards 会对仍在 :hover 的卡片自动起播。
+  if (path && !state.coverCacheMulti.has(path)) prefetchMultiForCards([card]);
+  _startCarousel(card, path);
 });
 document.addEventListener("mouseout", (e) => {
   const card = e.target && e.target.closest ? e.target.closest("#mmMasonry .ms-card") : null;
