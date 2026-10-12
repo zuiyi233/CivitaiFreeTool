@@ -1583,3 +1583,80 @@ html[data-theme^="dark"] { color-scheme: dark; }
 .detail-desc-zh ul, .detail-desc-zh ol { margin: 4px 0 8px; padding-left: 22px; }
 .dz-label { display: inline-flex; align-items: center; gap: 4px; font-size: calc(11.5px * var(--type-scale, 1)); color: var(--text-dim); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 0 10px; margin-bottom: 6px; }
 .dz-label .ic { width: calc(12px * var(--type-scale, 1)); height: calc(12px * var(--type-scale, 1)); }
+
+/* ============================================================================
+   资源库（ComfyUI 生成媒体库）
+   只新增 .lib-* / #lib* / #page-library 选择器，不改任何既有规则。
+   卡片、网格、目录面板、按钮、输入框全部复用既有类（.masonry .ms-card
+   .ms-img-wrap .ms-img .ms-info .ms-titles .ms-name .ms-sub .ms-footer
+   .ms-size .thumb-video-badge .folders-panel .fm-item .mm-metro .mm-row
+   .status-pill .input .btn），因此这里只补差异。
+   颜色一律取主题令牌，亮色/暗色/[data-theme^="dark_"] 都不需要额外适配。
+   ========================================================================== */
+
+/* 页头不参与滚动：卡片纵向 flex，工具区固定，只有 #libViewport 滚。 */
+#page-library { height: 100%; min-height: 0; }
+#page-library > .card { height: 100%; min-height: 0; }
+.lib-toolbar { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+#libScanHint { max-width: 46%; overflow: hidden; text-overflow: ellipsis; }
+.lib-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; font-size: calc(12px * var(--type-scale, 1)); color: var(--text-dim); }
+
+/* 滚动视口：与模型库「锁定菜单」时的 #mmMasonryViewport 完全同规格，
+   A5 的分页只监听这一个容器；列宽继续由 --model-card-width 驱动，不写死像素。 */
+#libViewport { flex: 1 1 0; min-height: 0; display: block; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+#libGrid { flex: none; min-height: 0; height: auto; overflow: visible; }
+
+/* 卡片底部一行：左「体积」右「时间」，两端对齐并各自省略号。 */
+.lib-card .ms-footer { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+.lib-card .ms-footer > .ms-size { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lib-time { flex: none; padding: 0 10px 8px; font-size: calc(11px * var(--type-scale, 1)); color: var(--text-dim); white-space: nowrap; }
+/* 无内嵌元数据徽标：只读提示，不参与点击（视频角标沿用 .thumb-video-badge，不在此重声明）。 */
+.lib-badge-meta { position: absolute; top: 6px; right: 6px; z-index: 2; display: flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface2); color: var(--text-dim); font-size: calc(11px * var(--type-scale, 1)); pointer-events: none; }
+
+/* 标签 chip：卡片、标签浮层、详情面板共用，必须有自己的键盘焦点态。 */
+.lib-chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.lib-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface2); color: var(--text); font-family: var(--font); font-size: calc(12px * var(--type-scale, 1)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease; }
+.lib-chip:hover { border-color: var(--primary); }
+.lib-chip[aria-pressed="true"] { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 16%, var(--surface)); color: var(--primary); }
+.lib-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* 标签管理里的删除柄：嵌在 chip 内，点击不得冒泡成「切换归属」 */
+.lib-chip-x { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; margin-left: -2px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--text-dim); font: inherit; font-size: calc(13px * var(--type-scale, 1)); line-height: 1; cursor: pointer; }
+.lib-chip-x:hover { background: color-mix(in srgb, var(--danger) 18%, var(--surface)); color: var(--danger); }
+.lib-chip-x:focus-visible { outline: 2px solid var(--danger); outline-offset: 1px; }
+
+/* 分组标题横跨整个瀑布流列（column-span 只对多列容器生效）。 */
+.lib-group-title { column-span: all; display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; padding-bottom: 5px; border-bottom: 1px solid var(--border); font-size: calc(12px * var(--type-scale, 1)); font-weight: 600; color: var(--text-dim); }
+
+/* 加载哨兵 / 骨架 / 空态 */
+.lib-more { display: flex; justify-content: center; align-items: center; gap: 8px; width: max-content; margin: 10px auto; padding: 7px 16px; font-size: calc(12px * var(--type-scale, 1)); color: var(--text-dim); }
+#libLoading { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 12px; padding: 4px 2px; }
+#libLoading .lib-skeleton { width: var(--model-card-width, 220px); height: calc(var(--model-card-width, 220px) * .72); border: 1px solid var(--border); border-radius: 12px; background: var(--surface2); }
+#libEmpty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 40px 16px; text-align: center; color: var(--text-dim); }
+#libEmpty .lib-empty-title { font-size: calc(14px * var(--type-scale, 1)); font-weight: 600; color: var(--text); }
+
+/* 标签浮层：由 A5 用 left/top 定位（fixed 才不受滚动容器裁切）。 */
+.lib-tagpop { position: fixed; left: 0; top: 0; z-index: 300; display: flex; flex-direction: column; gap: 8px; min-width: 210px; max-width: 300px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-hover); }
+
+/* 筛选行的开关：与 .tool-row 同排，勾选后转主色提示「已生效」。 */
+.lib-check { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: calc(12px * var(--type-scale, 1)); color: var(--text-dim); cursor: pointer; }
+.lib-check input { width: calc(15px * var(--type-scale, 1)); height: calc(15px * var(--type-scale, 1)); margin: 0; accent-color: var(--primary); cursor: pointer; }
+.lib-check:has(input:checked) { color: var(--primary); }
+.lib-check input:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* 覆盖层统一用 hidden 属性开关：作者样式会压过 UA 默认的 hidden 隐藏规则，必须显式兜住。 */
+#libEmpty[hidden], #libLoading[hidden], #libMore[hidden], #libTagPop[hidden], #libFoldersPanel[hidden] { display: none !important; }
+/* 目录面板复用 .folders-panel 外观（默认 display:none），但按上面的 hidden 约定开关，不再要求 .open。 */
+#libFoldersPanel:not([hidden]) { display: block; }
+
+/* 窄屏：与既有 760px 侧栏收起断点同值，只收紧资源库自己的页头（卡片内边距交给主题层）。 */
+@media (max-width: 760px) {
+  #libScanHint { max-width: 38%; }
+  #libEmpty { padding: 24px 10px; }
+  .lib-toolbar { gap: 6px; }
+}
+
+/* 视频懒挂载占位：src 只在卡片进入视口上下 1.5 屏时才挂（见 app.js libVidObserver），
+   没挂上的 <video> 是个空盒，用 16:9 把版位留住，滚到那儿不会因为突然出画面而跳行。
+   尺寸继续走 --model-card-width，颜色只取令牌，亮暗主题不用各写一遍。 */
+.lib-vid:not([data-lib-live="1"]) { aspect-ratio: 16 / 9; min-height: calc(var(--model-card-width, 220px) * .5625); background: var(--surface2); }

@@ -562,3 +562,21 @@ html[data-masonry-info]:not([data-masonry-info=always])[data-masonry-overlay=ful
 
 .binding-warning { color: var(--warn,#d29922); border-left: 3px solid currentColor; padding: 8px 12px; background: color-mix(in srgb,var(--surface2) 60%,transparent); font-size: calc(13px * var(--type-scale,1)); line-height: 1.6; }
 .binding-hashes dd { margin: 5px 0 12px; font-family: ui-monospace,Consolas,monospace; overflow-wrap: anywhere; user-select: text; }
+
+/* ===== 资源库（工作台层细化，全部是新增选择器）=====
+   与 #mmMasonryViewport 锁定工具栏时同规格：工具区固定，只有网格视口滚动，
+   这样分页只依赖一个滚动容器，窄窗口也不会出现双滚动条。 */
+html body #page-library { height: 100%; min-height: 0; }
+html body #page-library > .card { height: 100%; min-height: 0; }
+html body #libViewport { display: block; flex: 1 1 0; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+html body #libGrid { flex: none; min-height: 0; height: auto; overflow: visible; }
+html body .lib-toolbar { flex: 0 0 auto; }
+/* 骨架块与工作台的 8px 卡片圆角对齐，列宽仍由 --model-card-width 驱动。 */
+html body #libLoading .lib-skeleton { border-radius: 8px; min-height: calc(var(--model-card-width,220px) * .6); }
+html body .lib-card .ms-footer { gap: 10px; }
+/* 原生材质主题下透出背景，和 .masonry / .table-wrap 的处理一致。 */
+html[data-native-material=true] body #libViewport,html[data-native-material=true] body #libEmpty,html[data-native-material=true] body #libLoading {background:transparent !important;}
+html[data-native-material=true] body #libLoading .lib-skeleton {background:color-mix(in srgb,var(--surface2) 38%,transparent) !important;}
+html[data-native-material=true] body #libTagPop {background:color-mix(in srgb,var(--surface) 92%,transparent) !important;}
+/* 收起导航的窄屏（与上面 760px 断点同值）：统计条横向可滚，不撑破网格。 */
+@media(max-width:760px) { html body #libStatsBar { max-width: 100%; overflow-x: auto; } }

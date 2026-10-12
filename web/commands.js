@@ -3,7 +3,7 @@
 const SHORTCUT_DEFAULTS={'model:previous':'ArrowUp','model:next':'ArrowDown','model:favorite':'F','model:identify':'R','model:select':'Space','model:recycle':'Delete','model:preview':'Enter','image:previous':'ArrowLeft','image:next':'ArrowRight'};
 const commandRegistry=new Map();let shortcutSaveTimer=0,shortcutRunning=new Set(),shortcutNavigateAt=0,shortcutHistoryId='';
 let settingsBaseline=new Map(),settingsExitPending=false;
-const PAGE_NAMES={download:'批量下载',dlmanager:'下载管理',models:'模型管理',updates:'检查更新',reverse:'反向解析',workflow:'工作流分析',settings:'设置'};
+const PAGE_NAMES={download:'批量下载',dlmanager:'下载管理',models:'模型管理',library:'资源库',updates:'检查更新',reverse:'反向解析',workflow:'工作流分析',settings:'设置'};
 function shortcutBindings(){return {...SHORTCUT_DEFAULTS,...(state.cfg.shortcuts_bindings||{})};}
 function canonicalShortcut(value){
   const parts=String(value||'').trim().split('+').filter(Boolean),raw=parts.pop();if(!raw)return '';

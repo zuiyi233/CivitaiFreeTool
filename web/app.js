@@ -288,6 +288,7 @@ function switchPage(name) {
   if (typeof syncModelInspector === "function") syncModelInspector(name === "models");
   if (typeof applyTextAndWindowAppearance === "function") applyTextAndWindowAppearance();
   if (name === "models") mmScanIfNeeded();
+  if (name === "library") libScanIfNeeded();
   if (name === "download") refreshDlTarget();
   if (name === "updates") renderUpdatesPage();
   if (name === "dlmanager" && typeof refreshDownloadHistory === "function") refreshDownloadHistory();
@@ -4550,7 +4551,7 @@ const SETTING_FIELDS = [
   ["界面", "ui_corners", "控件圆角", "select", [["theme", "跟随主题"], ["square", "直角"], ["soft", "轻圆角"], ["rounded", "柔和圆角"]]],
   ["界面", "rename_menu_default", "改名默认动作", "select", [["custom", "自定义改名"], ["rename_c", "文件名改成C站名"], ["localize", "文件名翻中文"]]],
   ["界面", "confirm_buttons_flip", "确认弹窗按钮翻转", "bool"],
-  ["界面", "default_page", "启动默认页", "select", [["models", "模型管理"], ["download", "批量下载"], ["dlmanager", "下载管理"], ["reverse", "反向解析"], ["workflow", "工作流分析"], ["settings", "设置"]]],
+  ["界面", "default_page", "启动默认页", "select", [["models", "模型管理"], ["library", "资源库"], ["download", "批量下载"], ["dlmanager", "下载管理"], ["reverse", "反向解析"], ["workflow", "工作流分析"], ["settings", "设置"]]],
   ["界面", "default_view", "模型默认视图", "select", [["waterfall", "瀑布流"], ["list", "列表"]]],
   ["界面", "zebra_rows", "模型列表斑马纹", "bool"],
   ["界面", "ambient_bg", "顶部氛围动态背景", "bool"],
@@ -5036,6 +5037,7 @@ function renderOnboarding() {
       ['download','download','批量下载','粘贴模型链接，解析后选择文件和保存位置，再开始下载。'],
       ['dlmanager','list','下载管理','查看进度，暂停或重试；已结束任务可收进历史，打开实际文件位置。'],
       ['models','layers','模型管理','扫描本地目录；单击选中并更新右侧详情，星标收藏置顶。'],
+      ['library','image','资源库','索引 ComfyUI 产出的图片与视频；按底模、文件夹、标签筛选，单击看提示词与参数。'],
       ['updates','refresh','检查更新','检查已有模型的新版本，选择需要更新的文件，不会自动删除旧版。'],
       ['reverse','search','反向解析','已有文件但缺少封面、名称或触发词？从这里识别 C站模型信息。'],
       ['workflow','workflow','工作流分析','打开 ComfyUI 的 JSON / PNG，查看节点、参数与缺少的模型。'],
@@ -5444,3 +5446,1000 @@ document.addEventListener("click", (e) => {
 // Escape 先关闭右键菜单，不同时关闭背后的模型详情。
 document.addEventListener('keydown',e=>{const menu=$('#ctxMenu');if(e.key==='Escape' && menu.style.display==='block'){menu.style.display='none';e.preventDefault();e.stopImmediatePropagation();}},true);
 window.addEventListener('resize',()=>{const menu=$('#ctxMenu');if(menu)menu.style.display='none';});
+
+// ===== 资源库 =====
+// ComfyUI 产物（图片/视频）索引页。数据一律走 lib_* RPC，与模型库的
+// state.models / state.display / state.coverCache 完全隔离，互不读写。
+const lib = {
+  rows: [], total: 0, offset: 0, limit: 200,
+  facets: null, tags: [], tagsLoaded: false,
+  filters: { kind: "", checkpoints: [], loras: [], dirs: [], tag_ids: [], starred: false, no_meta: false, q: "", sort: "time_desc", group_by: "" },
+  loading: false, thumbCache: new Map(), sel: new Set(), detail: null,
+  // 内部状态：请求令牌 + 定时器（切页时全部清理，避免后台继续请求、继续解码视频）
+  request: 0, detailRequest: 0, scanTimer: null, scrollTimer: null, qTimer: null,
+  thumbBusy: false, scanRunning: false, noRoots: false, rootsState: [],
+  posterTried: new Set(), posterTimers: [], vObs: null,      // vObs：全页共用的一个视频挂载观察器
+  popKind: "", popAnchor: null, foldersOpen: false,
+  _dirsFromPanel: [],
+};
+
+function libEl(id) { return document.getElementById(id); }
+function libPageActive() { const p = libEl("page-library"); return !!p && p.classList.contains("active"); }
+function libRowById(id) { const k = String(id); return lib.rows.find((r) => String(r.id) === k) || null; }
+// 每批条数取设置（§7：默认 200，config 归一化区间 20..500），启动早期 state.cfg 还没到位时回落 200
+function libLimit() { const n = Number((state.cfg || {}).media_page_size || 200) || 200; return Math.max(20, Math.min(500, n)); }
+// pywebview 用 file:/// 直读；浏览器模式下页面本身是 http origin，file:/// 不可用，走 /api/media 流式端点
+function libMediaUrl(it) { if (!it) return ""; return window.__browserMode ? String(it.url_http || "") : String(it.url_local || it.url_http || ""); }
+function libVal(id) { const el = libEl(id); return el ? String(el.value || "") : ""; }
+function libFlag(id) { const el = libEl(id); return !!(el && el.checked); }
+// 后端缩略图/预览可能回 dataURL（A3 现状）或裸 base64：统一成可直接赋给 src 的形式
+function libThumbUri(v) {
+  const s = String(v || "");
+  if (!s) return "";
+  return /^(data:|blob:|https?:|file:)/i.test(s) ? s : "data:image/jpeg;base64," + s;
+}
+function libDay(ts) { const d = new Date(Number(ts || 0) * 1000); const p = (n) => String(n).padStart(2, "0"); return p(d.getMonth() + 1) + "-" + p(d.getDate()); }
+function libDur(sec) {
+  const s = Number(sec || 0); if (!s) return "";
+  return s < 60 ? s.toFixed(1) + " 秒" : Math.floor(s / 60) + " 分" + String(Math.round(s % 60)).padStart(2, "0") + " 秒";
+}
+// 任何我们创建过的 <video> 都要清理：只 pause 不够（本仓库修过一次"关掉还在播"的 bug），
+// 但摘掉 src 只用于"节点即将被重建"的场合；网格卡片走 libReleaseVideo，顺带撤销未完成的抓帧尝试
+function libPauseVideos(root) {
+  if (!root) return;
+  root.querySelectorAll("video").forEach((v) => { try { v.pause(); } catch (e) { } });
+}
+function libTeardownVideos(root) {
+  libPauseVideos(root);
+  if (!root) return;
+  root.querySelectorAll("video").forEach((v) => {
+    if (v.dataset.src) { libReleaseVideo(v); return; }
+    v.removeAttribute("src"); try { v.load(); } catch (e) { }
+  });
+}
+function libPopShow(el, anchor) {
+  if (!el) return;
+  if (el.classList.contains("lib-tagpop") && el.parentElement !== document.body) document.body.appendChild(el);  // 浮层 portal：祖先的 transform/overflow 都裁不到它
+  el.hidden = false;
+  lib.popAnchor = anchor || null;
+  libPopPosition(el, anchor);
+}
+function libPopHide(el) { if (el) el.hidden = true; }
+function libPopPosition(pop, anchor) {
+  if (!pop || !anchor || !anchor.getClientRects().length) return;
+  const z = Number(document.documentElement.style.zoom) || 1, gap = 8;
+  const rect = anchor.getBoundingClientRect();
+  pop.style.position = "fixed";
+  pop.style.width = Math.min(320 * z, innerWidth - 2 * gap) / z + "px";
+  const below = innerHeight - rect.bottom - 2 * gap, above = rect.top - 2 * gap;
+  const upwards = below < 180 * z && above > below;
+  pop.style.maxHeight = Math.max(60, Math.min(420 * z, upwards ? above : below, innerHeight - 2 * gap)) / z + "px";
+  const box = pop.getBoundingClientRect();
+  pop.style.left = Math.max(gap, Math.min(rect.left, innerWidth - box.width - gap)) / z + "px";
+  pop.style.top = Math.max(gap, Math.min(upwards ? rect.top - box.height - gap : rect.bottom + gap, innerHeight - box.height - gap)) / z + "px";
+}
+function libHidePopovers() {
+  libPopHide(libEl("libTagPop"));
+  const folders = libEl("libFoldersPanel");
+  if (folders) folders.hidden = true;          // 目录面板靠 hidden 开关（A4 的 .folders-panel 绝对定位在 #libFoldersWrap 内）
+  const btn = libEl("libFoldersBtn");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  lib.popKind = ""; lib.popAnchor = null; lib.foldersOpen = false;
+}
+
+// ---------- 扫描 ----------
+const LIB_PHASE = { walk: "遍历目录", parse: "解析元数据", reconcile: "对账", done: "完成" };
+function libSetScanHint(t) { const el = libEl("libScanHint"); if (el) el.textContent = t || ""; }
+function libSetScanBtns(running) {
+  // A4 的标记用 disabled 表达「能不能点」（停止按钮默认存在但禁用）
+  const s = libEl("libScanBtn"), stop = libEl("libStopScanBtn");
+  if (s) s.disabled = !!running;
+  if (stop) stop.disabled = !running;
+}
+function libSetRootHint() {
+  const el = libEl("libRootHint"); if (!el) return;
+  // A4 在这里写了固定的扩展名说明：保留原文，只在末尾追加当前目录状态。
+  // 基准文本读写必须用同一个属性：以前存 _baseText、读 dataset.base（没人写过），
+  // 每次轮询都会把说明文字冲成 "undefined …"，这里统一用 _baseText。
+  if (el._baseText === undefined) el._baseText = (el.textContent || "").trim();
+  const roots = (state.cfg || {}).media_roots || [];
+  let extra = "";
+  if (!roots.length) extra = "当前未配置资源目录（设置 · 资源库扫描目录）。";
+  else {
+    const bad = (lib.rootsState || []).filter((r) => r && r.status !== "ok");
+    extra = "当前 " + roots.length + " 个目录" + (bad.length ? "，其中 " + bad.length + " 个不可达（" + short(bad[0].path || "", 24) + "）" : "") + "。";
+  }
+  el.textContent = el._baseText + (extra ? " " + extra : "");
+}
+function libScanIfNeeded() {
+  // 进页只做一次「是否该增量扫描」的判断（后端按 last_scan_at ≥60s 或有新文件迹象决定）
+  libHookCardVideos(libEl("libGrid"));      // 回页先把在场的卡片交回观察器，哪怕本轮不重绘网格
+  api.call("lib_rescan_if_stale").then((r) => {
+    lib.noRoots = !!(r && r.reason === "no_roots");
+    libSetRootHint();
+    if (r && r.started) { libSetScanHint("增量扫描中…"); libStartScanPoll(); return; }
+    // started=false 可能是「另一个扫描还在跑」：探一次状态，别拿着旧数据当新数据
+    return api.call("lib_scan_state").catch(() => null).then((s) => {
+      if (s && s.running) { libStartScanPoll(); return; }
+      if (s) { lib.rootsState = Array.isArray(s.roots) ? s.roots : lib.rootsState; libSetRootHint(); }
+      libLoad(true);
+    });
+  }).catch(() => { libSetScanHint("资源库后端未就绪（请确认程序已更新到含资源库的版本）"); libUpdateEmpty(); });
+}
+function libStartScan() {
+  api.call("lib_scan").then((r) => {
+    if (r && r.started) { libSetScanHint("扫描启动中…"); libStartScanPoll(); return; }
+    // 后端拒绝扫描的两种原因都要让用户看见：没配目录 / 模型扫描占用中
+    if (!(((state.cfg || {}).media_roots) || []).length) lib.noRoots = true;
+    libUpdateEmpty();
+    setStatus((r && r.msg) || "扫描已在进行中");
+  }).catch(() => setStatus("扫描启动失败：资源库后端未就绪"));
+}
+function libStopScan() {
+  api.call("lib_cancel_scan").then(() => setStatus("已请求停止扫描（已入库的部分保留）"))
+    .catch(() => setStatus("停止请求失败，请稍后再试"));
+}
+function libStartScanPoll() {
+  if (lib.scanTimer) return;                       // 防重复轮询：同一时刻只允许一个 interval
+  lib.scanRunning = true; libSetScanBtns(true);
+  lib.scanTimer = setInterval(async () => {
+    if (!libPageActive()) { libStopScanPoll(); return; }   // 离开页面即停表（扫描仍在后台跑）
+    let s = null;
+    try { s = await api.call("lib_scan_state"); } catch (e) { }
+    if (!s) return;
+    lib.rootsState = Array.isArray(s.roots) ? s.roots : lib.rootsState;
+    libSetRootHint();
+    if (s.running) {
+      const p = LIB_PHASE[s.phase] || s.phase || "";
+      libSetScanHint("扫描中" + (p ? " · " + p : "") + (s.total ? " · " + (s.done || 0) + "/" + s.total : "") + (s.msg ? " · " + s.msg : ""));
+      return;
+    }
+    libStopScanPoll();
+    const errs = Array.isArray(s.errors) ? s.errors.length : 0;
+    libSetScanHint((s.msg || "扫描完成") + (errs ? " · " + errs + " 条解析异常" : ""));
+    await libLoad(true);
+  }, 1000);                                        // §7：扫描进度 1s 轮询（对齐模型库）
+}
+function libStopScanPoll() {
+  if (lib.scanTimer) { clearInterval(lib.scanTimer); lib.scanTimer = null; }
+  lib.scanRunning = false; libSetScanBtns(false);
+}
+
+// ---------- 列表加载 ----------
+function libReadControls() {
+  const f = lib.filters;
+  f.kind = libVal("libKindF");
+  f.sort = libVal("libSort") || "time_desc";
+  f.group_by = libVal("libGroup");
+  f.checkpoints = libVal("libCkF") ? [libVal("libCkF")] : [];
+  f.loras = libVal("libLoraF") ? [libVal("libLoraF")] : [];
+  f.tag_ids = libVal("libTagF") ? [Number(libVal("libTagF"))] : [];
+  f.starred = libFlag("libStarOnly");
+  f.no_meta = libFlag("libNoMeta");
+  const dir = libVal("libDirF");
+  // 目录有两个入口：下拉（单选）与面板（多选）。下拉有值时以它为准，否则沿用面板的多选集合。
+  if (dir) f.dirs = [dir]; else f.dirs = lib._dirsFromPanel.slice();
+  f.q = libVal("libQ").trim();
+}
+function libBuildFlt(offset) {
+  const f = lib.filters;
+  return {
+    kind: f.kind, checkpoints: f.checkpoints, loras: f.loras, dirs: f.dirs, tag_ids: f.tag_ids,
+    starred: f.starred, no_meta: f.no_meta, q: f.q, sort: f.sort, group_by: f.group_by,
+    offset: offset, limit: libLimit(),
+  };
+}
+function libHasFilter() {
+  const f = lib.filters;
+  return !!(f.kind || f.q || f.starred || f.no_meta || f.checkpoints.length || f.loras.length || f.dirs.length || f.tag_ids.length);
+}
+async function libLoad(reset) {
+  const grid = libEl("libGrid"); if (!grid) return;
+  if (reset) { lib.request++; lib.rows = []; lib.offset = 0; libReadControls(); }   // 重置即重读控件：筛选状态只有一个真相来源（DOM）
+  const flt = libBuildFlt(reset ? 0 : lib.offset);
+  const token = lib.request;
+  lib.loading = true; libSetLoading(true); libUpdateEmpty();
+  let data = null;
+  try {
+    const raw = await api.call("lib_list", JSON.stringify(flt));   // 大批量负载后端以 JSON 字符串返回
+    data = typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || null);
+  } catch (e) { data = null; }
+  if (token !== lib.request) return;                               // 迟到响应（已换筛选/已重置）直接丢弃
+  lib.loading = false; libSetLoading(false);
+  if (!data || data.ok === false) {
+    libSetScanHint("资源库读取失败" + (data && data.msg ? "：" + data.msg : ""));
+    libRenderGrid(); libUpdateStats(); libUpdateEmpty(); return;
+  }
+  const items = Array.isArray(data.items) ? data.items : [];
+  lib.total = Number(data.total || 0);
+  if (Number(data.limit)) lib.limit = Number(data.limit);
+  lib.offset = Number(flt.offset) + items.length;                  // 续拉偏移按实际返回条数推进，不受服务端回显影响
+  if (reset) lib.rows = items; else lib.rows = lib.rows.concat(items);
+  if (data.facets) { lib.facets = data.facets; libFillFacets(); }
+  // #libScanHint 在空闲时改读「库里有多少」，别停在几轮前的"扫描中…"上
+  if (!lib.scanRunning) {
+    const cur = (libEl("libScanHint") || {}).textContent || "";
+    if (!cur || /扫描中|未扫描|读取失败/.test(cur)) libSetScanHint(lib.noRoots ? "未配置资源目录" : "库内 " + lib.total + " 项");
+  }
+  lib.sel.clear();
+  if (reset) libRenderGrid(); else libAppendCards(items);
+  libUpdateStats(); libUpdateEmpty(); libUpdateMore(); libPrefetchThumbs();
+}
+function libGroupHtml(group, last) {
+  if (!group || group === last) return "";
+  return '<div class="lib-group-title">' + esc(group) + "</div>";
+}
+function libCardHtml(it) {
+  const isVid = it.kind === "video";
+  const dims = isVid ? libDur(it.duration) : (it.width && it.height ? it.width + "×" + it.height : "");
+  const sub = [it.checkpoint ? short(String(it.checkpoint), 20) : "", dims].filter(Boolean).join(" · ");
+  // 后端已经把 prompt 前 120 字算成 snippet：卡片没地方全文展示，就挂在文件名 tooltip 上（悬停即读）。
+  // snippet 来自文件内嵌元数据，属于外部可控文本，一律过 esc。
+  const snip = String(it.snippet || "").trim();
+  const nameTip = [String(it.filename || ""), snip ? "提示词：" + snip : ""].filter(Boolean).join(" · ");
+  // 视频且还没有海报缓存时放 <video>：src 只写进 data-src，等观察器确认卡片进了视口附近再挂上。
+  // 渲染 200 张卡就直接挂 200 个 preload="metadata"，等于同时开 200 路 /api/media 流（Chromium 每个
+  // origin 只排队 6 条连接，多余的只能干等，每个解码器还各占一份内存），所以这里按需挂载并按时释放。
+  const media = (isVid && !it.thumb)
+    ? '<video class="ms-img lib-vid" muted loop playsinline preload="metadata" data-path="' + esc(it.path) +
+      '" data-src="' + esc(libMediaUrl(it) + "#t=0.1") + '" data-lib-live="0"></video>'
+    : '<img class="ms-img" decoding="async" alt="" data-path="' + esc(it.path) + '"/>';
+  const chips = (Array.isArray(it.tags) ? it.tags : []).slice(0, 3)
+    .map((t) => '<span class="lib-chip"' + (t.color ? ' style="border-color:' + esc(t.color) + '"' : "") + ">" + esc(t.name) + "</span>").join("");
+  return '<div class="ms-card lib-card" tabindex="0" data-id="' + esc(String(it.id)) + '" data-path="' + esc(it.path) + '" data-kind="' + esc(it.kind) + '"' +
+    ' title="' + esc(String(it.filename || "") + " · " + String(it.path || "")) + '">' +
+    '<div class="ms-img-wrap" data-ph="' + ((isVid && !it.thumb) ? "ok" : "loading") + '">' + media +
+    (isVid ? '<span class="thumb-video-badge">▶</span>' : "") +
+    (it.has_meta ? "" : '<span class="lib-badge-meta" title="无内嵌元数据">?</span>') +
+    "</div>" +
+    '<div class="ms-info"><div class="ms-titles">' +
+    '<div class="ms-name" title="' + esc(nameTip) + '">' + esc(it.filename || "") + "</div>" +
+    '<div class="ms-sub">' + esc(sub || (isVid ? "视频" : "图片")) + "</div>" +
+    (chips ? '<div class="lib-chips">' + chips + "</div>" : "") +
+    '</div><div class="ms-footer"><span class="ms-size">' + esc(fmtSize(it.size)) + '</span><span class="lib-time">' + esc(libDay(it.mtime)) + "</span></div></div></div>";
+}
+function libRenderGrid() {
+  const grid = libEl("libGrid"); if (!grid) return;
+  const vp = libEl("libViewport"), keepTop = vp ? vp.scrollTop : 0;   // 重绘不回顶部（收藏/删标签都会重绘）
+  if (lib.vObs) lib.vObs.disconnect();                                 // 旧节点全部作废：先解绑再重挂，避免观察器攥着已丢弃的元素
+  libTeardownVideos(grid);
+  let last = "", html = "";
+  for (const it of lib.rows) { const g = libGroupHtml(it.group, last); if (g) { last = it.group; html += g; } html += libCardHtml(it); }
+  grid.innerHTML = html;
+  if (vp) vp.scrollTop = keepTop;
+  libApplyCachedThumbs(); libHookCardVideos(grid); libUpdateMore();
+}
+function libAppendCards(items) {
+  const grid = libEl("libGrid"); if (!grid) return;
+  let last = "", html = "";
+  for (const it of items) { const g = libGroupHtml(it.group, last); if (g) { last = it.group; html += g; } html += libCardHtml(it); }
+  if (html) grid.insertAdjacentHTML("beforeend", html);
+  libApplyCachedThumbs(); libHookCardVideos(grid);
+}
+function libSetLoading(on) {
+  const el = libEl("libLoading"); if (!el) return;
+  el.hidden = !(on && !lib.rows.length);
+}
+function libUpdateMore() {
+  const more = libEl("libMore"); if (!more) return;
+  const show = !lib.scanRunning && lib.rows.length < lib.total;
+  more.hidden = !show;
+  if (show) more.textContent = "加载更多（已加载 " + lib.rows.length + " / " + lib.total + "）";
+}
+function libUpdateStats() {
+  const bar = libEl("libStatsBar"); if (!bar) return;
+  const f = lib.facets || {}, kinds = f.kinds || {};
+  // facets.total 是库内全局数（不受筛选影响），lib.total 是本次 lib_list 的过滤后总数：
+  // 有筛选时两个都要说清楚，否则用户会拿着「共 2792 项」去理解只有 863 项的结果。
+  const globalTotal = f.total != null ? Number(f.total) : null;
+  const parts = [];
+  if (libHasFilter()) parts.push("筛选 " + lib.total + " 项" + (globalTotal != null ? " / 共 " + globalTotal + " 项" : ""));
+  else parts.push("共 " + (globalTotal != null ? globalTotal : lib.total) + " 项");
+  if (kinds.image != null) parts.push("图片 " + kinds.image);
+  if (kinds.video != null) parts.push("视频 " + kinds.video);
+  if (f.starred != null) parts.push("收藏 " + f.starred);
+  if (f.no_meta != null) parts.push("无元数据 " + f.no_meta);
+  if (f.missing) parts.push("文件已删 " + f.missing);
+  parts.push("已加载 " + lib.rows.length);
+  if (lib.sel.size) parts.push("选中 " + lib.sel.size);
+  bar.innerHTML = parts.map((p) => "<span>" + esc(p) + "</span>").join("");   // .lib-stats 是 flex+gap，一项一个 span
+}
+function libUpdateEmpty() {
+  const empty = libEl("libEmpty"); if (!empty) return;
+  if (lib.rows.length || lib.loading || lib.scanRunning) { empty.hidden = true; return; }
+  empty.hidden = false;
+  const title = lib.noRoots ? "还没有配置资源目录" : (libHasFilter() ? "无匹配项" : "资源库还没有内容");
+  const hint = lib.noRoots
+    ? "去设置页添加 ComfyUI 输出目录（可填多个），再回这里点「扫描资源」。"
+    : (libHasFilter() ? "当前筛选条件下没有文件；清掉关键词或分面再看。" : "点上面的「扫描资源」索引本地 ComfyUI 产物。");
+  // A4 的空态是 <p class="lib-empty-title"> + <p class="hint">：有结构就只改文字，没结构再回落纯文本
+  const t = empty.querySelector(".lib-empty-title"), h = empty.querySelector(".hint");
+  if (t || h) { if (t) t.textContent = title; if (h) h.textContent = hint; }
+  else empty.textContent = title + "：" + hint;
+}
+
+// ---------- 缩略图与视频海报 ----------
+function libApplyCachedThumbs() {
+  const grid = libEl("libGrid"); if (!grid) return;
+  grid.querySelectorAll('img.ms-img[data-path]').forEach((img) => {
+    const du = lib.thumbCache.get(img.dataset.path);
+    if (!du || img.src === du) return;
+    const w = img.closest(".ms-img-wrap");
+    img.onload = () => { if (w) w.dataset.ph = "ok"; };
+    img.onerror = () => { if (w) w.dataset.ph = "fail"; };
+    img.src = du;
+  });
+}
+function libPrefetchThumbs() { setTimeout(libThumbPass, 0); }
+async function libThumbPass() {
+  if (lib.thumbBusy) return;
+  const grid = libEl("libGrid"); if (!grid) return;
+  const token = lib.request;
+  const pending = Array.from(grid.querySelectorAll('img.ms-img[data-path]')).filter((img) => {
+    const w = img.closest(".ms-img-wrap");
+    return w && w.dataset.ph === "loading" && !lib.thumbCache.has(img.dataset.path);
+  });
+  if (!pending.length) {
+    // 收尾：真正没图的标"暂无封面"（保住卡片高度），只是 onload 还没回来的不动，别把刚要显示的图标成空
+    grid.querySelectorAll('.ms-img-wrap[data-ph="loading"]').forEach((w) => {
+      const img = w.querySelector("img.ms-img");
+      if (img && img.getAttribute("src")) return;
+      w.dataset.ph = "none";
+    });
+    return;
+  }
+  lib.thumbBusy = true;
+  const paths = Array.from(new Set(pending.map((i) => i.dataset.path))).slice(0, 40);   // §7：缩略图批 40
+  let ok = true, map = null;
+  try {
+    const _dpr = Math.max(1, window.devicePixelRatio || 1);
+    const raw = await api.call("lib_get_thumbs", JSON.stringify(paths), Math.min(960, Math.round(320 * _dpr)));
+    map = typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || {});
+  } catch (e) { ok = false; }
+  lib.thumbBusy = false;
+  if (token !== lib.request) return;                 // 已换筛选/已重置：这一批的结果不要了
+  if (ok && map) {
+    if (lib.thumbCache.size > 4000) lib.thumbCache.clear();
+    // A3 的 lib_get_thumbs 已带 data: 前缀（图片走 _cover_thumb、视频读海报缓存）；仍兼容裸 base64
+    for (const [p, b64] of Object.entries(map)) { const du = libThumbUri(b64); if (du) lib.thumbCache.set(p, du); }
+    libApplyCachedThumbs();
+    paths.filter((p) => !map[p]).forEach((p) => libMarkThumbWrap(p, "none"));
+  } else {
+    paths.forEach((p) => libMarkThumbWrap(p, "fail"));   // 拉取失败：与模型库同一「加载失败」占位语义
+    return;
+  }
+  setTimeout(libThumbPass, 30);                      // 继续下一批（分页后卡片可能还很多）
+}
+function libMarkThumbWrap(path, ph) {
+  const grid = libEl("libGrid"); if (!grid) return;
+  grid.querySelectorAll('img.ms-img[data-path="' + CSS.escape(path) + '"]').forEach((img) => {
+    const w = img.closest(".ms-img-wrap"); if (w && w.dataset.ph === "loading") w.dataset.ph = ph;
+  });
+}
+// ---------- 视频懒挂载与海报抓帧 ----------
+// 单 exe 打包不内置 ffmpeg，后端无法解码视频首帧，因此由前端 <video> 解码后离屏 canvas 抓一帧
+// 回传 lib_save_poster 缓存；失败（画布被跨域污染 / 解码不出来）就静默留着 <video>。
+// 挂载与抓帧绑在一起：卡片不在近区就既不挂 src 也不记「已试过」，回到近区再补。
+const LIB_VID_MARGIN = "150% 0px";     // 视口上下各 1.5 屏：滚到哪解到哪，不会一次积压几百路
+const LIB_VID_FALLBACK = 12;           // 引擎没有 IntersectionObserver 时只挂前 12 个，宁少不炸
+function libVidObserver() {
+  if (lib.vObs) return lib.vObs;                    // 全页共用一个观察器：切页只 disconnect，回来复用同一实例
+  if (typeof IntersectionObserver !== "function") return null;
+  const root = libEl("libViewport");
+  lib.vObs = new IntersectionObserver((entries) => {
+    for (const en of entries) { if (en.isIntersecting) libHydrateVideo(en.target); else libReleaseVideo(en.target); }
+  }, { root: root || null, rootMargin: LIB_VID_MARGIN, threshold: 0 });
+  return lib.vObs;
+}
+// 渲染 / 追加卡片后唯一的登记入口：只交给观察器判断，不在这里挂 src（observe 会立刻回调一次）
+function libHookCardVideos(root) {
+  if (!root) return;
+  const vids = Array.from(root.querySelectorAll('video.lib-vid[data-src]'));
+  if (!vids.length) return;
+  const obs = libVidObserver();
+  if (!obs) { vids.slice(0, LIB_VID_FALLBACK).forEach(libHydrateVideo); return; }
+  vids.forEach((v) => obs.observe(v));
+}
+function libHydrateVideo(v) {
+  if (!v || !v.dataset.src || v.dataset.libLive === "1") return;
+  v.dataset.libLive = "1";
+  v.src = v.dataset.src;                            // 地址建卡时写进 data-src，这里只赋值，不再解析标记
+  const card = v.closest(".lib-card");
+  const item = card ? libRowById(card.dataset.id) : null;
+  // 播放/暂停交给文档级 mouseover/mouseout 委托（与模型库瀑布流同一手法），这里只管挂流和抓帧
+  if (item && item.kind === "video" && !item.thumb) v._libPosterCancel = libCapturePoster(v, item);
+}
+// 离开近区：停解码、摘 src，把解码器和那一路 /api/media 流交出去；滚回来观察器会再挂上
+function libReleaseVideo(v) {
+  if (!v || v.dataset.libLive !== "1") return;
+  v.dataset.libLive = "0";
+  if (v._libPosterCancel) {
+    const cancel = v._libPosterCancel; v._libPosterCancel = null;
+    cancel();                                       // 本次抓帧随卡片一起作废：path 不能记成「已试过」
+  }
+  try { v.pause(); } catch (e) { }
+  v.removeAttribute("src");
+  try { v.load(); } catch (e) { }
+}
+// 视频海报抓帧：readyState 到 2（首帧可用）才画 canvas，长边 640 / JPEG q=0.82 回传 lib_save_poster
+// 会话级上限：thumbCache 在 libThumbPass 里也是超 4000 就整桶换水，这里同一把尺子，
+// 免得一次不切页的长滚动把 posterTried 堆到 10 万条（换水只会让旧 path 允许再试一次）。
+function libPosterTriedAdd(path) {
+  if (lib.posterTried.size > 4000) lib.posterTried.clear();
+  lib.posterTried.add(path);
+}
+function libCapturePoster(video, item) {
+  if (lib.posterTried.has(item.path)) return null;
+  libPosterTriedAdd(item.path);                       // 同一 path 会话内只回传一次
+  let done = false, timer = 0;
+  const finish = (keepTried) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    const idx = lib.posterTimers.indexOf(timer);
+    if (idx >= 0) lib.posterTimers.splice(idx, 1);
+    video.removeEventListener("loadeddata", onData);
+    video.removeEventListener("error", onError);
+    if (keepTried === false) lib.posterTried.delete(item.path);   // 只有「卡片被卸载」才退回未试过
+  };
+  const grab = () => {
+    if (done) return;
+    finish(true);
+    try {
+      const vw = Number(video.videoWidth || 0), vh = Number(video.videoHeight || 0);
+      if (!vw || !vh) return;
+      const scale = Math.min(1, 640 / Math.max(vw, vh));             // §7：回传最长边 640
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(vw * scale));
+      canvas.height = Math.max(1, Math.round(vh * scale));
+      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+      const du = canvas.toDataURL("image/jpeg", 0.82);               // §7：JPEG q=0.82
+      const b64 = du.slice(du.indexOf(",") + 1);
+      if (!b64 || b64.length * 0.75 > 2 * 1024 * 1024) return;       // §7：≤2MB
+      api.call("lib_save_poster", item.path, b64).then((r) => {
+        if (r && r.ok) { lib.thumbCache.set(item.path, du); item.thumb = true; }
+      }).catch(() => { });
+    } catch (e) { /* 跨域画布被污染或解码失败：静默跳过，卡片仍是 <video> */ }
+  };
+  function onData() { grab(); }
+  function onError() { finish(true); }
+  timer = setTimeout(() => finish(true), 8000);      // 解码超时：放弃抓帧
+  lib.posterTimers.push(timer);
+  video.addEventListener("loadeddata", onData);
+  video.addEventListener("error", onError);
+  if (Number(video.readyState || 0) >= 2) grab();    // 挂监听前首帧已解好（本地 file:// 常发生）
+  return () => finish(false);                        // 交给 libReleaseVideo 的撤销句柄
+}
+
+// ---------- 分面下拉 ----------
+function libFillSelect(id, rows, allLabel, valueOf, labelOf) {
+  const el = libEl(id); if (!el) return;
+  const sig = rows.map((r) => valueOf(r)).join("|");
+  if (el._sig === sig) return;            // 与模型库同一手法：签名不变就不重填（重填会把选中项冲掉）
+  el._sig = sig;
+  const cur = el.value;
+  el.innerHTML = '<option value="">' + esc(allLabel) + "</option>" +
+    rows.map((r) => '<option value="' + esc(String(valueOf(r))) + '">' + esc(String(labelOf(r))) + "</option>").join("");
+  el.value = cur;
+  if (cur && el.value !== cur && lib.filters) libPruneFacet(id);   // 选项已消失：同步清掉对应筛选，别筛出"莫名空列表"
+}
+function libPruneFacet(id) {
+  const f = lib.filters;
+  if (id === "libCkF") f.checkpoints = [];
+  else if (id === "libLoraF") f.loras = [];
+  else if (id === "libTagF") f.tag_ids = [];
+  else if (id === "libDirF" && f.dirs.length === 1) f.dirs = [];
+}
+function libFillFacets() {
+  const f = lib.facets || {};
+  libFillSelect("libCkF", Array.isArray(f.checkpoints) ? f.checkpoints.slice(0, 300) : [], "全部底模", (r) => r.name, (r) => r.name + "（" + r.count + "）");
+  libFillSelect("libLoraF", Array.isArray(f.loras) ? f.loras.slice(0, 300) : [], "全部 LoRA", (r) => r.name, (r) => r.name + "（" + r.count + "）");
+  libFillSelect("libDirF", Array.isArray(f.dirs) ? f.dirs.slice(0, 300) : [], "全部文件夹", (r) => String(r.path != null ? r.path : r.name), (r) => short(String(r.name || r.path || ""), 26) + "（" + r.count + "）");
+  libFillSelect("libTagF", Array.isArray(f.tags) ? f.tags.slice(0, 300) : [], "全部标签", (r) => String(r.id), (r) => r.name + "（" + r.count + "）");
+  if (lib.foldersOpen) libRenderFolders();
+}
+// 标签增删改之后筛选下拉必须自己跟上：facets 只在 lib_list 时回来，不重开页面就一直是旧列表。
+// lib_tags 是权威全量（含 count），读过就用它，没读过拿 facets.tags 兜底；libFillSelect 会保住当前选中项。
+function libRefreshTagFilter() {
+  const el = libEl("libTagF"); if (!el) return;
+  const facetTags = (lib.facets && Array.isArray(lib.facets.tags)) ? lib.facets.tags : [];
+  const rows = lib.tagsLoaded ? lib.tags : facetTags;   // 删掉最后一个标签时 lib.tags 是空数组，不能当「没读过」
+  el._sig = null;                                  // 强制重填：id 没变但名称/计数可能已经变了
+  libFillSelect("libTagF", rows.slice(0, 300), "全部标签", (r) => String(r.id), (r) => String(r.name || "") + (r.count != null ? "（" + r.count + "）" : ""));
+}
+// 标签数据变更后的统一收尾（新建 / 增删绑定 / 将来删除标签都走这里）：刷新下拉 + 重画浮层
+function libAfterTagChange() {
+  libRefreshTagFilter();
+  const pop = libEl("libTagPop");
+  if (pop && !pop.hidden) libRenderTagPop(pop);
+}
+
+// ---------- 目录面板（无独立 RPC，分面 dirs 已在 lib_list 里返回，按路径段拼树） ----------
+function libDirTree() {
+  const dirs = (lib.facets && Array.isArray(lib.facets.dirs)) ? lib.facets.dirs : [];
+  const root = { children: {} };
+  for (const d of dirs) {
+    const p = String(d.path != null ? d.path : (d.name || "")).replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    let node = root, acc = "";
+    if (!p) { root.count = Number(d.count || 0); continue; }
+    for (const seg of p.split("/")) {
+      acc = acc ? acc + "/" + seg : seg;
+      node.children[seg] = node.children[seg] || { name: seg, path: acc, children: {}, count: 0 };
+      node = node.children[seg];
+    }
+    node.count = Number(d.count || 0);
+  }
+  const out = [];
+  (function walk(node, depth) {
+    Object.keys(node.children).sort((a, b) => a.localeCompare(b, "zh")).forEach((k) => {
+      const n = node.children[k]; n.depth = depth; out.push(n); walk(n, depth + 1);
+    });
+  })(root, 0);
+  return out;
+}
+function libRenderFolders() {
+  const panel = libEl("libFoldersPanel"); if (!panel) return;
+  const rows = libDirTree();
+  if (!rows.length) { panel.innerHTML = '<div class="fm-title">暂无文件夹：先扫描，或检查资源目录配置</div>'; return; }
+  panel.innerHTML = '<div class="fm-title">资源库文件夹（点击筛选，不移动也不删除文件）</div>' +
+    '<div class="fm-toolbar"><button class="btn btn-tiny" data-lib-act="dirs-none" type="button">全部文件夹</button></div>' +
+    rows.map((n) => {
+      const on = !lib.filters.dirs.length || lib.filters.dirs.indexOf(n.path) >= 0;
+      return '<div class="fm-item" role="checkbox" tabindex="0" aria-checked="' + (lib.filters.dirs.indexOf(n.path) >= 0) + '" data-lib-dir="' + esc(n.path) + '" style="padding-left:' + (12 + n.depth * 18) + 'px">' +
+        '<input type="checkbox" tabindex="-1" aria-hidden="true"' + (lib.filters.dirs.indexOf(n.path) >= 0 ? " checked" : "") + "/>" + _icon("folder") +
+        '<span class="fm-name">' + esc(n.name) + "</span>" +
+        '<span class="fm-state ' + (on ? "on" : "off") + '">' + (n.count > 0 ? n.count + " 项" : "—") + "</span></div>";
+    }).join("");
+}
+function libToggleDir(path) {
+  const cur = lib.filters.dirs;
+  const i = cur.indexOf(path);
+  if (i >= 0) cur.splice(i, 1); else cur.push(path);
+  lib._dirsFromPanel = cur.slice();
+  const sel = libEl("libDirF");
+  if (sel) { sel.value = cur.length === 1 ? cur[0] : ""; }
+  libRenderFolders();
+  libOnFilterChange();
+}
+
+// ---------- 标签浮层 ----------
+function libEnsureTags() {
+  return api.call("lib_tags").then((raw) => {
+    const list = typeof raw === "string" ? JSON.parse(raw || "[]") : (raw || []);
+    lib.tags = Array.isArray(list) ? list : [];
+    lib.tagsLoaded = true;
+  }).catch(() => { lib.tags = []; lib.tagsLoaded = false; });
+}
+function libOpenTagPop(anchor) {
+  const pop = libEl("libTagPop");
+  if (!pop || !lib.detail) return;
+  lib.popKind = "tags";
+  libPopShow(pop, anchor);
+  libTagSlot(pop).innerHTML = '<span class="dt-dim">读取中…</span>';
+  libEnsureTags().then(() => { if (lib.popKind === "tags" && !pop.hidden) libRenderTagPop(pop); });
+}
+function libTagSlot(pop) { return pop.querySelector("[data-lib-slot='chips']") || pop; }   // A4 的浮层留了 chip 插槽
+function libRenderTagPop(pop) {
+  const d = lib.detail; if (!d) return;
+  const chosen = new Set((Array.isArray(d.tags) ? d.tags : []).map((t) => Number(t.id)));
+  libTagSlot(pop).innerHTML =
+    (lib.tags.length ? lib.tags.map((t) => {
+      const on = chosen.has(Number(t.id));
+      return '<span class="lib-chip" role="button" tabindex="0" aria-pressed="' + (on ? "true" : "false") + '" data-lib-tag="' + esc(String(t.id)) + '"' +
+        (t.color ? ' style="border-color:' + esc(t.color) + '"' : "") + ' title="点击' + (on ? "移除" : "添加") + '">' + esc(t.name) + (t.count != null ? " · " + t.count : "") +
+        '<button class="lib-chip-x" type="button" data-lib-tagdel="' + esc(String(t.id)) + '" data-lib-tagname="' + esc(t.name) + '" data-lib-tagcount="' + esc(String(t.count == null ? 0 : t.count)) + '" aria-label="删除标签 ' + esc(t.name) + '">×</button></span>';
+    }).join("") : '<span class="dt-dim">还没有标签，先新建一个</span>') +
+    '<div class="lib-chips" style="width:100%"><input class="input" data-lib-newtag placeholder="新标签名" style="flex:1;min-width:0"/>' +
+    '<button class="btn btn-tiny" data-lib-act="tag-add" type="button">新建</button></div>';
+}
+function libSaveTags(ids) {
+  const d = lib.detail; if (!d) return Promise.resolve();
+  return api.call("lib_set_tags", Number(d.id), JSON.stringify(ids)).then((r) => {
+    if (!r || !r.ok) { setStatus((r && r.msg) || "标签保存失败"); return; }
+    d.tags = Array.isArray(r.tags) ? r.tags : [];
+    const row = libRowById(d.id); if (row) row.tags = d.tags;
+    libRenderGrid(); libUpdateStats();
+    // 打完标签后 #libTagF 不能还停在「全部标签」：重读标签列表（带新计数）再刷新下拉与浮层
+    libEnsureTags().then(libAfterTagChange);
+  }).catch(() => setStatus("标签保存失败"));
+}
+function libAddTag(name) {
+  return api.call("lib_tag_save", 0, name, "", -1).then((r) => {
+    if (!r || !r.ok) { setStatus((r && r.msg) || "新建标签失败"); return; }
+    return libEnsureTags();
+  });
+}
+
+function libDeleteTag(id, name, count) {
+  if (!id) return Promise.resolve();
+  const used = count ? "它会从 " + count + " 个条目上移除。" : "它还没被用到。";
+  if (!window.confirm("删除标签「" + (name || "") + "」？" + used + "（不动文件本身）")) return Promise.resolve();
+  const wasFiltered = String(id) === String(libVal("libTagF"));
+  return api.call("lib_tag_delete", id).then((r) => {
+    if (!r || !r.ok) { setStatus((r && r.msg) || "删除标签失败"); return; }
+    setStatus("已删除标签");
+    if (wasFiltered) { const s = libEl("libTagF"); if (s) s.value = ""; lib.filters.tag_ids = []; }
+    return libEnsureTags().then(() => { libAfterTagChange(); if (wasFiltered) libLoad(true); });
+  }).catch(() => setStatus("删除标签失败"));
+}
+
+// ---------- 详情 ----------
+async function libShowDetail(id) {
+  const row = libRowById(id);
+  const request = ++lib.detailRequest;
+  let d = null;
+  try {
+    const raw = await api.call("lib_detail", Number(id));
+    d = typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || null);
+  } catch (e) { d = null; }
+  if (request !== lib.detailRequest || !libPageActive()) return;
+  if (!d || typeof d !== "object") { setStatus("资源详情读取失败"); return; }
+  if (d.ok === false) { setStatus(d.msg || "资源详情读取失败"); return; }
+  d.id = d.id || Number(id);
+  if (row) {   // 详情缺播放地址时用行数据兜底，避免右侧空白
+    if (!d.url_local) d.url_local = row.url_local;
+    if (!d.url_http) d.url_http = row.url_http;
+    if (!d.path) d.path = row.path;
+  }
+  lib.detail = d;
+  const panel = libEl("detailPanel"), mask = libEl("detailMask");
+  if (!panel || !mask) return;
+  libTeardownVideos(panel);
+  panel.innerHTML = libDetailHtml(d);
+  mask.style.display = "flex";
+}
+function libDetailRow(k, v, mono) {
+  if (v === "" || v == null) return "";
+  return '<div class="dt-mr"><span class="k">' + esc(k) + '</span><span class="v' + (mono ? " dt-mono" : "") + '" data-tip="' + esc(String(v)) + '">' + esc(String(v)) + "</span></div>";
+}
+function libDetailHtml(d) {
+  const isVid = d.kind === "video";
+  const url = libMediaUrl(d);
+  // 后端 lib_detail 已带 §7 详情边长 800 的 preview（视频则是海报缓存）：先显示它，点开才加载原文件
+  const preview = libThumbUri(d.preview) || lib.thumbCache.get(d.path) || "";
+  const media = isVid
+    ? '<video class="detail-main-img" id="dMain" controls preload="metadata" playsinline' + (preview ? ' poster="' + esc(preview) + '"' : "") + ' src="' + esc(url) + '"></video>'
+    : (url ? '<img class="detail-main-img" id="dMain" alt="' + esc(d.filename || "") + '" src="' + esc(preview || url) + '" data-lib-full="' + esc(url) + '" title="点击看原图 / 还原"/>'
+      : '<div class="detail-main-img dt-empty" id="dMain">' + _icon("image", "ic-lg") + "<span>文件不可读</span></div>");
+  const refs = []
+    .concat(Array.isArray(d.models) ? d.models : [])
+    .concat(Array.isArray(d.loras) ? d.loras : [])
+    .filter((v, i, arr) => v && arr.indexOf(v) === i);
+  const extra = d.extra && typeof d.extra === "object" ? JSON.stringify(d.extra, null, 2) : "";
+  // 提示词来源要诚实：name_fallback 是后端按字段名（prompt/text 等）回退捞出来的，
+  // 不是链条解析结果。extra 里没这个字段就不标注，不编造来源说明。
+  const srcHint = (d.extra && d.extra.prompt_source === "name_fallback") ? '<span class="dt-sec-hint">按字段名提取</span>' : "";
+  return '<div class="dt-head"><div class="dt-head-t">资源详情</div><div class="dt-head-r">' +
+    '<button class="icon-btn dt-close" data-lib-act="close" aria-label="关闭详情" title="关闭">' + _icon("x") + "</button></div></div>" +
+    '<div class="dt-body"><div class="detail-left">' + media +
+    (d.exists === false ? '<p class="binding-warning">文件已不在磁盘上（索引保留 30 天后清除）</p>' : "") +
+    '</div><div class="detail-right">' +
+    '<div class="detail-title">' + esc(d.filename || "-") + "</div>" +
+    '<div class="dt-mrs">' +
+      libDetailRow("类型", isVid ? "视频 " + String(d.ext || "") : "图片 " + String(d.ext || "")) +
+      libDetailRow("底模", d.checkpoint) +
+      libDetailRow("尺寸", d.width && d.height ? d.width + " × " + d.height : "") +
+      libDetailRow("时长", libDur(d.duration)) +
+      libDetailRow("大小", fmtSize(d.size)) +
+      libDetailRow("生成时间", d.mtime ? fmtTime(d.mtime) : "") +
+      libDetailRow("入库时间", d.added_at ? fmtTime(d.added_at) : "") +
+      libDetailRow("元数据来源", d.meta_source || (d.has_meta ? "" : "无内嵌元数据")) +
+      libDetailRow("seed", d.seed) + libDetailRow("steps", d.steps) + libDetailRow("cfg", d.cfg) +
+      libDetailRow("采样器", d.sampler) + libDetailRow("调度器", d.scheduler) +
+      libDetailRow("路径", d.path, true) +
+    "</div>" +
+    (d.note ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("info") + '解析备注</div><div class="detail-desc">' + esc(d.note) + "</div></div>" : "") +
+    '<div class="dt-sec"><div class="dt-sec-h">' + _icon("file") + '正面提示词' + srcHint +
+      (d.prompt ? '<button class="btn dt-copy" data-lib-act="copy-prompt" type="button">' + _icon("copy") + "复制</button>" : "") +
+      '</div><div class="detail-desc">' + (d.prompt ? esc(d.prompt) : '<span class="dt-dim">无提示词（文件未内嵌元数据，或同名 .json 侧车也没有）</span>') + "</div></div>" +
+    (d.negative ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("file") + '负面提示词' +
+      '<button class="btn dt-copy" data-lib-act="copy-negative" type="button">' + _icon("copy") + "复制</button>" +
+      '</div><div class="detail-desc">' + esc(d.negative) + "</div></div>" : "") +
+    (refs.length ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("layers") + '模型引用<span class="dt-sec-hint">点击跳模型库</span></div><div class="lib-chips">' +
+      refs.map((m) => '<span class="lib-chip" data-lib-model="' + esc(m) + '" title="在本地模型库里定位">' + esc(m) + "</span>").join("") + "</div></div>" : "") +
+    (extra ? '<div class="dt-sec"><details><summary class="dt-sec-h">' + _icon("settings") + "原始解析摘要</summary><pre class=\"detail-desc\">" + esc(extra) + "</pre></details></div>" : "") +
+    '<div class="dt-sec"><div class="dt-sec-h">' + _icon("tag") + '标签</div><div class="lib-chips">' +
+      ((d.tags && d.tags.length) ? d.tags.map((t) => '<span class="lib-chip"' + (t.color ? ' style="border-color:' + esc(t.color) + '"' : "") + ">" + esc(t.name) + "</span>").join("") : '<span class="dt-dim">未打标签</span>') +
+      "</div>" +
+      '<div class="dt-ag"><div class="dt-ag-h">操作</div><div class="dt-ag-b">' +
+        '<button class="btn" data-lib-act="star" aria-pressed="' + (!!d.starred) + '" type="button">' + _icon("star") + (d.starred ? "取消收藏" : "收藏") + "</button>" +
+        '<button class="btn" data-lib-act="tags" type="button">' + _icon("tag") + "打标签</button>" +
+        '<button class="btn" data-lib-act="folder" type="button">' + _icon("folder") + "打开所在文件夹</button>" +
+        '<button class="btn" data-lib-act="copy-path" type="button">' + _icon("copy") + "复制路径</button>" +
+      "</div></div>" +
+      '<div class="dt-ag"><div class="dt-ag-h">分析</div><div class="dt-ag-b">' +
+        '<button class="btn" data-lib-act="workflow" type="button"' + (d.has_meta ? "" : " disabled") + ' title="' + (d.has_meta ? "把内嵌工作流送去分析" : "该文件没有内嵌元数据，无工作流可分析") + '">' + _icon("workflow") + "送工作流分析</button>" +
+        (d.kind === "image" ? '<button class="btn" data-lib-act="reverse" type="button" title="按文件哈希加入反向解析列表；到反向解析页点「开始反查」才会联网查询">' + _icon("search") + "送逆向解析</button>" : "") +
+      "</div></div>" +
+      '<div class="dt-ag"><div class="dt-ag-h">删除</div><div class="dt-ag-b">' +
+        '<button class="btn btn-danger" data-lib-act="delete" type="button"' + (d.exists === false ? " disabled" : "") + ">" + _icon("trash") + "删除文件</button>" +
+      "</div></div>" +
+    "</div></div></div>";
+}
+function libCloseDetail() {
+  const panel = libEl("detailPanel"), mask = libEl("detailMask");
+  libTeardownVideos(panel);
+  if (mask) mask.style.display = "none";
+  if (panel) panel.innerHTML = "";
+  lib.detail = null;
+  libHidePopovers();
+}
+async function libGotoModel(name) {
+  let list = [];
+  try {
+    const raw = await api.call("workflow_model_matches", [name]);   // 后端按可迭代对象处理，必须传数组
+    list = typeof raw === "string" ? JSON.parse(raw || "[]") : (raw || []);
+  } catch (e) { list = []; }
+  const hit = Array.isArray(list) ? list.find((x) => x && x.local && x.path) : null;
+  if (!hit) { setStatus("本地模型库未匹配到 " + name + "（不在设置的模型目录里）"); return; }
+  libCloseDetail(); libLeavePage();
+  switchPage("models");
+  try { await showModelDetail(hit.path); } catch (e) { setStatus("模型详情打开失败"); }
+}
+function libSetStar(on) {
+  const d = lib.detail; if (!d) return Promise.resolve();
+  return api.call("lib_set_star", Number(d.id), !!on).then((r) => {
+    if (!r || !r.ok) { setStatus((r && r.msg) || "收藏状态保存失败"); return; }
+    d.starred = !!r.starred;
+    const row = libRowById(d.id); if (row) row.starred = d.starred;
+    const btn = document.querySelector('#detailPanel [data-lib-act="star"]');
+    if (btn) { btn.setAttribute("aria-pressed", String(d.starred)); btn.innerHTML = _icon("star") + (d.starred ? "取消收藏" : "收藏"); }
+    libRenderGrid(); libUpdateStats();
+  }).catch(() => setStatus("收藏状态保存失败"));
+}
+function libDeleteItem() {
+  const d = lib.detail; if (!d) return Promise.resolve();
+  // 只回收媒体文件本体：同名 .json 侧车是 ComfyUI 给同名的图片/视频共享写的，删了会连带毁掉兄弟文件的元数据
+  const msg = "删除 " + (d.filename || "") + " ？文件会被移进系统回收站（不是彻底删除，可从回收站还原）。同名 .json 侧车文件有意保留：ComfyUI 用它同时存放本媒体与同名兄弟文件（图片／视频共用一份生成数据）的元数据。";
+  return confirmBox(msg).then((ok) => {
+    if (!ok) return;
+    return api.call("lib_delete", Number(d.id)).then((r) => {
+      if (!r || !r.ok) { setStatus((r && r.msg) || "删除失败：文件可能被其它程序占用"); return; }
+      lib.thumbCache.delete(d.path); lib.posterTried.delete(d.path);
+      const idx = lib.rows.findIndex((x) => String(x.id) === String(d.id));
+      if (idx >= 0) lib.rows.splice(idx, 1);
+      lib.total = Math.max(0, lib.total - 1);
+      libCloseDetail();
+      libRenderGrid(); libUpdateStats(); libUpdateEmpty(); libUpdateMore();
+      setStatus("已删除（文件在回收站里）");
+    });
+  }).catch(() => setStatus("删除失败"));
+}
+function libDetailAction(act, btn) {
+  const d = lib.detail; if (!d) return;
+  if (act === "close") { libCloseDetail(); return; }
+  if (act === "star") return libSetStar(!d.starred);
+  if (act === "tags") { libOpenTagPop(btn); return; }
+  if (act === "delete") return libDeleteItem();
+  if (act === "copy-path") { window.__copyText(d.path || "").then((ok) => setStatus(ok ? "路径已复制" : "复制失败")); return; }
+  if (act === "copy-prompt") { window.__copyText(d.prompt || "").then((ok) => setStatus(ok ? "正面提示词已复制" : "复制失败")); return; }
+  if (act === "copy-negative") { window.__copyText(d.negative || "").then((ok) => setStatus(ok ? "负面提示词已复制" : "复制失败")); return; }
+  if (act === "folder") {
+    return api.call("open_in_folder", d.path).then((raw) => {
+      const r = typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || {});
+      setStatus(r && r.ok ? "已打开所在文件夹" : ((r && r.msg) || "文件不存在或已被移动"));
+    }).catch(() => setStatus("打开文件夹失败"));
+  }
+  if (act === "workflow") {
+    const p = String(d.path || "");
+    libCloseDetail(); libLeavePage();
+    switchPage("workflow");
+    if (typeof wfAnalyze === "function") wfAnalyze(p); else api.call("analyze_workflow", p).catch(() => { });
+    return;
+  }
+  if (act === "reverse") {
+    // 与模型库「发送去识别」同一条既有链路：rp_add_paths 只把路径塞进反查列表，反向解析页用
+    // rp_get_rows 渲染、点「开始反查」再 rp_start 才联网；不另起后端方法，也不在这里抢跑队列。
+    // 缺 API Key 时 api 包装层已经提示并弹账号引导（返回 false），这里不再叠一条状态。
+    const p = String(d.path || "");
+    return api.call("rp_add_paths", [p]).then((ok) => {
+      if (!ok) return;
+      libCloseDetail(); libLeavePage();
+      switchPage("reverse");
+      if (typeof rpRefresh === "function") rpRefresh();
+      setStatus("已送去逆向解析 " + short(p.split(/[\\/]/).pop() || "", 24) + "：在反向解析页点「开始反查」");
+    }).catch(() => setStatus("送去反向解析失败"));
+  }
+}
+
+// ---------- 分页 / 筛选 ----------
+function libOnFilterChange() { libLoad(true); }
+function libMaybeMore() {
+  if (lib.loading || lib.scanRunning) return;
+  if (lib.rows.length >= lib.total) return;
+  const vp = libEl("libViewport");
+  if (vp && vp.scrollHeight - vp.scrollTop - vp.clientHeight > 400) return;
+  lib.offset = lib.rows.length;
+  libLoad(false);
+}
+function libOnScroll() {
+  if (lib.scrollTimer) return;      // 300ms 节流，与模型库滚动同一参数
+  lib.scrollTimer = setTimeout(() => { lib.scrollTimer = null; libMaybeMore(); }, 300);
+}
+
+// ---------- 设置页（media_* 三键，控件由 index.html 提供） ----------
+function libSyncSettings() {
+  const cfg = state.cfg || {};
+  const roots = libEl("setMediaRoots"); if (roots) roots.value = (cfg.media_roots || []).join("\n");
+  const exc = libEl("setMediaExclude"); if (exc) exc.value = (cfg.media_exclude_dirs || []).join("\n");
+  const size = libEl("setMediaPageSize"); if (size) size.value = String(cfg.media_page_size || 200);
+}
+function libCfgSet(key, value) { if (state.cfg) state.cfg[key] = value; }
+function libDetectRoots() {
+  api.call("lib_autodetect_roots").then((r) => {
+    if (!r || !r.ok) { setStatus((r && r.msg) || "没有探测到 ComfyUI output 目录"); return; }
+    const found = Array.isArray(r.roots) ? r.roots : [];
+    if (!found.length) { setStatus("没有探测到 ComfyUI output 目录，请手动填写"); return; }
+    const box = libEl("setMediaRoots");
+    // A4 的按钮说明是「不覆盖手写路径」：所以是并入而不是替换
+    const curText = box ? String(box.value || "") : ((state.cfg || {}).media_roots || []).join("\n");
+    const lines = curText.split("\n").map((s) => String(s).trim()).filter(Boolean);
+    const norm = (s) => String(s).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const seen = new Set(lines.map(norm));
+    const added = found.filter((p) => p && !seen.has(norm(p)));
+    if (box) box.value = lines.concat(added).join("\n");
+    libCfgSet("media_roots", lines.concat(added));
+    setStatus(added.length ? "探测到并并入 " + added.length + " 个目录（已存在的没重复添加），记得点保存" : "探测到的目录都已在列表里，无需改动");
+  }).catch(() => setStatus("自动探测失败"));
+}
+
+// ---------- 切页清理 ----------
+function libReleaseGridVideos() {
+  const grid = libEl("libGrid"); if (!grid) return;
+  grid.querySelectorAll("video").forEach((v) => libReleaseVideo(v));
+}
+function libLeavePage() {
+  libStopScanPoll();
+  if (lib.scrollTimer) { clearTimeout(lib.scrollTimer); lib.scrollTimer = null; }
+  if (lib.qTimer) { clearTimeout(lib.qTimer); lib.qTimer = null; }
+  lib.request++;                    // 让在途的列表/缩略图响应作废
+  lib.thumbBusy = false;
+  lib.posterTimers.forEach((t) => clearTimeout(t)); lib.posterTimers = [];
+  if (lib.vObs) lib.vObs.disconnect();          // 观察器只解绑、实例留着：回页时 libHookCardVideos 重新登记
+  libReleaseGridVideos();                       // 离页把解码器和 /api/media 流全部交出去，隐藏页不该继续占
+  lib.posterTried.clear(); lib.thumbCache.clear();   // 会话级缓存到此为止：10 万视频的滚动会话不能让它们只涨不落
+  libHidePopovers();
+}
+
+// ---------- 事件绑定（一律文档级委托：A4 的标记若有出入也不会因缺节点抛错） ----------
+const LIB_FILTER_IDS = ["libKindF", "libSort", "libGroup", "libCkF", "libLoraF", "libTagF", "libDirF", "libStarOnly", "libNoMeta"];
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  if (!t || !t.closest) return;
+  const id = t.id || "";
+  // 切页清理：switchPage 只允许 1 行钩子（进 library），离开由这里兜住（#navTabs 的委托先执行）
+  const navTab = t.closest(".nav-tab");
+  if (navTab && navTab.dataset.page !== "library") libLeavePage();
+  if (id === "libScanBtn") { libStartScan(); return; }
+  if (id === "libStopScanBtn") { libStopScan(); return; }
+  if (id === "libMore") { libMaybeMore(); return; }
+  if (id === "libRootDetect") { libDetectRoots(); return; }
+  if (id === "libFoldersBtn") {
+    const panel = libEl("libFoldersPanel");
+    if (!panel) return;
+    const open = !lib.foldersOpen;
+    libHidePopovers();
+    lib.foldersOpen = open;
+    panel.hidden = !open;
+    t.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) { lib.popKind = "folders"; lib.popAnchor = t; libRenderFolders(); }
+    return;
+  }
+  const tab = t.closest('.nav-tab[data-page="settings"]');
+  if (tab) { setTimeout(libSyncSettings, 0); return; }
+  const dirItem = t.closest('[data-lib-dir]');
+  if (dirItem) { libToggleDir(dirItem.dataset.libDir); return; }
+  if (t.closest('[data-lib-act="dirs-none"]')) { lib.filters.dirs = []; lib._dirsFromPanel = []; const s = libEl("libDirF"); if (s) s.value = ""; libRenderFolders(); libOnFilterChange(); return; }
+  const delTag = t.closest("[data-lib-tagdel]");
+  if (delTag) { libDeleteTag(Number(delTag.dataset.libTagdel), delTag.dataset.libTagname, Number(delTag.dataset.libTagcount)); return; }
+  const tagItem = t.closest("[data-lib-tag]");
+  if (tagItem && lib.detail) {
+    const tid = Number(tagItem.dataset.libTag);
+    const ids = (lib.detail.tags || []).map((x) => Number(x.id));
+    const i = ids.indexOf(tid);
+    if (i >= 0) ids.splice(i, 1); else ids.push(tid);
+    libSaveTags(ids);
+    return;
+  }
+  if (t.closest('[data-lib-act="tag-add"]')) {
+    const pop = libEl("libTagPop");
+    const inp = pop ? pop.querySelector("[data-lib-newtag]") : null;
+    const name = inp ? String(inp.value || "").trim() : "";
+    if (!name) { setStatus("先写标签名"); return; }
+    libAddTag(name).then(libAfterTagChange);
+    return;
+  }
+  const model = t.closest("[data-lib-model]");
+  if (model) { libGotoModel(model.dataset.libModel); return; }
+  const act = t.closest("#detailPanel [data-lib-act]");
+  if (act) { libDetailAction(act.dataset.libAct, act); return; }
+  const card = t.closest("#libGrid .lib-card");
+  if (card) {
+    if (e.detail > 1) return;
+    const grid = libEl("libGrid");
+    lib.sel.clear(); lib.sel.add(card.dataset.id);
+    if (grid) grid.querySelectorAll(".lib-card.checked").forEach((c) => c.classList.remove("checked"));
+    card.classList.add("checked");
+    libUpdateStats();
+    libShowDetail(card.dataset.id);
+    return;
+  }
+  const main = t.closest("#detailPanel #dMain");
+  if (main && main.tagName === "IMG") {   // 详情图片就地放大：库内文件是原图，无需再走在线画廊查看器
+    const big = main.dataset.libBig === "1";
+    main.dataset.libBig = big ? "0" : "1";
+    if (!big) {
+      if (main.dataset.libFull && main.src !== main.dataset.libFull) { main.dataset.libPreview = main.src; main.src = main.dataset.libFull; }
+      main.style.maxHeight = "calc(100vh - 160px)";
+    } else {
+      if (main.dataset.libPreview) main.src = main.dataset.libPreview;
+      main.style.maxHeight = "";
+    }
+    main.style.objectFit = "contain";
+    return;
+  }
+  // 浮层外点击即关（浮层已 portal 到 body，只判断自身与锚点）
+  if (lib.popKind && !t.closest("#libTagPop") && !t.closest("#libFoldersPanel") && !(lib.popAnchor && lib.popAnchor.contains(t))) libHidePopovers();
+});
+document.addEventListener("mouseover", (e) => {
+  const v = e.target && e.target.closest ? e.target.closest("#libGrid video.lib-vid") : null;
+  if (!v) return;
+  libHydrateVideo(v);                 // 悬停可能赶在观察器回调之前：没挂 src 的 play() 只会 reject
+  if (v.paused) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => { }); }
+});
+document.addEventListener("mouseout", (e) => {
+  const card = e.target && e.target.closest ? e.target.closest("#libGrid .lib-card") : null;
+  if (!card || (e.relatedTarget && card.contains(e.relatedTarget))) return;
+  const v = card.querySelector("video.lib-vid"); if (v) { try { v.pause(); } catch (err) { } }
+});
+document.addEventListener("input", (e) => {
+  const t = e.target; if (!t || !t.id) return;
+  if (t.id === "libQ") {
+    clearTimeout(lib.qTimer);
+    lib.qTimer = setTimeout(() => { lib.filters.q = String(t.value || "").trim(); libOnFilterChange(); }, 300);
+    return;
+  }
+  if (t.id === "setMediaRoots") { t.dataset.touched = "1"; libCfgSet("media_roots", String(t.value || "").split("\n").map((s) => s.trim()).filter(Boolean)); return; }
+  if (t.id === "setMediaExclude") { t.dataset.touched = "1"; libCfgSet("media_exclude_dirs", String(t.value || "").split("\n").map((s) => s.trim()).filter(Boolean)); return; }
+  if (t.id === "setMediaPageSize") { t.dataset.touched = "1"; libCfgSet("media_page_size", Number(t.value) || 200); }
+});
+// A4 的媒体控件不在 SETTING_FIELDS 里（saveSettings 只回收 [data-key]），值靠 state.cfg 桥接：
+// 进设置页要回填，用户没动过的控件聚焦时再补一次，避免框里是空的让人以为没配置
+document.addEventListener("focusin", (e) => {
+  const t = e.target;
+  if (!t || !t.id || t.dataset.touched) return;
+  if (["setMediaRoots", "setMediaExclude", "setMediaPageSize"].indexOf(t.id) >= 0) libSyncSettings();
+});
+document.addEventListener("change", (e) => {
+  const t = e.target; if (!t || !t.id) return;
+  if (LIB_FILTER_IDS.indexOf(t.id) < 0) return;
+  if (t.id === "libDirF") { lib.filters.dirs = t.value ? [t.value] : []; lib._dirsFromPanel = []; if (lib.foldersOpen) libRenderFolders(); }
+  libReadControls();
+  libOnFilterChange();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!lib.popKind) return;                 // 浮层打开时 Esc 只关浮层，不同时关掉详情（捕获阶段抢在既有 Esc 处理之前）
+  libHidePopovers();
+  e.preventDefault(); e.stopImmediatePropagation();
+}, true);
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  if (!e.target || !e.target.closest) return;
+  const chip = e.target.closest("#libTagPop [data-lib-tag]");
+  if (chip) { e.preventDefault(); chip.click(); return; }      // chip 是 role=button 的 span，键盘要能按
+  const card = e.target.closest("#libGrid .lib-card");
+  if (!card) return;
+  e.preventDefault();
+  libShowDetail(card.dataset.id);
+});
+window.addEventListener("resize", () => { if (lib.popKind === "tags") libPopPosition(libEl("libTagPop"), lib.popAnchor); });
+
+function libInit() {
+  const vp = libEl("libViewport");
+  if (vp) vp.addEventListener("scroll", libOnScroll, { passive: true });
+  window.addEventListener("scroll", libOnScroll, { passive: true });
+  libSetScanBtns(false);
+  libSetRootHint();
+}
+try { libInit(); } catch (e) { /* 资源库标记未就位时不影响其它页面 */ }

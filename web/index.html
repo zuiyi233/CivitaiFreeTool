@@ -73,6 +73,7 @@
       <button class="nav-tab active" data-page="download" data-nav-icon="download">批量下载</button>
       <button class="nav-tab" data-page="dlmanager" data-nav-icon="list">下载管理</button>
       <button class="nav-tab" data-page="models" data-nav-icon="layers">模型管理</button>
+      <button class="nav-tab" data-page="library" data-nav-icon="image">资源库</button>
       <button class="nav-tab" data-page="updates" data-nav-icon="refresh">检查更新</button>
       <button class="nav-tab" data-page="reverse" data-nav-icon="search">反向解析</button>
       <button class="nav-tab" data-page="workflow" data-nav-icon="workflow">工作流分析</button>
@@ -321,6 +322,64 @@
     </div>
   </section>
 
+  <!-- 资源库：ComfyUI 生成图片/视频索引（行为见 app.js「资源库」段） -->
+  <section class="page" id="page-library">
+    <div class="card">
+      <div class="lib-toolbar">
+        <div class="title-row">
+          <h2 class="page-title" id="libTitle">资源库</h2>
+          <span class="status-pill" id="libScanHint">未扫描</span>
+          <button class="btn btn-primary" id="libScanBtn" data-tip="扫描设置页配置的资源目录：只解析新文件或改动过的文件，已入库的不重复读元数据"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-scan"/></svg>扫描资源</button>
+          <button class="btn" id="libStopScanBtn" disabled data-tip="停止本次扫描；已入库的内容保留，下次扫描从缺失处继续"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-x"/></svg>停止</button>
+        </div>
+        <p class="hint" id="libRootHint">资源库只索引「设置 · 资源库目录」里列出的文件夹（默认自动探测 ComfyUI/output）。图片支持 png / jpg / jpeg / webp / gif，视频支持 mp4 / mov / webm / mkv，其中 webm 与 mkv 只入库、不解析元数据。扫描不移动也不删除任何原文件。</p>
+        <div class="lib-stats" id="libStatsBar" role="status" aria-live="polite"></div>
+        <div class="mm-metro">
+          <div class="mm-row mm-row1">
+            <span class="mm-search-field"><input id="libQ" class="input" type="search" aria-label="搜索资源关键词" placeholder="搜索提示词 / 文件名 / 模型名…" data-tip="在生成元数据全文里搜索：提示词、负面提示词、模型名、文件名。输入停顿 300 毫秒后自动查询"/></span>
+            <select class="input" id="libSort" aria-label="资源排序方式" data-tip="排序只接受固定几种方式，未知值回落「生成时间（新→旧）」。"><option value="time_desc">排序：生成时间（新→旧）</option><option value="time_asc">排序：生成时间（旧→新）</option><option value="name_asc">排序：文件名 A→Z</option><option value="size_desc">排序：文件体积（大→小）</option><option value="added_desc">排序：入库时间（最近入库）</option></select>
+            <select class="input" id="libGroup" aria-label="资源分组方式" data-tip="分组标题横跨整行；按日期分组用本地时区，只影响显示不改文件位置"><option value="">不分组</option><option value="date">分组：生成日期</option><option value="checkpoint">分组：底模</option><option value="dir">分组：所在文件夹</option></select>
+            <span class="mm-spacer"></span>
+          </div>
+          <div class="mm-row mm-row3">
+            <select class="input" id="libKindF" aria-label="筛选媒体类型" data-tip="按扩展名归类：五种图片、四种视频。"><option value="">全部类型</option><option value="image">仅看图片</option><option value="video">仅看视频</option></select>
+            <select class="input" id="libCkF" aria-label="筛选底模" data-tip="来自生成元数据的 Checkpoint / UNet 文件名，按数量降序，最多列出 300 项；无元数据的文件不在其中。"><option value="">全部底模</option></select>
+            <select class="input" id="libLoraF" aria-label="筛选 LoRA" data-tip="来自生成元数据的 LoRA 文件名，按数量降序，最多 300 项。"><option value="">全部 LoRA</option></select>
+            <select class="input" id="libTagF" aria-label="筛选标签" data-tip="按资源库标签筛选；标签在卡片或详情的「打标签」里添加。"><option value="">全部标签</option></select>
+            <select class="input" id="libDirF" aria-label="筛选文件夹" data-tip="按扫描根目录下的相对文件夹筛选；空值表示全部。"><option value="">全部文件夹</option></select>
+            <label class="lib-check"><input type="checkbox" id="libStarOnly" aria-label="只看收藏的资源" data-tip="只显示已收藏的资源；收藏只改库里的标记，不动文件"/><span>只看收藏</span></label>
+            <label class="lib-check"><input type="checkbox" id="libNoMeta" aria-label="只看无内嵌元数据的资源" data-tip="排查用：只显示读不到提示词的文件，也就是卡片右上角带问号的资源"/><span>无元数据</span></label>
+            <span class="folders-wrap" id="libFoldersWrap">
+              <button class="btn" id="libFoldersBtn" aria-controls="libFoldersPanel" aria-expanded="false" data-tip="展开目录树，勾选或排除要查看的文件夹（含子目录）"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-folder"/></svg>文件夹</button>
+              <div class="folders-panel" id="libFoldersPanel" role="dialog" aria-label="资源库文件夹筛选" hidden></div>
+            </span>
+            <span class="mm-spacer"></span>
+          </div>
+        </div>
+      </div>
+      <div id="libViewport">
+        <div class="masonry" id="libGrid"></div>
+        <button type="button" class="btn lib-more" id="libMore" aria-label="加载更多资源" hidden>加载更多</button>
+        <div id="libLoading" role="status" aria-busy="true" hidden>
+          <div class="lib-skeleton" aria-hidden="true"></div>
+          <div class="lib-skeleton" aria-hidden="true"></div>
+          <div class="lib-skeleton" aria-hidden="true"></div>
+          <div class="lib-skeleton" aria-hidden="true"></div>
+          <div class="lib-skeleton" aria-hidden="true"></div>
+          <div class="lib-skeleton" aria-hidden="true"></div>
+        </div>
+        <div id="libEmpty" role="status" hidden>
+          <p class="lib-empty-title">资源库还没有内容</p>
+          <p class="hint">去设置页添加 ComfyUI 输出目录，再点上面的「扫描资源」。</p>
+        </div>
+      </div>
+      <div class="lib-tagpop" id="libTagPop" role="dialog" aria-label="为资源打标签" hidden>
+        <p class="hint">点一下添加或移除标签；新标签可在资源库筛选旁的标签管理里创建。</p>
+        <div class="lib-chips" data-lib-slot="chips"></div>
+      </div>
+    </div>
+  </section>
+
   <!-- 更新检测（紧凑表格：模型信息 / 当前版本 / 同底模可用版本 / 发布时间 / 状态 / 操作） -->
   <section class="page" id="page-updates">
     <div class="upd-toolbar">
@@ -462,6 +521,25 @@
         <button class="btn" id="openLogs" data-tip="打开程序日志文件夹（startup.log / watchdog.log / error.log）—— 排查问题时把这里的日志发出来即可"><span class="emj">📂</span> 打开日志文件夹</button>
       </div>
       <div id="settingsForm"></div>
+      <!-- 资源库扫描设置：与「模型管理目录」同组显示（data-settings-panel=general 由 workbench.js 的分类切换与搜索托管；控件由 app.js 资源库段读写） -->
+      <section class="settings-category" role="tabpanel" aria-label="资源库目录设置" data-settings-panel="general">
+        <header><h3>资源库目录</h3><p>资源库扫描的是生成出来的图片与视频，和上面的模型目录完全分开；两边互不影响，也不会互相移动文件。</p></header>
+        <div class="setting-row" data-setting-search="资源库 媒体 生成图 comfyui output 目录 media_roots">
+          <div class="setting-copy"><label for="setMediaRoots">资源库扫描目录（每行一个）</label><p id="setMediaRoots-help">每行一个 ComfyUI 输出目录的绝对路径，例如 <code>D:\ComfyUI\output</code> 或 <code>E:\生成图</code>。也可以直接点「自动探测」。目录只会新增进库的文件，不删除、不移动任何原文件。</p></div>
+          <div class="setting-control">
+            <textarea class="input" rows="3" id="setMediaRoots" aria-label="资源库扫描目录" aria-describedby="setMediaRoots-help" data-tip="资源库增量扫描的根目录，每行一个绝对路径；留空时资源库不会扫描任何文件" placeholder="D:\ComfyUI\output&#10;E:\生成图&#10;\\192.168.1.10\ComfyUI\output（局域网共享）"></textarea>
+            <button type="button" class="btn" id="libRootDetect" data-tip="按顺序探测安装目录、用户目录以及各模型目录旁的 ComfyUI/output，把存在的目录填进上面的文本框；不会覆盖你手写的路径"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-scan"/></svg>自动探测</button>
+          </div>
+        </div>
+        <div class="setting-row" data-setting-search="资源库 排除 忽略 子目录 media_exclude_dirs">
+          <div class="setting-copy"><label for="setMediaExclude">资源库排除目录（每行一个）</label><p id="setMediaExclude-help">相对扫描根目录填写，使用正斜杠，例如 <code>temp</code> 或 <code>video/drafts</code>。填写的目录及其全部子目录都不扫描，已经入库的记录会在下次扫描时标记为缺失。</p></div>
+          <div class="setting-control"><textarea class="input" rows="3" id="setMediaExclude" aria-label="资源库排除目录" aria-describedby="setMediaExclude-help" data-tip="每行一个相对扫描根的目录（正斜杠），自身及子目录一起跳过；以点开头的目录、__pycache__、node_modules 已默认排除"></textarea></div>
+        </div>
+        <div class="setting-row" data-setting-search="资源库 每页 批量 条数 分页 media_page_size">
+          <div class="setting-copy"><label for="setMediaPageSize">资源库每批条数</label><p id="setMediaPageSize-help">滚动到底时一次追加读取的条数，默认 200，可填 20–500。数值越大首屏越全，但缩略图与渲染更慢。</p></div>
+          <div class="setting-control"><input class="input" type="number" id="setMediaPageSize" aria-label="资源库每批条数" aria-describedby="setMediaPageSize-help" min="20" max="500" step="10" value="200" data-tip="资源库列表分页每批读取的条数；超过 500 会按 500 处理，小于 20 会按 20 处理"/></div>
+        </div>
+      </section>
       <div class="btn-row sticky-actions" id="settingsActions">
         <button class="btn btn-danger" id="btnSaveSettings">保存设置</button>
         <button class="btn" id="btnTestApi">测试 API 连接</button>
