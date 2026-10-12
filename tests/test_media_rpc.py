@@ -23,6 +23,12 @@ class FakeLib:
         self.detail_val = None
         self.item_val = None
         self.star_val = True
+        self.star_batch_val = 2
+        self.batch_tags_val = {}
+        self.items_by_id = {}            # 非空时 get_item 按 id 取（批量删除用例用）
+        self.export_val = {"kind": "cft-media-annotations", "version": 1, "tags": [], "items": []}
+        self.import_val = {"matched": 0, "starred": 0, "tags_applied": 0, "tags_created": 0,
+                           "unmatched": 0, "ambiguous": 0, "dry_run": True}
         self.tags_val = []
         self.new_tag_id = 7
         self.delete_tag_val = True
@@ -50,6 +56,8 @@ class FakeLib:
 
     def get_item(self, item_id):
         self.calls.append(("get_item", item_id))
+        if self.items_by_id:
+            return self.items_by_id.get(item_id)
         return self.item_val
 
     def set_star(self, item_id, on):
@@ -59,6 +67,18 @@ class FakeLib:
     def set_tags(self, item_id, ids):
         self.calls.append(("set_tags", item_id, ids))
         return self.tags_val
+
+    def set_starred(self, ids, on):
+        self.calls.append(("set_starred", list(ids), bool(on)))
+        return self.star_batch_val
+
+    def add_tags(self, ids, tag_ids):
+        self.calls.append(("add_tags", list(ids), list(tag_ids)))
+        return self.batch_tags_val
+
+    def remove_tags(self, ids, tag_ids):
+        self.calls.append(("remove_tags", list(ids), list(tag_ids)))
+        return self.batch_tags_val
 
     def list_tags(self):
         self.calls.append(("list_tags",))
@@ -75,6 +95,14 @@ class FakeLib:
     def mark_gone(self, item_id):
         self.calls.append(("mark_gone", item_id))
         return True
+
+    def export_annotations(self):
+        self.calls.append(("export_annotations",))
+        return self.export_val
+
+    def import_annotations(self, payload, dry_run=False):
+        self.calls.append(("import_annotations", payload, bool(dry_run)))
+        return self.import_val
 
     def get_item_by_path(self, path):
         self.calls.append(("get_item_by_path", path))
@@ -664,6 +692,164 @@ class AccessorTests(LibRPCTestBase):
                 api = webui.Api()
             self.assertEqual(api._media_roots_for_bridge(), [])
             self.assertFalse(api.lib_scan()["started"])  # 未配置根 → 不起线程
+
+
+class BatchTests(LibRPCTestBase):
+    """§16 批量 RPC：入参闸门、分片上限、以及删除只一次回收站调用。"""
+
+    def test_star_batch_dedupes_and_counts(self):
+        a, lib, _mod = self.make_api()
+        lib.star_batch_val = 2
+        r = a.lib_set_star_batch('[3, 3, "x", null, 0, -1, 1]', True)
+        self.assertEqual(r, {"ok": True, "count": 2})
+        self.assertIn(("set_starred", [3, 1], True), lib.calls)   # 去重、丢非正整数、保序
+
+    def test_batch_payload_gates(self):
+        a, lib, _mod = self.make_api()
+        for bad in ("", "[]", "not json", '{"a":1}', "[0, -2]"):
+            self.assertFalse(a.lib_set_star_batch(bad, True)["ok"])
+        self.assertEqual([c for c in lib.calls if c[0] == "set_starred"], [])   # 闸门在委托之前
+        self.assertFalse(a.lib_delete_batch(json.dumps(list(range(1, 2002))))["ok"])
+        self.assertEqual(a.lib_set_star_batch(json.dumps(list(range(1, 2001))), 1)["count"], 2)
+
+    def test_tag_batch_shapes_and_bad_tag_json(self):
+        a, lib, _mod = self.make_api()
+        lib.batch_tags_val = {"1": [{"id": 5, "name": "A", "color": ""}]}
+        r = a.lib_tag_add_batch("[1,2]", "[5]")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["count"], 2)
+        self.assertEqual(r["tags"], {"1": [{"id": 5, "name": "A", "color": ""}]})
+        self.assertIn(("add_tags", [1, 2], [5]), lib.calls)
+        a.lib_tag_remove_batch("[1]", "[5]")
+        self.assertIn(("remove_tags", [1], [5]), lib.calls)
+        bad = a.lib_tag_add_batch("[1]", "{坏")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["msg"], "标签参数格式错误")
+
+    def test_delete_batch_one_trash_call_and_skips_absent_files(self):
+        a, lib, _mod = self.make_api()
+        with TemporaryDirectory() as d:
+            p1 = os.path.join(d, "a.png")
+            p2 = os.path.join(d, "b.mp4")
+            make_png(p1)
+            with open(p2, "wb") as f:                    # 删除层只看文件在不在，不需要真视频
+                f.write(b"\x00\x00\x00\x18ftypmp42")
+            lib.items_by_id = {1: {"id": 1, "path": p1}, 2: {"id": 2, "path": p2},
+                               3: {"id": 3, "path": os.path.join(d, "gone.png")}, 4: None}
+            with patch.object(posix_compat, "IS_WINDOWS", True), \
+                 patch.object(webui, "_recycle_to_trash", return_value=True) as rec:
+                r = a.lib_delete_batch("[1,2,3,4,9]")
+            self.assertEqual((r["ok"], r["deleted"], r["missing"]), (True, 2, 3))
+            rec.assert_called_once_with([p1, p2])       # 一次调用带走整批，绝不带 sidecar
+            self.assertIn(("mark_gone", 1), lib.calls)
+            self.assertIn(("mark_gone", 2), lib.calls)
+            self.assertEqual([c for c in lib.calls if c[0] == "mark_gone" and c[1] in (3, 4, 9)], [])
+
+    def test_delete_batch_refuses_when_nothing_on_disk(self):
+        a, lib, _mod = self.make_api()
+        lib.items_by_id = {7: {"id": 7, "path": "C:/nope/x.png"}}
+        with patch.object(webui, "_recycle_to_trash") as rec:
+            r = a.lib_delete_batch("[7]")
+        self.assertFalse(r["ok"])
+        rec.assert_not_called()
+
+
+    def test_scan_state_msg_mentions_reparse_and_relinked(self):
+        """升级后第一轮扫描会重解析整片库（真实库 2792 条约 31s），不说明就像卡住了。"""
+        with TemporaryDirectory() as d:
+            a, lib, mod = self.make_api(media_roots=(d,))
+
+            def impl(roots, exclude, progress, cancel):
+                return {"roots": [{"path": d, "status": "ok", "count": 2792}], "total": 2792,
+                        "added": 0, "updated": 2035, "unchanged": 757, "missing": 0,
+                        "reparse": 2035, "relinked": 3, "errors": []}
+
+            lib.scan_impl = impl
+            self.assertTrue(a.lib_scan()["started"])
+            self.wait_scan_done(a)
+            msg = a.lib_scan_state()["msg"]
+            self.assertIn("升级后补解析 2035 项", msg)
+            self.assertIn("搬家已重连 3 项", msg)
+
+    def test_scan_state_msg_omits_zero_counts(self):
+        with TemporaryDirectory() as d:
+            a, lib, mod = self.make_api(media_roots=(d,))
+            lib.scan_impl = lambda roots, exclude, progress, cancel: {
+                "roots": [{"path": d, "status": "ok", "count": 1}], "total": 1, "added": 1,
+                "updated": 0, "unchanged": 0, "missing": 0, "reparse": 0, "relinked": 0, "errors": []}
+            self.assertTrue(a.lib_scan()["started"])
+            self.wait_scan_done(a)
+            msg = a.lib_scan_state()["msg"]
+            self.assertNotIn("补解析", msg)                # 平常的增量扫描不许显示升级文案
+            self.assertNotIn("搬家", msg)
+
+
+class TransferTests(LibRPCTestBase):
+    """§18 标注导出/导入的 RPC 层：只做形状、闸门与异常兜底，匹配逻辑在库层用例里。"""
+
+    def test_export_returns_document_and_count(self):
+        a, lib, _mod = self.make_api()
+        lib.export_val = {"kind": "cft-media-annotations", "version": 1,
+                          "tags": [{"name": "A", "color": "", "parent_path": []}],
+                          "items": [{"relpath": "x.png", "starred": 1}, {"relpath": "y.png", "starred": 0}]}
+        r = a.lib_export_annotations()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["count"], 2)
+        self.assertEqual(r["data"]["tags"][0]["parent_path"], [])   # data 原样透出，不重新加工
+        self.assertIn(("export_annotations",), lib.calls)
+
+    def test_export_failure_is_reported_not_raised(self):
+        a, lib, _mod = self.make_api()
+        lib.export_annotations = lambda: (_ for _ in ()).throw(RuntimeError("库坏了"))
+        r = a.lib_export_annotations()
+        self.assertFalse(r["ok"])
+        self.assertIn("库坏了", r["msg"])
+
+    def test_import_passthrough_dry_run_and_stats(self):
+        a, lib, _mod = self.make_api()
+        lib.import_val = {"matched": 3, "starred": 2, "tags_applied": 1, "tags_created": 1,
+                          "unmatched": 0, "ambiguous": 0, "dry_run": True}
+        r = a.lib_import_annotations('{"kind":"cft-media-annotations","items":[]}', True)
+        self.assertEqual((r["ok"], r["matched"], r["dry_run"]), (True, 3, True))
+        self.assertIn(("import_annotations", {"kind": "cft-media-annotations", "items": []}, True), lib.calls)
+        a.lib_import_annotations('{"kind":"cft-media-annotations","items":[]}', False)
+        self.assertIn(("import_annotations", {"kind": "cft-media-annotations", "items": []}, False), lib.calls)
+
+    def test_import_gates_bad_payloads(self):
+        a, lib, _mod = self.make_api()
+        # 真实库对不认识的档案一律回 msg；FakeLib 必须照此行事，否则空档案会被默认值蒙过去
+        lib.import_val = {"msg": "文件不是资源库标注导出", "matched": 0, "dry_run": True}
+        for bad in ("", "{}", "not json", "[1,2,3]"):
+            self.assertFalse(a.lib_import_annotations(bad, True)["ok"], bad)
+        self.assertEqual([c for c in lib.calls if c[0] == "import_annotations" and c[1] == [1, 2, 3]],
+                         [])                                   # 顶层是数组：RPC 层就挡住，不进库
+        huge = json.dumps({"kind": "cft-media-annotations", "pad": "A" * (33 * 1024 * 1024)})
+        r = a.lib_import_annotations(huge, True)
+        self.assertFalse(r["ok"])
+        self.assertIn("过大", r["msg"])
+
+    def test_library_rejection_is_never_reported_as_success(self):
+        a, lib, _mod = self.make_api()
+        lib.import_val = {"msg": "文件不是资源库标注导出", "matched": 0, "dry_run": True}
+        r = a.lib_import_annotations('{"kind":"别的","items":[]}', True)
+        self.assertFalse(r["ok"])                      # 带着 msg 的答复绝不能算成功
+        self.assertEqual(r["msg"], "文件不是资源库标注导出")
+
+    def test_import_reports_zero_match_and_exceptions(self):
+        a, lib, _mod = self.make_api()
+        lib.import_val = {"matched": 0, "unmatched": 5, "dry_run": True}
+        r = a.lib_import_annotations('{"kind":"cft-media-annotations","items":[]}', True)
+        self.assertTrue(r["ok"])                      # 试算本身就是成功的答复，matched=0 不算失败
+        self.assertEqual(r["unmatched"], 5)
+        lib.import_val = {"matched": 0, "unmatched": 5, "dry_run": False}
+        self.assertFalse(a.lib_import_annotations('{"kind":"cft-media-annotations","items":[]}', False)["ok"])
+
+        def boom(payload, dry_run=False):
+            raise RuntimeError("写库失败")
+        lib.import_annotations = boom
+        r = a.lib_import_annotations('{"kind":"cft-media-annotations"}', False)
+        self.assertFalse(r["ok"])
+        self.assertIn("写库失败", r["msg"])
 
 
 if __name__ == "__main__":

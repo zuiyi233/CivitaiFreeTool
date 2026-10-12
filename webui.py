@@ -4859,6 +4859,7 @@ class Api:
     # （同 get_scan_rows：js_api 大 list 转换会卡死桥接）。
     _MEDIA_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")      # 兜底用（§3.1，优先取模块常量）
     _MEDIA_VID_EXTS = (".mp4", ".mov", ".webm", ".mkv")
+    _LIB_BATCH_MAX = 2000                              # 单次批量 RPC 的 id 上限，前端按 500 一片
 
     def _media_lib(self):
         """懒建媒体库实例；media_library.db_path() 变化即重建（测试 patch config.APP_DIR 依赖这条）。"""
@@ -5005,10 +5006,16 @@ class Api:
                 st["phase"] = "done"
                 st["msg"] = "扫描完成：新增 %s · 更新 %s · 共 %s" % (
                     res.get("added", 0), res.get("updated", 0), res.get("total", 0))
+                if int(res.get("reparse") or 0) > 0:
+                    # 提取语义升级后的第一轮扫描会重解析整片库（真实库 2792 条约 31s），
+                    # 不说明的话看起来像卡住或像扫描逻辑坏了
+                    st["msg"] += "（升级后补解析 %s 项新字段）" % res.get("reparse")
                 skipped = [s for s in (res.get("skipped_roots") or []) if isinstance(s, dict)]
                 if skipped:
                     st["msg"] += "（重叠目录已跳过 %d 个：%s）" % (
                         len(skipped), "、".join(str(s.get("path") or "") for s in skipped[:3]))
+                if int(res.get("relinked") or 0) > 0:
+                    st["msg"] += "（目录搬家已重连 %s 项的收藏与标签）" % res.get("relinked")
                 self._lib_last_scan_at = time.time()
             except Exception as e:
                 st["msg"] = "扫描失败: %s" % e
@@ -5090,6 +5097,9 @@ class Api:
         if not isinstance(d, dict):
             return json.dumps({"ok": False, "msg": "条目不存在"}, ensure_ascii=False)
         out = self._lib_enrich(d)
+        seed = out.get("seed")
+        if isinstance(seed, int) and abs(seed) > 2 ** 53:
+            out["seed"] = str(seed)          # JS 的 number 超过 2^53 会掉精度，改用字符串原样呈现
         out["exists"] = bool(out.get("path")) and os.path.isfile(out["path"])
         img_exts, _ = self._lib_exts()
         if img_exts and os.path.splitext(str(out.get("path") or ""))[1].lower() in img_exts:
@@ -5192,6 +5202,116 @@ class Api:
             return {"ok": False, "msg": "标签参数格式错误"}
         tags = self._media_lib().set_tags(item_id, ids)
         return {"ok": True, "tags": tags if tags is not None else []}
+
+    def _lib_batch_ids(self, ids_json):
+        """批量 RPC 的入参闸门：必须是 id 数组，且单次有上限（前端按 500 一批分片）。"""
+        try:
+            raw = json.loads(ids_json or "[]")
+        except Exception:
+            return None, "参数格式错误"
+        if not isinstance(raw, list):
+            return None, "参数必须是数组"
+        ids = []
+        for x in raw:
+            try:
+                n = int(x)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in ids:
+                ids.append(n)
+        if not ids:
+            return None, "未选择任何条目"
+        if len(ids) > self._LIB_BATCH_MAX:
+            return None, "单次最多 %d 项，请分片提交" % self._LIB_BATCH_MAX
+        return ids, ""
+
+    def lib_set_star_batch(self, ids_json, on):
+        ids, msg = self._lib_batch_ids(ids_json)
+        if ids is None:
+            return {"ok": False, "msg": msg, "count": 0}
+        return {"ok": True, "count": int(self._media_lib().set_starred(ids, bool(on)) or 0)}
+
+    def lib_tag_add_batch(self, ids_json, tag_ids_json):
+        return self._lib_tag_batch(ids_json, tag_ids_json, add=True)
+
+    def lib_tag_remove_batch(self, ids_json, tag_ids_json):
+        return self._lib_tag_batch(ids_json, tag_ids_json, add=False)
+
+    def _lib_tag_batch(self, ids_json, tag_ids_json, add):
+        ids, msg = self._lib_batch_ids(ids_json)
+        if ids is None:
+            return {"ok": False, "msg": msg, "tags": {}}
+        try:
+            tag_ids = json.loads(tag_ids_json or "[]")
+        except Exception:
+            return {"ok": False, "msg": "标签参数格式错误", "tags": {}}
+        lib = self._media_lib()
+        tags = lib.add_tags(ids, tag_ids) if add else lib.remove_tags(ids, tag_ids)
+        return {"ok": True, "count": len(ids), "tags": tags or {}}
+
+    def lib_export_annotations(self):
+        """§18 导出收藏与标签：返回 {ok, data}，data 由前端存成 .json 文件（身份键是库内相对路径）。"""
+        try:
+            data = self._media_lib().export_annotations()
+        except Exception as e:
+            return {"ok": False, "msg": "导出失败: %s" % e}
+        return {"ok": True, "count": len(data.get("items") or []), "data": data}
+
+    def lib_import_annotations(self, payload_json, dry_run=True):
+        """§18 导入标注档案：默认先试算（dry_run），前端确认后才写。只补不删。"""
+        try:
+            payload = json.loads(payload_json or "{}")
+        except Exception:
+            return {"ok": False, "msg": "档案格式错误（不是 JSON）"}
+        if not isinstance(payload, dict):
+            return {"ok": False, "msg": "档案格式错误（顶层不是对象）"}
+        if len(json.dumps(payload)) > 32 * 1024 * 1024:
+            return {"ok": False, "msg": "档案过大（>32MB）"}
+        try:
+            stats = self._media_lib().import_annotations(payload, bool(dry_run))
+        except Exception as e:
+            return {"ok": False, "msg": "导入失败: %s" % e}
+        if stats.get("msg"):
+            return dict({"ok": False}, **stats)      # 库层认出的坏档案绝不能报成功
+        return dict({"ok": bool(stats.get("matched", 0) > 0 or stats.get("dry_run"))}, **stats)
+
+    def lib_delete_batch(self, ids_json):
+        """批量删除：一次回收站调用 + 逐行 mark_gone；只回收媒体本体，绝不连带共用的 .json。"""
+        ids, msg = self._lib_batch_ids(ids_json)
+        if ids is None:
+            return {"ok": False, "msg": msg, "deleted": 0}
+        lib = self._media_lib()
+        paths = []
+        hit = []
+        missing = 0
+        for item_id in ids:
+            item = lib.get_item(item_id)
+            if not isinstance(item, dict):
+                missing += 1
+                continue
+            p = str(item.get("path") or "").strip()
+            if not p or not os.path.isfile(p):
+                missing += 1
+                continue
+            paths.append(p)
+            hit.append((item_id, p))
+        if not hit:
+            return {"ok": False, "msg": "选中项都没有可删除的文件", "deleted": 0}
+        try:
+            if posix_compat.IS_WINDOWS:
+                ok = _recycle_to_trash([p for _i, p in hit])
+            else:
+                ok = posix_compat.trash([p for _i, p in hit])
+        except Exception as e:
+            return {"ok": False, "msg": "删除失败: %s" % e, "deleted": 0}
+        if not ok:
+            return {"ok": False, "msg": "删除失败", "deleted": 0}
+        for item_id, _p in hit:
+            try:
+                lib.mark_gone(item_id)
+            except Exception:
+                pass                             # 文件已进回收站，行标记失败不回滚删除
+        return {"ok": True, "deleted": len(hit), "missing": missing}
 
     def lib_tags(self):
         return json.dumps(self._media_lib().list_tags() or [], ensure_ascii=False)

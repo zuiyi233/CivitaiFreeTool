@@ -428,6 +428,129 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 - 冻结产物复验（`dist/CivitaiFreeToolWeb.exe`，2.6.27 版本资源已同步）：浏览器模式真实页面重扫得「新增 0 · 更新 0 · 共 2792」，首屏 200 卡，§13.14 的根作用域生效（3 行幽灵不再出现），控制台仅字体 `Slow network` info、无 error。
 - **未覆盖**：内置浏览器 `visibilityState=hidden` 且视口高度为 0，截图与「IntersectionObserver 真实进视口」这两步只能以结构证据代替；像素级观感（卡片间距、角标位置、明暗主题下的对比）需人工开一次窗口确认。
 
+## 15. 功能完善第二轮（v1.2，2026-10-12 实测驱动）
+
+### 15.0 实测依据（真实库重扫进临时库，2792 条在场）
+
+| 项 | 实测 |
+|---|---|
+| 容器分布 | png 1503 / jpg 756 / mp4 532 / gif 1，**webm/mkv 为 0 个** |
+| jpg 实况 | 756 张全为 `sha256_<64hex>.jpg`（合计 39.3MB），首 4KB 无 Exif / XMP / C2PA / ComfyUI 任何标记，`has_meta=0` |
+| 参数覆盖（键存在 ≠ 有值） | seed 520/2792、steps 1022、sampler 1022、scheduler 1022、cfg 1289；**视频 532 条五项全为 0** |
+| 时长 | 视频 532/532 有 duration，min 4.46 / 中位 8.00 / max 30.67 秒 → 时长口径已够，**fps 全缺** |
+| negative | 29/2792（1%），现代工作流确实不写负面提示词 |
+| 尺寸 | width/height 100% 有值，Top：768x1280(768) 307x512(742) 480x864(278) 832x1248(262) 608x1056(116) 832x1216(118) 1024x1024(112) |
+| mp4 内层 | 426/532 有 `meta_source`（comment 命中），其中 354 有提示词、420 有底模 |
+
+### 15.1 `media_meta.py`：参数按字段名回收 + fps（D1）
+
+复用 §13.1 的「纯字段名 + 值域校验」层，只补参数，**不改链式优先级**：`comfy_generation` 链式已给出值的字段一律不动，字段名层只在字段为空时填。
+
+1. 候选字段名（大小写不敏感、两端去空白）与值域：
+   - `seed` ← `seed|noise_seed|rand_seed|random_seed`，`_as_int` 且 `0 <= v < 2**64`；
+   - `steps` ← `steps|num_steps|sampling_steps|step_count`，int 且 `1..10000`；
+   - `cfg` ← `cfg|cfg_scale|guidance_scale|true_cfg_scale`，float 且 `0..100`；
+   - `sampler` ← `sampler|sampler_name|sample_type|solver`，值须落在 `KNOWN_SAMPLERS`（按小写比较）；
+   - `scheduler` ← `scheduler|noise_schedule|schedule`，值须落在 `KNOWN_SCHEDULERS`。
+2. **先测后定表**：`KNOWN_SAMPLERS` / `KNOWN_SCHEDULERS` 取「真实库实测出现值 ∩ 看起来就是采样器/调度器的形式」与 ComfyUI 官方枚举的并集，提交说明里必须给出实测命中数；表外的值不采用、不猜。
+3. 诚实性：同一文件里同名字段出现**两个以上不同值**时不选边——字段留空，并把冲突写进 `note`（文案模板：`工作流里有 N 个不同的 <字段>，未按字段名猜测。`），链式结果不受影响。
+4. provenance：`extra.params_source` = `chain|field_name`（任一参数由字段名层填入即为 `field_name`）；`extra.params_fields` 列出实际命中的字段名，供 UI 如实标注。
+5. fps：`read_mp4_meta` 顺路读视频轨（`hdlr == 'vide'` 或 `tkhd` 宽 > 0）的 `mdhd`(timescale) 与 `stts`，`fps = 采样数合计 / (delta 合计 / timescale)`，保留 3 位小数；拿不到就是 `None`，**不得**默认 30。
+6. `blank_result()` 必须新增 `"fps": None`——所有输出键恒定存在，否则写库与详情会炸。
+
+### 15.2 `media_library.py`：schema v2、筛选与分面（D2）
+
+1. 新列：`seed INTEGER`、`steps INTEGER`、`cfg REAL`、`sampler TEXT NOT NULL DEFAULT ''`、`scheduler TEXT NOT NULL DEFAULT ''`、`fps REAL`；建表 SQL 里同步，`PRAGMA user_version = 2`。
+2. 迁移（**禁止**要求用户删库重扫）：对 v1 库逐列 `ALTER TABLE items ADD COLUMN`（重复列名吞掉），再用 `json_extract(extra_json,'$.seed')` 等回填；JSON1 不可用时把该行 `meta_mtime` 置 0，交给下次增量扫描重解析。
+3. 新索引（partial，`WHERE missing_since IS NULL`）：`ix_items_sampler`、`ix_items_scheduler`。
+4. `_build_where` 新维度，全部 bind 参数、同维度 OR、跨维度 AND：`samplers` / `schedulers` 列表 → `sampler IN (%s)`；`sizes` 列表（形如 `"768x1280"`，先按 `^\d+x\d+$` 校验再拆）→ OR 连接的 `(width = ? AND height = ?)` 组；`duration_min` / `duration_max` → `duration >= ?` / `duration <= ?`（非法值忽略该维度，不报错）。
+5. `facets(root_ids=None)` 新增 `samplers` / `schedulers` / `sizes`，形状与 `checkpoints` 完全一致：`[{"name","count"}]`（sizes 的 name 是 `"WxH"`），`count DESC, name ASC`、`FACET_LIMIT=300`、只统计在场文件并与 `list_items` 同 root_ids 作用域。
+6. 写库路径（行构造 / upsert）带上 6 个新键；`list_items` 若有显式列清单要同步补齐，行里直接给列值。`detail()` 以列为准、列为空时回落 `extra_json`（既有 29 条 negative 等的展示口径不能退化）。
+
+### 15.3 前端（D3：`web/app.js` / `web/index.html` / `web/style.css` / `web/workbench.css`）
+
+1. 左栏在底模 / LoRA 分面之后加**采样器 / 调度器 / 尺寸**三组，复用既有 `.lib-facet-*` 与 chip 多选交互（同维度多选 = OR），计数取 facets；筛选区加时长上下限两个 `number` 输入（单位秒，留空 = 不限）。
+2. `lib.filter` 的新键名与服务端严格一致：`samplers` / `schedulers` / `sizes` / `duration_min` / `duration_max`；筛选生效时统计条继续显示「筛选 N 项 / 共 M 项」。
+3. 详情参数区：种子 / 步数 / CFG / 采样器 / 调度器 / 帧率 / 时长 **只在有值时渲染**；`extra.params_source == 'field_name'` 时给该组标注「按字段名提取」（沿用提示词的文案与样式）。
+4. 一切 metadata 派生字符串过 `esc()`；不新增硬编码颜色，只用现有主题 token；`node --check web/app.js` 必须过。
+
+### 15.4 本轮明确不做（取舍写死）
+
+- **EBML（webm/mkv）元数据**：真实库 0 条，写出来没有验收样本；等真出现样本再做，届时扩展名白名单与 §3.1 一起改。
+- **JPEG EXIF/XMP 解析器**：756 张全是无标记的 `sha256_*.jpg`，为它们造解析器零收益。
+- **自动标签（底模即标签）**：沿用 §13.12 的两份真相问题，不做。
+- **伪造 negative**：现代工作流确实没有负面提示词（29/2792），不从采样参数以外的地方凑。
+
+## 16. 第二轮补充口径（自愈、批量与偏差确认，2026-10-12）
+
+### 16.1 提取语义版本自愈（`media_meta.EXTRACT_VERSION` = 2）
+
+只加列不重扫是不够的：增量扫描按 mtime+size 对账，**文件没改就永不重解析**，而参数回收与 fps 只有新提取器才产出。所以库层记一个 `meta.extract_version`，落后于 `media_meta.EXTRACT_VERSION` 时把待补的行 `meta_mtime=0`，本轮扫描顺路重解析；版本**只在一轮完整扫描后**落盘（取消/崩溃的那轮不算，下轮继续补，代价是已补过的行再解析一次——解析幂等，有界）。
+
+- 重解析范围：`NOT (kind='image' AND has_meta=0)`，即无元数据的下载图/gif 不值得重扫。
+- 真实库实测：v1 库打开即迁移 **0.36s**（逐列核对：老列一列未变，只加列 + 从 `extra_json` 回填）；自愈扫描 **31.1s**，重解析 2035 行、跳过 757 行、errors 0；第二轮扫描 **182ms**，`reparse=0 updated=0 unchanged=2792`。
+- 自愈后的覆盖率与全新库**逐字段相等**：seed 1907(68%)、steps 1659(59%)、cfg 1289(46%)、sampler 1722(62%)、scheduler 1653(59%)、fps 532/532（视频全覆盖）。对照回收前：seed 520(19%)、steps/sampler/scheduler 各 1022(37%)、fps 0。
+- 31s 比全新扫描 7.5s 慢，是因为走的是 2035 行 `UPDATE` + FTS 逐行 delete/insert 的改写路径（写库在同一事务里 `executemany`，不是逐行提交）；这是一次性代价，且进度可见、可取消。
+
+### 16.2 批量操作（§15 之后的第二轮 UI）
+
+新增 4 个 RPC，`idsJson` 一律是 id 数组的 JSON 字符串，服务端单次上限 `_LIB_BATCH_MAX = 2000`，前端按 500 一片分片：
+
+| 方法 | 返回 | 语义 |
+|---|---|---|
+| `lib_set_star_batch(idsJson, on)` | `{ok, count}` | 一条 `UPDATE` 覆盖整批，`count` = 库里真实存在的行数 |
+| `lib_tag_add_batch(idsJson, tagIdsJson)` | `{ok, count, tags}` | **并集**，不动条目原有标签；库里不存在的 `tag_id` 直接忽略 |
+| `lib_tag_remove_batch(idsJson, tagIdsJson)` | `{ok, count, tags}` | 只摘指定的那几个 |
+| `lib_delete_batch(idsJson)` | `{ok, deleted, missing}` | **一次**回收站调用带走整批 + 逐行 `mark_gone`；仍绝不连带共用 `.json` |
+
+`tags` 是 `{item_id: [{id,name,color}]}`（§5.1 形状）。闸门在委托之前：非数组、空数组、坏 JSON、全是非正整数都直接 `ok:false`，一次库调用都不发。
+
+### 16.3 本轮偏差与语义确认
+
+1. **分面 chip 是新建的**：契约 §15.3 说「复用既有 `.lib-facet-*`」，但仓库里此前**没有**这套 DOM/类（底模/LoRA 是单选 `<select>`）。实际落地为新建 `.lib-facet-group/-title/-opts/-empty/-chip`，chip 本体与选中态复用既有 `.lib-chips` / `.lib-chip[aria-pressed]` / `.lib-chip-x`；资源库页也没有「左栏」，三组分面放在筛选 row3 之后的新行。
+2. **时长区间会把图片整维滤掉**：`duration >= ?` 对 `duration IS NULL` 的图片恒不成立，这是既定语义（图片没有时长字段），界面必须在输入框旁写明「只匹配视频」。实测：真实库 `duration_min=5, duration_max=10` → 429 项，全是视频。
+3. **`meta.db_version` 随 `user_version` 一起记为 "2"**（§3.2 未钉死，本轮确认）。
+4. **迁移必须 `rebuild` FTS**：v1 库的 `items` 先于 `items_fts` 存在时，external-content 索引是空的，重解析的 `UPDATE` 触发器要 `'delete'` 一个不存在的 rowid，sqlite 直接 `database disk image is malformed`。已在 `_ensure_schema` 里对「表本来就有行、FTS 表新建」的情况补 `INSERT INTO items_fts(items_fts) VALUES('rebuild')`。
+5. **超大 seed 的精度**：JS number 超过 2^53 会掉精度，`lib_detail` 对这种值改发字符串。真实库实测 **0 行**超过 2^53（最大 seed 1.0e15），所以这只是防御性口径，不改变现有数据显示。
+6. **超出 int63 的 seed 不进列**：sqlite INTEGER 是 63 位，这类值列留 NULL、原值仍在 `extra_json` 由 `detail()` 回落展示，避免整批 `executemany` 抛 OverflowError。
+
+
+
+## 17. 目录搬家重连（`MediaLibrary.relink_moved_roots`）
+
+独立审计在真实库结构上找到的隐患：条目身份是 `path UNIQUE` + `root_id = sha1(abspath)`，而用户的库目录名里带版本号（`D:\ComfyUI_Mie_2026_V8.0\ComfyUI\output`）。目录一旦改名/换盘符/换机器，旧行整体失去作用域，新行是全新 id，**收藏与标签整片留在旧行上陪葬**——用户看到的是一个"清空了策展"的库。
+
+规则（写死，不许放宽）：
+
+1. 触发时机：`scan()` 完整走完、判缺失之后，按本次扫描的根调用；结果回 `result["relinked"]`，扫描完成文案追加「目录搬家已重连 N 项的收藏与标签」。
+2. 候选：`o.root_id` **不在**本次扫描的根里（旧根已移出配置）+ 另一个在管根里有 `relpath`、`size`、`ext` 全等的在场行。为此新增 `ix_items_relpath`（否则 sqlite 每次为 join 现造自动索引，实测 2792 行 27ms，万级会退化）。
+3. 必须是"搬家"而不是"两套库"：旧行 `path` 指向的文件**还在磁盘上**就一律不动（实测反例 `relinked=0`）。
+4. 歧义不猜：一个旧行对上多个新行、或一个新行被多个旧行争，都跳过（实测：把同一份文件同时放进两个在管根 → `relinked=0`，新行谁也没收到收藏）。
+5. **只复制不删旧行**：移出配置的根按 §13.14 是故意保留的（加回即恢复），删旧行会打破这条承诺。
+6. 复制内容 = `starred` 与 `item_tags`（`INSERT OR IGNORE`，幂等）；海报不跟随（按 abspath 散列），新行首次进视口重新抓帧。
+7. 实测（真实索引副本，relpath/size 取真实值）：搬家扫描 0.28s 重连 3 行，收藏与标签都落到新行，旧行仍在库里，作用域内总数 2789。重复导入/重复扫描幂等。
+
+## 18. 标注导出与导入（`export_annotations` / `import_annotations`）
+
+收藏与标签目前只活在 `media_library.db` 一个文件里：文件损坏、误删、换机、`purge_missing` 都会连带丢掉策展成果，且没有任何出路。本期补一条**只含人工标注**的导出/导入通路（机器解析出的元数据不属于它，重扫就能拿回来）。
+
+1. 档案形状：`{kind:"cft-media-annotations", version:1, exported_at, tags:[{name,color,parent_path:[祖先名…]}], items:[{relpath,filename,ext,size,starred,tags:[名字]}]}`。`items` 只包含 `starred=1` 或有任何标签的行。
+2. **身份键是 `relpath` + `size`，不是绝对路径**——与 §17 同一条思路，目录改名后档案仍认得回来。`size` 对不上时退回"`relpath` 唯一命中"；仍不唯一就记 `ambiguous` 不猜；库里没有的记 `unmatched`。
+3. `parent_path` 是**祖先名字列表**，不是 `"父/子"` 字符串：标签名本身可以含 `/`，拼串再拆会把一层拆成两层（实测踩过并修掉）。
+4. 导入**只补不删**：绝不取消库里已有的收藏或标签；同名标签按名字合并；缺失的标签（含祖先）按档案里的名字与颜色新建。
+5. `dry_run` 先行，且**试算计数必须与真写一致**（祖先层也要计数，否则预览少报）；`unmatched`/`ambiguous` 如实回报，不静默丢弃。
+6. RPC：`lib_export_annotations()` → `{ok,count,data}`；`lib_import_annotations(payload_json, dry_run)` → `{ok,…stats}`。闸门：非 JSON、顶层非对象、>32MB 直接拒；库层返回带 `msg`（不是本程序的档案）时 `ok` 必须为 `false`——**坏档案不许报成功**（这条是用例抓出来的：早期实现因 `dry_run=True` 把它算成成功）。
+7. 前端：导出走 Blob + `a.download`（复用 `image-viewer.js` 已验证的下载写法，两种界面模式都可用）；导入 = 选文件 → 试算 → 展示六个计数 → 确认才真写 → 刷新列表/分面/标签下拉。
+8. 实测（真实索引副本，40 条标注 + 父子标签）：导出 23ms / 6.3KB；试算 38ms 与真写 45ms 的 `{matched:40, starred:40, tags_applied:30, tags_created:2, unmatched:0, ambiguous:0}` 完全一致；清空收藏与标签后导入全部恢复（含颜色与父级）；重复导入幂等。
+
+## 19. 本轮明确留观察的项（不实现）
+
+- **同路径文件被就地替换且 mtime 不比旧值大**：对账只看 size+mtime，无内容哈希，元数据不会刷新。真实库里 756 张下载图按 sha256 命名不受影响，属低概率；补哈希的成本是每次扫描多读整片文件。
+- **`facets()` 的 loras 逐行 Python 解析**：2792 行 ~60ms 无压力，触及设计自设的 10 万级上限时才需要 EAV facts 索引（§3.2 已缓期的那条）。
+- **include/exclude 分面、批次聚合、对比视图、CLIP 以图搜图**：前者在 2792 规模收益不明确；后者要下模型跑 GPU，与本功能"stdlib + Pillow"的边界冲突，是另一个产品。
+- **§15.4 的取舍维持不变**（webm/mkv=0 条、jpg 全为无标记下载图、negative 仅 1% 不伪造、自动标签两份真相不做）。
+
+
 
 ## 12. 补充钉死（A4/A5 共用，与 §6/§9 同权重）
 
