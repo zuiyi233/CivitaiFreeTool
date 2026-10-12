@@ -84,3 +84,11 @@ gallery_cache/
 
 # 本机私人资料，不属于项目源码
 /AI绘画文档/
+
+# ===== 参考项目（对照用克隆，不入库）=====
+reference/
+
+# ===== 本地编码代理/IDE 工作目录 =====
+.serena/
+.zcode/
+.zcode-scan-rows.json
