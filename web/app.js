@@ -1894,12 +1894,17 @@ function _startCarousel(card, path) {
   const st = { timer: null, cur: null };   // cur 必须回写，_stopCarousel 才能清叠层/暂停视频
   _masonryCarousel.set(card, st);
   const mount = (el) => {
-    if (cur) { if (cur.tagName === "VIDEO") { try { cur.pause(); } catch (_) {} } cur.remove(); cur = null; }
+    // 归属检查：本轮已经 _stopCarousel 过（鼠标移开）而预载才回来时，绝不能把帧挂上去——
+    // 那会在卡片上留下一张没人负责清理的孤儿叠图，直到下次重渲染才消失。
+    if (_masonryCarousel.get(card) !== st) { if (el.tagName === "VIDEO") { try { el.pause(); } catch (_) {} } return false; }
+    wrap.querySelectorAll(".ms-img-alt").forEach((n) => { if (n.tagName === "VIDEO") { try { n.pause(); } catch (_) {} } n.remove(); });  // 一律清干净，叠层只允许一张
     wrap.append(el); cur = el; st.cur = el;
-    requestAnimationFrame(() => { if (cur === el) el.style.opacity = "1"; });  // .ms-img-alt 默认 opacity:0，淡入
+    requestAnimationFrame(() => { if (cur === el && _masonryCarousel.get(card) === st) el.style.opacity = "1"; });
+    return true;
   };
   const tick = () => { if (!card.isConnected) { _stopCarousel(card); return; } if (loading) return; show(); };
-  const rearm = () => { clearInterval(st.timer); st.timer = setInterval(tick, _MM_CAROUSEL_MS); };  // 以挂载时刻重排，保证每帧驻留均匀
+  const rearm = () => { if (_masonryCarousel.get(card) !== st) return;  // 停播后回来的帧不再排下一拍，否则留下一个没人回收的定时器
+    clearInterval(st.timer); st.timer = setInterval(tick, _MM_CAROUSEL_MS); };  // 以挂载时刻重排，保证每帧驻留均匀
   const show = () => {
     for (let tries = 0; tries < list.length; tries++) {
       if (idx >= list.length) idx = 1;
@@ -1912,8 +1917,7 @@ function _startCarousel(card, path) {
         v.playsInline = true; v.preload = "metadata"; v.style.opacity = "1";
         v.onerror = () => { if (cur === v) { try { v.pause(); } catch (_) {} v.remove(); if (cur === v) cur = null; } };
         v.src = src;
-        mount(v);
-        const p = v.play && v.play(); if (p && p.catch) p.catch(() => {});
+        if (mount(v)) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); }
         idx = idx + 1; rearm(); return;
       }
       if (/^data:/i.test(src)) {
@@ -1955,8 +1959,10 @@ function _stopCarousel(card) {
   const st = _masonryCarousel.get(card);
   if (!st) return;
   clearInterval(st.timer);
-  if (st.cur) { if (st.cur.tagName === "VIDEO") { try { st.cur.pause(); } catch (_) {} } st.cur.remove(); }
-  _masonryCarousel.delete(card);
+  _masonryCarousel.delete(card);   // 先摘登记：在途的预载回来时 mount() 会发现归属已变而丢弃这一帧
+  const wrap = card.querySelector(".ms-img-wrap") || card;
+  wrap.querySelectorAll(".ms-img-alt").forEach((n) => { if (n.tagName === "VIDEO") { try { n.pause(); } catch (_) {} } n.remove(); });  // 按 DOM 清而不是只清 st.cur：历史上漏掉的孤儿叠图也顺手治好
+  st.cur = null;
 }
 document.addEventListener("mouseover", (e) => {
   const card = e.target && e.target.closest ? e.target.closest("#mmMasonry .ms-card") : null;

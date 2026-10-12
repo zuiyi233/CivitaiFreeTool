@@ -73,6 +73,26 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
   await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length===0,null,{timeout:4000});
   ok('移开鼠标后叠层帧清理干净');
 
+  // 慢网：预载帧在鼠标移开之后才回来。旧写法 _stopCarousel 只清当前那张叠层，不取消在途预载，
+  // 晚到的帧会挂到已经停播的卡片上变成永久孤儿图（实测叠层数 2→移开后仍剩 1）。
+  await page.evaluate(()=>{const Real=window.Image;
+    window.Image=function(){const el=new Real();let s='';
+      Object.defineProperty(el,'src',{set(v){s=v;setTimeout(()=>el.dispatchEvent(new Event('load')),1200);},get(){return s;}});return el;};
+    window.__restoreImage=()=>{window.Image=Real;};});
+  await page.evaluate(()=>{document.querySelector('.content').scrollTop=0;});
+  await page.locator('.ms-card').first().hover({position:{x:60,y:60}});
+  await page.waitForTimeout(250);
+  assert.equal(await page.evaluate(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length),0,'预载未回来前不该有叠层');
+  await page.mouse.move(8,8);
+  await page.waitForTimeout(2400);
+  assert.equal(await page.evaluate(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length),0,'移开后晚到的预载帧挂成了孤儿叠图');
+  await page.evaluate(()=>window.__restoreImage());
+  await page.locator('.ms-card').first().hover({position:{x:60,y:60}});
+  await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-card:first-child .ms-img-alt').length===1,null,{timeout:6000});
+  await page.mouse.move(8,8);
+  await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length===0,null,{timeout:4000});
+  ok('移开鼠标后晚到的预载帧不挂图，之后重新 hover 仍能正常起播收摊');
+
   // hover 兜底：缓存里没这帧（例如还没滚到就先 hover）时，当场补一次请求并起播
   await page.evaluate(p=>{state.coverCacheMulti.delete(p);_multiTried.delete(p);document.querySelector('.content').scrollTop=0;},
                       await page.evaluate(()=>window.fixturePaths[0]));
