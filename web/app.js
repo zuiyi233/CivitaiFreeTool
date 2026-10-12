@@ -1849,7 +1849,7 @@ async function prefetchMultiForCards(cards) {
     const raw = await api.call("get_covers_multi", need);
     const multi = (typeof raw === "string") ? JSON.parse(raw || "{}") : (raw || {});
     if (multi && typeof multi === "object") {
-      if (state.coverCacheMulti.size > 4000) state.coverCacheMulti.clear();
+      if (state.coverCacheMulti.size > 4000) { state.coverCacheMulti.clear(); _multiTried.clear(); }   // 两个集合必须一起清：只清缓存会让 _multiTried 把老路径永久挡在门外
       for (const [p, list] of Object.entries(multi)) {
         if (!Array.isArray(list) || !list.length) continue;
         // 帧格式 [[src, isVideo], ...]：src 为 dataURI（本地）或 https/file URL（远程/落盘视频），原样使用
