@@ -22,6 +22,13 @@ MAX_SIDECAR_BYTES = 8 * 1024 * 1024      # sidecar JSON 上限
 MAX_EXTRA_BYTES = 64 * 1024              # extra 摘要上限
 MAX_BOXES = 20000                        # mp4 单窗口盒数量防失控
 MAX_DEPTH = 8
+# stts 的 entry 数来自文件声明：几百 MB 的视频也只该有几十条，异常声明必须封顶，
+# 否则一个伪造的 4 字节计数会让解析循环把扫描线程吃掉。
+MAX_STTS_ENTRIES = 100000
+
+# 提取语义版本：这层一变，老行就必须重解析才能拿到新字段（media_library 据此决定要不要
+# 把 meta_mtime 清零重扫）。v2 = §15.1 的参数按字段名回收 + stts 帧率。
+EXTRACT_VERSION = 2
 
 IMAGE_EXTS = (".png", ".webp", ".jpg", ".jpeg", ".gif")
 
@@ -30,7 +37,7 @@ PNG_TEXT_TYPES = ("tEXt", "zTXt", "iTXt")
 
 RESULT_KEYS = ("has_meta", "source", "prompt", "negative", "note", "checkpoint", "loras",
                "models", "sampler", "scheduler", "seed", "steps", "cfg",
-               "width", "height", "duration", "extra")
+               "width", "height", "duration", "fps", "extra")
 
 # mp4 的盒类型只有 4 字节，写不出 comment/prompt 全称：QuickTime/iTunes 用 ©cmt/©des，
 # ffmpeg 的自由元数据键只保留前 4 个字符。故统一归一到四个逻辑标签名，再按
@@ -58,6 +65,42 @@ _FIELD_PROMPT = ("prompt", "text", "caption", "positive_text")
 _FIELD_PROMPT_SKIP = ("note", "markdown", "text panel", "comfyui-textpanel",
                       "reroute", "anythingindex")
 MAX_FALLBACK_PROMPT_CHARS = 4000
+
+# 参数回收（契约 §15.1）：候选字段名 + 值域照抄 §15.1.1。链式已给出值的字段一律不动，
+# 这一层只在字段为空时填；同名字段有两个以上不同有效值时不选边（§15.1.3）。
+PARAM_FIELDS = ("seed", "steps", "cfg", "sampler", "scheduler")
+_PARAM_SPEC = (
+    ("seed", ("seed", "noise_seed", "rand_seed", "random_seed"), "int", 0, 2 ** 64 - 1),
+    ("steps", ("steps", "num_steps", "sampling_steps", "step_count"), "int", 1, 10000),
+    ("cfg", ("cfg", "cfg_scale", "guidance_scale", "true_cfg_scale"), "float", 0.0, 100.0),
+    ("sampler", ("sampler", "sampler_name", "sample_type", "solver"), "sampler", None, None),
+    ("scheduler", ("scheduler", "noise_schedule", "schedule"), "scheduler", None, None),
+)
+_PARAM_BY_NAME = {candidate: (field, kind, lo, hi)
+                  for field, candidates, kind, lo, hi in _PARAM_SPEC for candidate in candidates}
+
+# 表外值一律不采用（§15.1.2）：真实库实测出现值 ∪ ComfyUI 官方枚举。
+# 实测（2792 条在场、1676 条有空参数）：sampler 只有 euler(790) res_multistep(364) er_sde(180)
+# euler_ancestral(138)，scheduler 只有 simple(1172) beta57(152) beta(65) sgm_uniform(14)，
+# 全部落在下面的表里；官方枚举取自安装的 ComfyUI：comfy/samplers.py 的
+# SAMPLER_NAMES = KSAMPLER_NAMES + ["ddim","uni_pc","uni_pc_bh2"] 与 SCHEDULER_NAMES =
+# list(SCHEDULER_HANDLERS)。beta57 是已安装的 comfyui-minimax-h3-audio-T8 注册的调度器
+# （h3_t8/sampling.py: BETA57_SCHEDULER_NAME = "beta57"，语义是 beta + alpha0.5/beta0.7）。
+KNOWN_SAMPLERS = frozenset((
+    "euler", "euler_cfg_pp", "euler_ancestral", "euler_ancestral_cfg_pp", "heun", "heunpp2",
+    "exp_heun_2_x0", "exp_heun_2_x0_sde", "dpm_2", "dpm_2_ancestral", "lms", "dpm_fast",
+    "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_2s_ancestral_cfg_pp", "dpmpp_sde",
+    "dpmpp_sde_gpu", "dpmpp_2m", "dpmpp_2m_cfg_pp", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu",
+    "dpmpp_2m_sde_heun", "dpmpp_2m_sde_heun_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm",
+    "lcm", "ipndm", "ipndm_v", "deis", "cfgpp_ud10_ab", "res_multistep", "res_multistep_cfg_pp",
+    "res_multistep_ancestral", "res_multistep_ancestral_cfg_pp", "gradient_estimation",
+    "gradient_estimation_cfg_pp", "er_sde", "seeds_2", "seeds_3", "sa_solver", "sa_solver_pece",
+    "ddim", "uni_pc", "uni_pc_bh2",
+))
+KNOWN_SCHEDULERS = frozenset((
+    "simple", "sgm_uniform", "karras", "exponential", "ddim_uniform", "beta", "normal",
+    "linear_quadratic", "kl_optimal", "beta57",
+))
 
 
 def _is_document_node(class_type):
@@ -104,12 +147,85 @@ def _field_fallback(api):
     return checkpoint, loras, " | ".join(texts)[:MAX_FALLBACK_PROMPT_CHARS]
 
 
+def _param_value(kind, value, lo, hi):
+    """字段名候选值 → 归一化值；不落在值域（含表外采样器/调度器名）就返回 None。"""
+    if value is None or isinstance(value, bool) or isinstance(value, (list, dict)):
+        return None
+    if kind == "int":
+        number = _as_int(value)
+        return number if number is not None and lo <= number <= hi else None
+    if kind == "float":
+        number = _as_float(value)
+        return number if number is not None and lo <= number <= hi else None
+    text = _text(value).strip()
+    table = KNOWN_SAMPLERS if kind == "sampler" else KNOWN_SCHEDULERS
+    return text if text and text.lower() in table else None
+
+
+def _params_by_field(api):
+    """遍历 API 图 nodes[].inputs 的参数字段名 → (唯一值, 命中字段名, 多值冲突数)。"""
+    found = {field: [] for field in PARAM_FIELDS}     # 每字段：[(比较键, 原值)]
+    names = {field: [] for field in PARAM_FIELDS}
+    for node in api.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for raw_name, raw_value in inputs.items():
+            spec = _PARAM_BY_NAME.get(_text(raw_name).strip().lower())
+            if spec is None:
+                continue
+            field, kind, lo, hi = spec
+            value = _param_value(kind, raw_value, lo, hi)
+            if value is None:
+                continue
+            compare = value.lower() if isinstance(value, str) else value
+            if any(key == compare for key, _old in found[field]):
+                continue
+            found[field].append((compare, value))
+            name = _text(raw_name).strip().lower()
+            if name not in names[field]:
+                names[field].append(name)
+    values = {}
+    conflicts = {}
+    for field, pairs in found.items():
+        if len(pairs) == 1:
+            values[field] = pairs[0][1]
+        elif len(pairs) > 1:
+            conflicts[field] = len(pairs)     # §15.1.3：多个不同值时不选边
+    return values, names, conflicts
+
+
+def _apply_param_fallback(out, api, notes, extra):
+    """链式优先：只填仍为空的参数位，冲突如实留空并写 note（§15.1.3/§15.1.4）。"""
+    values, names, conflicts = _params_by_field(api)
+    filled = []
+    chain_had = False
+    for field in PARAM_FIELDS:
+        if out[field] not in (None, ""):
+            chain_had = True
+            continue
+        if field in values:
+            out[field] = values[field]
+            filled.append(field)
+        elif field in conflicts:
+            notes.append("工作流里有 %d 个不同的 %s，未按字段名猜测。" % (conflicts[field], field))
+    if filled or chain_had:
+        extra["params_source"] = "field_name" if filled else "chain"
+    if filled:
+        hit = []
+        for field in filled:
+            hit.extend(names[field])
+        extra["params_fields"] = sorted(set(hit))
+
+
 def blank_result():
     """键恒定存在的空壳；缺值为 ''/[]/None。"""
     return {"has_meta": False, "source": "none", "prompt": "", "negative": "", "note": "",
             "checkpoint": "", "loras": [], "models": [], "sampler": "", "scheduler": "",
             "seed": None, "steps": None, "cfg": None, "width": None, "height": None,
-            "duration": None, "extra": {}}
+            "duration": None, "fps": None, "extra": {}}
 
 
 def _text(value):
@@ -395,7 +511,66 @@ def _tkhd_size(data):
     return int(width), int(height)
 
 
-def _handle_box(ctype, body, acc, in_trak, depth):
+def _mdhd_timescale(data):
+    """mdhd 的时间基：v0 在 creation(4)+modification(4) 之后，v1 两个时间字段改 64 位。"""
+    if not data:
+        return None
+    if data[0] == 1:
+        timescale = _u32(data, 20) if len(data) >= 24 else 0
+    else:
+        timescale = _u32(data, 12) if len(data) >= 16 else 0
+    return timescale if timescale > 0 else None
+
+
+def _stts_totals(data):
+    """stts：ver/flags(4) + entry_count(4) + (sample_count(4) sample_delta(4))*。
+
+    返回 (采样数合计, tick 合计)。tick 合计按 count*delta 累加 —— 一条 entry 描述的是
+    count 个间隔为 delta 的样本，只加 delta 会把多帧合成一帧，帧率就假高。
+    """
+    if len(data) < 8:
+        return None
+    entries = _u32(data, 4)
+    if entries <= 0 or entries > MAX_STTS_ENTRIES:
+        return None
+    samples = ticks = 0
+    pos = 8
+    for _ in range(entries):
+        if pos + 8 > len(data):
+            break
+        samples += _u32(data, pos)
+        ticks += _u32(data, pos) * _u32(data, pos + 4)
+        pos += 8
+    if samples <= 0 or ticks <= 0:
+        return None
+    return samples, ticks
+
+
+def _track_fps(track):
+    """fps = 采样数合计 / (delta 合计 / timescale)，保留 3 位；拿不到就 None（不默认 30）。"""
+    if not track or not track.get("video"):
+        return None
+    timescale = track.get("timescale")
+    totals = track.get("stts")
+    if not timescale or not totals:
+        return None
+    samples, ticks = totals
+    fps = samples * float(timescale) / float(ticks)
+    if not math.isfinite(fps) or fps <= 0:
+        return None
+    return round(fps, 3)
+
+
+def _read_trak(body, acc, depth):
+    """逐 trak 建临时上下文：视频轨判定与 stts/mdhd 必须同轨才配对。"""
+    track = {"video": False, "timescale": None, "stts": None}
+    _walk_boxes(body, 0, len(body), acc, True, depth + 1, track)
+    fps = _track_fps(track)
+    if fps is not None and acc["fps"] is None:
+        acc["fps"] = fps
+
+
+def _handle_box(ctype, body, acc, in_trak, depth, track=None):
     bucket = "container" if not in_trak else "track"
     logical = _logical_key(ctype)
     if logical:
@@ -403,13 +578,15 @@ def _handle_box(ctype, body, acc, in_trak, depth):
         if text:
             acc[bucket].append((logical, text))
         return
+    if ctype == b"trak":
+        _read_trak(body, acc, depth)
+        return
     if ctype in _MP4_CONTAINERS:
         if b"<key>" in body and ctype not in (b"udta", b"ilst", b"trak", b"mdia", b"minf", b"stbl"):
             for pair in _plist_pairs(body):
                 acc[bucket].append(pair)
             return
-        _walk_boxes(body, 4 if ctype == b"meta" else 0, len(body), acc,
-                    in_trak or ctype == b"trak", depth + 1)
+        _walk_boxes(body, 4 if ctype == b"meta" else 0, len(body), acc, in_trak, depth + 1, track)
         return
     stripped = body.lstrip(b"\x00")[:5]
     if stripped == b"<?xml" or b"<key>" in body:
@@ -418,13 +595,27 @@ def _handle_box(ctype, body, acc, in_trak, depth):
         return
     if ctype == b"mvhd" and acc["duration"] is None:
         acc["duration"] = _mvhd_duration(body)
-    elif ctype == b"tkhd" and acc["width"] is None:
+    elif ctype == b"tkhd":
         size = _tkhd_size(body)
         if size:
-            acc["width"], acc["height"] = size
+            if track is not None:
+                track["video"] = True          # 有画面尺寸就是视频轨，不依赖 hdlr 写法
+            if acc["width"] is None:
+                acc["width"], acc["height"] = size
+    elif ctype == b"hdlr" and track is not None:
+        if body[8:12] == b"vide":
+            track["video"] = True
+    elif ctype == b"mdhd" and track is not None:
+        timescale = _mdhd_timescale(body)
+        if timescale:
+            track["timescale"] = timescale
+    elif ctype == b"stts" and track is not None:
+        totals = _stts_totals(body)
+        if totals:
+            track["stts"] = totals
 
 
-def _walk_boxes(buf, pos, end, acc, in_trak, depth):
+def _walk_boxes(buf, pos, end, acc, in_trak, depth, track=None):
     if depth > MAX_DEPTH:
         return
     while pos + 8 <= end and acc["boxes"] < MAX_BOXES:
@@ -439,7 +630,7 @@ def _walk_boxes(buf, pos, end, acc, in_trak, depth):
         if size < header or pos + size > end:
             return          # 声明尺寸越界：窗口被截断或字节本是垃圾，本窗口到此为止
         acc["boxes"] += 1
-        _handle_box(ctype, buf[pos + header:pos + size], acc, in_trak, depth)
+        _handle_box(ctype, buf[pos + header:pos + size], acc, in_trak, depth, track)
         pos += size
 
 
@@ -483,13 +674,13 @@ def _moov_spans(buf, tail_window):
 
 def read_mp4_meta(path, max_window_bytes=MAX_WINDOW_BYTES, info=None):
     """返回 {"comment":str|None,"description":str|None,"prompt":str|None,"workflow":str|None,
-             "duration":float|None,"width":int|None,"height":int|None}。
+             "duration":float|None,"width":int|None,"height":int|None,"fps":float|None}。
 
     info 是可选的诊断字典（调用方传空 dict 即可），用来记录 moov 落在哪个窗口，
     不参与契约返回值形状。
     """
     out = {"comment": None, "description": None, "prompt": None, "workflow": None,
-           "duration": None, "width": None, "height": None}
+           "duration": None, "width": None, "height": None, "fps": None}
     if info is None:
         info = {}
     info.setdefault("moov_found", False)
@@ -509,7 +700,8 @@ def read_mp4_meta(path, max_window_bytes=MAX_WINDOW_BYTES, info=None):
             tail = f.read(max_window_bytes)
         windows = [(head, False), (tail, True)]
         info["window"] = "head+tail"
-    acc = {"container": [], "track": [], "duration": None, "width": None, "height": None, "boxes": 0}
+    acc = {"container": [], "track": [], "duration": None, "width": None, "height": None,
+           "fps": None, "boxes": 0}
     for buf, is_tail in windows:
         for start, stop in _moov_spans(buf, is_tail):
             info["moov_found"] = True
@@ -525,6 +717,7 @@ def read_mp4_meta(path, max_window_bytes=MAX_WINDOW_BYTES, info=None):
     out["duration"] = acc["duration"]
     out["width"] = acc["width"]
     out["height"] = acc["height"]
+    out["fps"] = acc["fps"]
     info["boxes"] = acc["boxes"]
     info["tags"] = sorted(k for k, v in tags.items() if v)
     return out
@@ -643,6 +836,7 @@ def _apply_graph(out, api, ui, notes, extra):
             extra["prompt_source"] = "name_fallback"
             notes.append("提示词按字段名（prompt/text 等）回退还原：工作流使用自定义条件节点，"
                          "无法区分正负向分组，多条文本以 | 连接，可能包含非生成内容。")
+        _apply_param_fallback(out, api, notes, extra)
     if not out["checkpoint"] and out["models"]:
         # 纯 UI 图里没有 CHECKPOINT 语义，不靠文件名猜底模。
         notes.append("仅有 UI 工作流，底模/LoRA 未记录（不猜测）。")
@@ -820,13 +1014,15 @@ def _fill(out, path, ext, max_chunk_bytes, max_window_bytes, notes, extra):
             source = "mp4_udta"
         if not mp4_info.get("moov_found"):
             notes.append("未找到 moov（可能超出首尾各 16MB 窗口）。")
-        # 时长/宽高属于容器，即使没有元数据也要回填。
+        # 时长/宽高/帧率属于容器，即使没有元数据也要回填。
         if out["width"] is None:
             out["width"] = meta["width"]
         if out["height"] is None:
             out["height"] = meta["height"]
         if meta.get("duration") is not None:
             out["duration"] = meta["duration"]
+        if meta.get("fps") is not None:
+            out["fps"] = meta["fps"]
     elif ext in (".webm", ".mkv"):
         extra["ebml"] = "v1 不解析 EBML"
 

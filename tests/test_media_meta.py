@@ -83,6 +83,36 @@ def tkhd(width=640, height=360, version=0):
     return box(b"tkhd", body)
 
 
+def mdhd(timescale=24000, version=0):
+    """mdhd 时间基：v0 的 timescale 在第 12 字节，v1 的 creation/modification 是 64 位。"""
+    if version == 1:
+        head = b"\x01\x00\x00\x00" + struct.pack(">QQ", 0, 0) + struct.pack(">I", timescale) + struct.pack(">Q", 0)
+    else:
+        head = b"\x00\x00\x00\x00" + struct.pack(">III", 0, 0, timescale) + struct.pack(">I", 0)
+    return box(b"mdhd", head + b"\x00" * 4)
+
+
+def hdlr(handler=b"vide"):
+    """hdlr：ver/flags(4) + pre-defined(4) + handler_type(4)，fps 只认视频轨。"""
+    return box(b"hdlr", b"\x00" * 8 + handler + b"\x00" * 5)
+
+
+def stts(entries):
+    body = b"\x00" * 4 + struct.pack(">I", len(entries))
+    for count, delta in entries:
+        body += struct.pack(">II", count, delta)
+    return box(b"stts", body)
+
+
+def video_trak(width=1024, height=576, timescale=24000, mdhd_version=0, entries=((240, 1001),),
+               handler=b"vide"):
+    """tkhd + mdia(mdhd/hdlr/minf/stbl(stts))：契约 §15.1.5 的 fps 来源。"""
+    media = mdhd(timescale, mdhd_version) + hdlr(handler)
+    if entries:
+        media += box(b"minf", box(b"stbl", stts(entries)))
+    return box(b"trak", tkhd(width, height) + box(b"mdia", media))
+
+
 def itunes_data(text, type_flag=1):
     """ilst 项的 data 子盒：size+'data'+version/flags+locale 共 16 字节头。"""
     return box(b"data", struct.pack(">II", type_flag << 24, 0) + text.encode("utf-8"))
@@ -178,6 +208,25 @@ def h3_api_graph(prompt_text="a girl dancing, 1girl"):
     }
 
 
+def custom_param_api_graph(seed=2026081201, steps="8", cfg=1.0, sampler=" Euler ", scheduler="beta57"):
+    """SamplerCustomAdvanced 全家桶：参数只散落在自定义节点的标准字段名里，
+    链式回溯一个都拿不到（真实库里 1676 条就是这个形状）。字段名故意混大小写与空格。"""
+    return {
+        "1": {"class_type": "SamplerCustomAdvanced",
+              "inputs": {"noise": ["2", 0], "guider": ["3", 0], "sampler": ["4", 0],
+                         "sigmas": ["5", 0], "latent_image": ["7", 0]}},
+        "2": {"class_type": "RandomNoise", "inputs": {" NOISE_SEED ": seed}},
+        "3": {"class_type": "CFGGuider", "inputs": {"model": ["6", 0], "positive": ["8", 0],
+                                                    "negative": ["9", 0], "cfg": cfg}},
+        "4": {"class_type": "KSamplerSelect", "inputs": {"SAMPLER_NAME": sampler}},
+        "5": {"class_type": "CustomSigmas", "inputs": {"num_steps": steps, "Scheduler": scheduler}},
+        "6": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "models/unet/qwen_fp8.safetensors"}},
+        "7": {"class_type": "EmptyLatentImage", "inputs": {"width": 768, "height": 512, "batch_size": 1}},
+        "8": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}},
+        "9": {"class_type": "CLIPTextEncode", "inputs": {"text": "lowres"}},
+    }
+
+
 def doc_noise_api_graph(prompt_text="1girl, custom conditioning"):
     """文档/面板类节点的 text/prompt 是备忘文字，不能当提示词回收。"""
     return {
@@ -226,6 +275,7 @@ class MediaMetaTestCase(unittest.TestCase):
             self.assertTrue(result[key] is None or isinstance(result[key], int), key)
         self.assertTrue(result["cfg"] is None or isinstance(result["cfg"], float))
         self.assertTrue(result["duration"] is None or isinstance(result["duration"], float))
+        self.assertTrue(result["fps"] is None or isinstance(result["fps"], float))
         json.dumps(result, allow_nan=False)
 
 
@@ -464,9 +514,10 @@ class ReadMp4MetaTests(MediaMetaTestCase):
         path = self.write("head.mp4", data)
         meta = media_meta.read_mp4_meta(path)
         self.assertEqual(sorted(meta), sorted(("comment", "description", "prompt", "workflow",
-                                               "duration", "width", "height")))
+                                               "duration", "width", "height", "fps")))
         self.assertEqual(meta["comment"], text)
         self.assertEqual(meta["duration"], 96.0)
+        self.assertIsNone(meta["fps"])
         self.assertEqual((meta["width"], meta["height"]), (640, 360))
 
     def test_track_level_udta_and_description(self):
@@ -505,6 +556,72 @@ class ReadMp4MetaTests(MediaMetaTestCase):
         body = box(b"moov", mvhd() + box(b"trak", tkhd(720, 1280, version=1)))
         meta = media_meta.read_mp4_meta(self.write("v1t.mp4", mp4_bytes(ftyp(), body)))
         self.assertEqual((meta["width"], meta["height"]), (720, 1280))
+
+
+class Mp4FpsTests(MediaMetaTestCase):
+    """契约 §15.1.5：fps = stts 采样数合计 / (delta 合计 / mdhd 时间基)；拿不到就 None，绝不默认 30。"""
+
+    def meta(self, name, *boxes):
+        return media_meta.read_mp4_meta(self.write(name, mp4_bytes(*boxes)))
+
+    def test_23_976_non_integer_fps(self):
+        """24000/1001 的 23.976 是最常见的 ntsc 帧率：3 位小数保留，不四舍五入成 24。"""
+        meta = self.meta("fps.mp4", ftyp(), mdat(64), moov([video_trak()]))
+        self.assertEqual(meta["fps"], 23.976)
+
+    def test_mdhd_version_one_timescale(self):
+        meta = self.meta("fpsv1.mp4", ftyp(), moov([video_trak(timescale=1000, mdhd_version=1,
+                                                              entries=((300, 33),))]))
+        self.assertEqual(meta["fps"], 30.303)
+
+    def test_stts_entries_sum_counts_and_ticks(self):
+        """两条 entry：采样数 10+20，tick 是 10*100 + 20*50 = 2000 → 30 帧 / 2 秒 = 15fps。"""
+        meta = self.meta("multi.mp4", ftyp(), moov([video_trak(timescale=1000,
+                                                              entries=((10, 100), (20, 50)))]))
+        self.assertEqual(meta["fps"], 15.0)
+
+    def test_rounded_to_three_decimals(self):
+        meta = self.meta("round.mp4", ftyp(), moov([video_trak(timescale=30000, entries=((100, 1001),))]))
+        self.assertEqual(meta["fps"], 29.97)
+
+    def test_missing_stts_is_none(self):
+        meta = self.meta("nostts.mp4", ftyp(), moov([video_trak(entries=())]))
+        self.assertIsNone(meta["fps"])
+        self.assertIsNone(media_meta.extract(self.write("nostts2.mp4", mp4_bytes(
+            ftyp(), mdat(64), moov([video_trak(entries=())]))))["fps"])
+
+    def test_audio_track_is_not_mistaken_for_video(self):
+        """只有声音的轨（tkhd 宽高 0 + hdlr 'soun'）不算 fps，哪怕 mdhd/stts 齐备。"""
+        meta = self.meta("aud.mp4", ftyp(), box(b"moov", mvhd() + video_trak(
+            width=0, height=0, handler=b"soun", timescale=44100, entries=((441, 1024),))))
+        self.assertIsNone(meta["fps"])
+        self.assertIsNone(meta["width"])
+
+    def test_absurd_stts_entry_count_is_refused(self):
+        garbage = box(b"stts", b"\x00" * 4 + struct.pack(">I", 0xFFFFFFFF) + b"\x00" * 16)
+        trak = box(b"trak", tkhd() + box(b"mdia", mdhd(1000) + hdlr() + box(b"minf", box(b"stbl", garbage))))
+        self.assertIsNone(self.meta("junk.mp4", ftyp(), box(b"moov", mvhd() + trak))["fps"])
+
+    def test_extract_carries_fps_and_dims(self):
+        data = mp4_bytes(ftyp(), mdat(512), moov([video_trak()], udta=udta_ilst(
+            comment_json(prompt=custom_param_api_graph()))))
+        r = media_meta.extract(self.write("full.mp4", data))
+        self.assert_shape(r)
+        self.assertEqual(r["fps"], 23.976)
+        self.assertEqual(r["duration"], 96.0)
+
+    def test_fps_from_moov_in_tail_window(self):
+        """真实 SaveVideo 没有 faststart：moov 落在尾窗口也要算得出 fps。"""
+        body = moov([video_trak()])
+        path = self.write("tailfps.mp4", mp4_bytes(ftyp(), mdat(4096), body))
+        r = media_meta.extract(path, max_window_bytes=len(body) + 16)
+        self.assertEqual(r["fps"], 23.976)
+        self.assertEqual(r["extra"]["mp4"]["window"], "head+tail")
+        self.assertEqual(r["extra"]["mp4"]["moov_at"], "tail")
+
+    def test_image_result_fps_is_none(self):
+        path = self.write("still.png", png_bytes([texp("prompt", json.dumps(api_graph()))]))
+        self.assertIsNone(media_meta.extract(path)["fps"])
 
 
 class ExtractVideoTests(MediaMetaTestCase):
@@ -617,7 +734,13 @@ class FieldFallbackTests(MediaMetaTestCase):
         self.assertEqual(r["extra"]["prompt_source"], "name_fallback")
         self.assertEqual(r["extra"]["classification_source"], "field_name")
         self.assertIn("字段名", r["note"])
-        self.assertIsNone(r["seed"])                 # RandomNoise 上的种子不在标准字段回退范围
+        # 参数按字段名回收（契约 §15.1）：noise_seed/steps/sampler_name/scheduler 都是标准字段名。
+        self.assertEqual(r["seed"], 777)
+        self.assertEqual(r["steps"], 8)
+        self.assertEqual((r["sampler"], r["scheduler"]), ("euler", "simple"))
+        self.assertIsNone(r["cfg"])                  # 图里没有任何 cfg 字段名，不臆造
+        self.assertEqual(r["extra"]["params_source"], "field_name")
+        self.assertEqual(r["extra"]["params_fields"], ["noise_seed", "sampler_name", "scheduler", "steps"])
         self.assertEqual((r["width"], r["height"]), (1024, 576))
 
     def test_chain_result_wins_when_sampler_chain_resolves(self):
@@ -686,6 +809,148 @@ class FieldFallbackTests(MediaMetaTestCase):
         self.assertEqual(r["prompt"], "")
         self.assertNotIn("classification_source", r["extra"])
         self.assertNotIn("prompt_source", r["extra"])
+
+
+class ParamFieldFallbackTests(MediaMetaTestCase):
+    """契约 §15.1：参数（seed/steps/cfg/sampler/scheduler）按字段名回收 —— 链式优先、值域校验、
+    多值不选边，来源如实写进 extra.params_source / params_fields。"""
+
+    def params(self, graph, name="p.png"):
+        path = self.write(name, png_bytes([texp("prompt", json.dumps(graph))]))
+        return media_meta.extract(path)
+
+    def test_custom_node_params_recovered_by_field_name(self):
+        path = self.write("params.png", png_bytes([texp("prompt", json.dumps(custom_param_api_graph()))]))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertTrue(r["has_meta"])
+        self.assertEqual((r["seed"], r["steps"], r["cfg"]), (2026081201, 8, 1.0))
+        self.assertEqual((r["sampler"], r["scheduler"]), ("Euler", "beta57"))
+        self.assertEqual((r["width"], r["height"]), (768, 512))
+        self.assertEqual(r["extra"]["params_source"], "field_name")
+        self.assertEqual(r["extra"]["params_fields"],
+                         ["cfg", "noise_seed", "num_steps", "sampler_name", "scheduler"])
+
+    def test_mixed_case_and_padded_field_names_match(self):
+        graph = {"1": {"class_type": "CustomNoise", "inputs": {"Rand_Seed": 5, "STEP_COUNT": 7,
+                                                              "GUIDANCE_SCALE": 3.5, "SOLVER": "lms",
+                                                              "Schedule": "karras"}}}
+        r = self.params(graph, "case.png")
+        self.assertEqual((r["seed"], r["steps"], r["cfg"]), (5, 7, 3.5))
+        self.assertEqual((r["sampler"], r["scheduler"]), ("lms", "karras"))
+
+    def test_conflicting_values_are_left_blank_and_noted(self):
+        graph = {
+            "1": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["2", 0], "guider": ["a", 0]}},
+            "2": {"class_type": "RandomNoise", "inputs": {"noise_seed": 111}},
+            "3": {"class_type": "Seed (rgthree)", "inputs": {"seed": 222}},
+            "4": {"class_type": "BasicScheduler", "inputs": {"steps": 4, "scheduler": "simple"}},
+            "5": {"class_type": "H3VMMasterLoader", "inputs": {"steps": "10", "scheduler": "beta57"}},
+            "6": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        }
+        r = self.params(graph, "conflict.png")
+        self.assert_shape(r)
+        self.assertIsNone(r["seed"])
+        self.assertIsNone(r["steps"])
+        self.assertEqual(r["scheduler"], "")
+        self.assertEqual(r["sampler"], "euler")
+        for text in ("工作流里有 2 个不同的 seed，未按字段名猜测。",
+                     "工作流里有 2 个不同的 steps，未按字段名猜测。",
+                     "工作流里有 2 个不同的 scheduler，未按字段名猜测。"):
+            self.assertIn(text, r["note"])
+        self.assertEqual(r["extra"]["params_source"], "field_name")
+        self.assertEqual(r["extra"]["params_fields"], ["sampler_name"])
+
+    def test_chain_values_are_never_overwritten(self):
+        graph = api_graph("chain prompt")
+        graph["9"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": 999}}
+        graph["10"] = {"class_type": "BasicScheduler", "inputs": {"steps": 99, "scheduler": "karras"}}
+        r = self.params(graph, "chain.png")
+        self.assertEqual(r["seed"], 1234)          # KSampler 链上的值优先
+        self.assertEqual((r["steps"], r["cfg"]), (25, 6.5))
+        self.assertEqual((r["sampler"], r["scheduler"]), ("dpmpp_2m", "karras"))
+        self.assertEqual(r["extra"]["params_source"], "chain")
+        self.assertNotIn("params_fields", r["extra"])
+        self.assertNotIn("未按字段名猜测", r["note"])   # 链式已有的字段冲突不写 note
+
+    def test_partially_chained_graph_is_marked_field_name(self):
+        graph = api_graph("chain prompt")
+        graph["11"] = {"class_type": "CustomSigmas", "inputs": {"step_count": 40}}
+        del graph["3"]["inputs"]["steps"]
+        r = self.params(graph, "partial.png")
+        self.assertEqual(r["steps"], 40)
+        self.assertEqual(r["seed"], 1234)
+        self.assertEqual(r["extra"]["params_source"], "field_name")
+        self.assertEqual(r["extra"]["params_fields"], ["step_count"])
+
+    def test_out_of_range_and_non_scalar_values_rejected(self):
+        cases = (("seed", -1, None), ("seed", 2 ** 64, None), ("seed", 2 ** 64 - 1, 2 ** 64 - 1),
+                 ("seed", True, None), ("seed", ["9", 0], None), ("seed", "not a number", None),
+                 ("steps", 0, None), ("steps", 10001, None), ("steps", 10000, 10000),
+                 ("cfg", 100.5, None), ("cfg", 0, 0.0), ("cfg", "6.5", 6.5),
+                 ("sampler", "dpmpp_9x_magic", ""), ("scheduler", "magic_schedule", ""))
+        for index, (field, value, expected) in enumerate(cases):
+            graph = {"1": {"class_type": "CustomNode", "inputs": {field: value}}}
+            r = self.params(graph, "domain%d.png" % index)
+            self.assertEqual(r[field], expected, "%s=%r" % (field, value))
+            if expected in (None, ""):
+                self.assertNotIn("params_source", r["extra"])
+            else:
+                self.assertEqual(r["extra"]["params_source"], "field_name")
+
+    def test_invalid_values_do_not_create_conflicts(self):
+        """表外/越界的候选值压根不是候选，不该把唯一的合法值挤成冲突。"""
+        graph = {
+            "1": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "dpmpp_9x_magic"}},
+            "2": {"class_type": "CustomSamplerSelect", "inputs": {"sampler": "euler_ancestral_cfg_pp"}},
+            "3": {"class_type": "BasicScheduler", "inputs": {"scheduler": "linear_quadratic", "steps": 20}},
+        }
+        r = self.params(graph, "noconflict.png")
+        self.assertEqual(r["sampler"], "euler_ancestral_cfg_pp")
+        self.assertEqual(r["scheduler"], "linear_quadratic")
+        self.assertEqual(r["steps"], 20)
+        self.assertNotIn("未按字段名猜测", r["note"])
+
+    def test_known_tables_are_measured_union_official(self):
+        for value in ("euler", "res_multistep", "er_sde", "euler_ancestral"):     # 真实库实测四个
+            self.assertIn(value, media_meta.KNOWN_SAMPLERS)
+        for value in ("simple", "beta57", "beta", "sgm_uniform"):                 # 实测四个调度器
+            self.assertIn(value, media_meta.KNOWN_SCHEDULERS)
+        for value in ("karras", "exponential", "ddim_uniform", "normal", "kl_optimal", "linear_quadratic"):
+            self.assertIn(value, media_meta.KNOWN_SCHEDULERS)                     # 官方枚举并集
+        for junk in ("Euler", "dpmpp_magic", "", "scheduler"):
+            self.assertNotIn(junk, media_meta.KNOWN_SAMPLERS)
+        self.assertTrue(all(name == name.lower() for name in media_meta.KNOWN_SAMPLERS))
+        self.assertTrue(all(name == name.lower() for name in media_meta.KNOWN_SCHEDULERS))
+
+    def test_mp4_comment_params_recovered(self):
+        text = comment_json(prompt=custom_param_api_graph(seed=484799350375457, steps="10",
+                                                          sampler="res_multistep", scheduler="simple"))
+        path = self.write("params.mp4", mp4_bytes(ftyp(), mdat(512),
+                                                  moov([video_trak()], udta=udta_ilst(text))))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertEqual(r["source"], "mp4_udta")
+        self.assertEqual((r["seed"], r["steps"], r["cfg"], r["sampler"], r["scheduler"]),
+                         (484799350375457, 10, 1.0, "res_multistep", "simple"))
+        self.assertEqual(r["extra"]["params_source"], "field_name")
+        self.assertEqual(r["fps"], 23.976)
+
+    def test_sidecar_params_recovered(self):
+        png = self.write("sc.png", png_bytes([]))
+        (self.root / "sc.json").write_text(json.dumps({"prompt": custom_param_api_graph(seed=9)}),
+                                          encoding="utf-8")
+        r = media_meta.extract(png)
+        self.assertEqual(r["source"], "sidecar")
+        self.assertEqual(r["seed"], 9)
+        self.assertEqual(r["extra"]["params_source"], "field_name")
+
+    def test_ui_only_graph_gets_no_params_provenance(self):
+        path = self.write("uip.png", png_bytes([ztxtp("workflow", json.dumps(ui_graph("dusk")))]))
+        r = media_meta.extract(path)
+        self.assertNotIn("params_source", r["extra"])
+        self.assertNotIn("params_fields", r["extra"])
+        self.assertIsNone(r["seed"])
 
 
 class SidecarTests(MediaMetaTestCase):
@@ -793,6 +1058,10 @@ class RobustnessTests(MediaMetaTestCase):
         self.assertEqual(sorted(blank), sorted(media_meta.RESULT_KEYS))
         self.assertEqual(blank["source"], "none")
         self.assertEqual(blank["extra"], {})
+        # 契约 §15.1.6：fps 必须在恒定键里，否则写库与详情会炸
+        self.assertIn("fps", blank)
+        self.assertIsNone(blank["fps"])
+        self.assertIn("fps", media_meta.RESULT_KEYS)
 
     def test_spec_numbers_are_contract_values(self):
         self.assertEqual(media_meta.MAX_CHUNK_BYTES, 8 * 1024 * 1024)
