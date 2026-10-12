@@ -141,3 +141,44 @@ CONFIG_DEFAULTS = {
 - 所有 JS：`node --check <file>` 通过。
 - Python：`python -m py_compile` 通过；不改坏现有单测（`python -m pytest` / unittest）。
 - 提交前每个代理自检自己文件；跨文件集成问题由主控统一修。
+
+---
+
+## 8. 批量归档协议（多标签页批量扩展）
+
+### 8.1 消息清单（信封 `{__cft:true,to,type,payload}`）
+
+| from → to | type | payload → 响应 |
+|---|---|---|
+| popup → bg | `archiveBatchStart` | `{rows:[{tabId,url,title}]}` → `{ok, jobId, total}`（立即返回） |
+| popup → bg | `archiveBatchStatus` | → `{running, jobId, phase, total, done, skipped, failed, current, results, errors, cancelRequested}` |
+| popup → bg | `archiveBatchCancel` | → `{ok}`（设取消标志；已入队的模型文件不撤回） |
+| bg → offscreen | `archiveBatch` | `{jobId, items:[{tabId,url,modelId,modelVersionId,pageUrl,aboutText}]}` → `{ok,started}` |
+| offscreen → bg | `archiveBadge` | `{text}`（bg setBadgeText，批结束发空清掉） |
+| popup/轮询 → offscreen | `archiveBatchStatus` / `archiveBatchCancel` | 同 bg 语义（bg 透传） |
+
+### 8.2 offscreen 批量状态机（模块级 `batch`，与单页 `_running` 互斥）
+
+```
+batch = { jobId, cancel:false, phase:'prepare'|'media'|'comments'|'done',
+          total, results:[{tabId,url,modelId,modelVersionId,status:'queued'|'done'|'skip'|'failed',
+                           dirName,autoChosenFile?,msg?}], errors:[] }
+```
+
+- **阶段 prepare（并发 5）**：逐页 fetchModel → dirName=safeFsName(模型名_版本)；多文件自动选主文件（primary 优先，否则 files[0]，记 `autoChosenFile`）；已归档预检（`CFT.history.get(mid,ver)` 命中 → status='skip'）；命中后逐页 `sendModelToSoftware {downloadUrl, destSubdir:dirName}` 立即入队（POST /api/download）。每页结果存 results 并带 `modelData`（阶段 1 复用，避免重复 fetch）。
+- **阶段 media（串行）**：逐页 `runArchive(payload,{batch:true,skipComments:true})`（batch 模式：跳过 askArchiveConfirm/askFileSelection、跳过逐页 notifyArchiveDone、支持 presetModelData 短路 fetchModel）；每页 try/catch 隔离。
+- **阶段 comments（串行）**：对 status='done' 页逐页 fetchCommentsText（**纯 tRPC，跳过 DOM 兜底**——页面可能已关）→ writeFileToBg(dirName/'评论.txt')；失败记 errors 不阻断。
+- **结束**：phase='done'；发一次 `notifyArchiveDone`（统一重扫）；badge 清空。
+- 单页归档（`archive` 消息）行为不变；batch 与单页互斥（一方在跑另一方拒绝）。
+
+### 8.3 bg 职责
+
+- `archiveBatchStart`：校验 rows → 逐页 `chrome.tabs.sendMessage(collectPage)`（无应答/页关 → 用 URL 解析 modelId/versionId 兜底，aboutText 置空）→ ensureOffscreen → 发 `archiveBatch`；badge 初始 `0/N`。
+- `archiveBatchStatus/Cancel`：透传 offscreen。
+- 收到 `archiveBadge`：setBadgeText（批结束空文本清除）。
+
+### 8.4 popup UI
+
+- 批量列表旁「批量归档」按钮（与「发送到下载」并列）：对 selected rows 发 `archiveBatchStart`。
+- 状态区轮询 1s：phase/进度 N/M/当前页/skip/failed 计数 + autoChosen 提示（"多文件版本已自动选择主文件 xxx"）+ 取消按钮；popup 关闭不影响任务（队列在 offscreen）。
+- 单页「一键归档」保持原行为。

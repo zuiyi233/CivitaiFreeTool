@@ -10,8 +10,10 @@ function updateButtons() {
   $('sendBatch').disabled = lock || !online || !count;
   $('sendBatch').textContent = `发送选中 ${count} 项到 CFT`;
   $('selectionCount').textContent = `已选 ${count} / ${rows.length}`;
-  // 一键归档：不依赖 CFT 在线，只要有当前模型页即可
+  // 一键归档：不依赖 CFT 在线，只要有当前模型页即可；批量归档同样不依赖在线（离线走浏览器下载降级）
   $('btnArchive').disabled = lock || !active;
+  $('btnArchiveBatch').disabled = lock || !count;
+  $('btnArchiveBatch').textContent = `🗂 批量归档选中 ${count} 页`;
 }
 function visibleRows() {const q = $('search').value.trim().toLowerCase();return rows.filter(r => !q || (r.title+' '+r.url).toLowerCase().includes(q));}
 function render() {
@@ -109,6 +111,61 @@ async function send(urls) {
   catch(_){$('feedback').textContent='未收到扩展确认，请重新打开小窗核对提交结果，勿重复点击。';}
   finally{busy=false;updateButtons();}
 }
+// ===== 批量归档：勾选页 → 模型文件立即批量入队 → 逐页图片/提示词归档 → 最后统一抓评论 =====
+let archTimer = null;
+const ARCH_PHASE_TEXT = { prepare: '阶段 1/3：解析模型并批量提交文件到 CFT 下载…', media: '阶段 2/3：逐页归档封面/配图/提示词…', comments: '阶段 3/3：统一抓取评论与评价…', done: '批量归档完成' };
+function renderArchBatch(s) {
+  const panel = $('archBatchPanel');
+  if (!s || (!s.running && s.total === 0)) { panel.hidden = true; return; }
+  panel.hidden = false;
+  $('archPhase').textContent = ARCH_PHASE_TEXT[s.phase] || s.phase || '';
+  const done = (s.results || []).filter(r => ['done','skip','failed'].includes(r.status)).length;
+  $('archProgress').textContent = s.running
+    ? `进度 ${done}/${s.total}` + (s.current ? ` · 当前：${s.current}` : '')
+    : `共 ${s.total} 页：完成 ${(s.results||[]).filter(r=>r.status==='done').length} · 跳过(已归档) ${s.skipped||0} · 失败 ${s.failed||0}`;
+  const auto = (s.results || []).filter(r => r.autoChosenFile);
+  $('archCounts').textContent = auto.length ? `多文件版本已自动选择主文件 ${auto.length} 页（其他精度可在 CFT 中单独下载）` : '';
+  $('archAuto').replaceChildren();
+  for (const r of auto.slice(0, 5)) {
+    const p = document.createElement('p'); p.className = 'muted';
+    p.textContent = `· ${r.dirName || r.url}：已自动选择 ${r.autoChosenFile}`;
+    $('archAuto').append(p);
+  }
+  if (auto.length > 5) { const p=document.createElement('p');p.className='muted';p.textContent=`… 等 ${auto.length} 页`; $('archAuto').append(p); }
+  $('btnArchCancel').hidden = !s.running;
+  if (s.running && !archTimer) archTimer = setInterval(pollArchBatch, 1000);
+  if (!s.running && archTimer) { clearInterval(archTimer); archTimer = null; updateButtons(); }
+}
+async function pollArchBatch() {
+  try {
+    const s = await ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'archiveBatchStatus', payload: {} });
+    if (s) renderArchBatch(s);
+  } catch (_) { /* SW 瞬时不可达，下轮再取 */ }
+}
+async function startArchiveBatch() {
+  const btn = $('btnArchiveBatch');
+  const rows = rows.filter(r => selected.has(r.key)).map(r => ({ tabId: r.tabId, url: r.url, title: r.title }));
+  if (!rows.length) return;
+  btn.disabled = true; busy = true; updateButtons();
+  $('feedback').textContent = `正在启动批量归档（${rows.length} 页）…`;
+  try {
+    const r = await ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'archiveBatchStart', payload: { rows } });
+    if (r && r.ok) {
+      $('feedback').textContent = `批量归档已启动：${r.total} 页` + (r.skipped ? `（${r.skipped} 页无法识别已跳过）` : '') + '。可关闭小窗，后台继续。';
+      renderArchBatch({ running: true, phase: 'prepare', total: r.total, results: [], skipped: r.skipped, failed: 0 });
+      if (!archTimer) archTimer = setInterval(pollArchBatch, 1000);
+      pollArchBatch();
+    } else {
+      $('feedback').textContent = (r && r.msg) || '批量归档启动失败';
+    }
+  } catch (_) { $('feedback').textContent = '批量归档启动失败，请重试'; }
+  finally { busy = false; updateButtons(); }
+}
+$('btnArchiveBatch').onclick = startArchiveBatch;
+$('btnArchCancel').onclick = async () => {
+  try { await ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'archiveBatchCancel', payload: {} }); $('feedback').textContent = '已请求取消；正在进行的页面完成后停止，已入队的模型文件不会撤回。'; }
+  catch (_) { $('feedback').textContent = '取消请求失败，请重试'; }
+};
 $('btnArchive').onclick = startArchive;
 $('clearResults').onclick=async()=>{if(!confirm('清除扩展提交记录后，这些页面可再次发送。请先核对 CFT，避免重复任务；不会删除 CFT 中的下载记录。'))return;try{const r=await ext.runtime.sendMessage({type:'cft-batch-clear'});if(r.ok){renderJob(null);$('feedback').textContent='扩展提交记录已清除；CFT 中的任务未改动';}else $('feedback').textContent=r.msg;}catch(_){$('feedback').textContent='清除失败，请重试';}};
 $('modeCurrent').onclick=()=>mode(false);$('modeBatch').onclick=()=>mode(true);
@@ -120,4 +177,5 @@ document.addEventListener('DOMContentLoaded',async()=>{
   try {const [tab]=await ext.tabs.query({active:true,currentWindow:true});active=CftTabs.modelLink(tab?.url);$('modelName').textContent=active?CftTabs.cleanTitle(tab.title):'当前页面不是 C 站模型页';$('modelUrl').textContent=active?active.url:'可以切换到“批量标签页”，发送其它已打开的模型页。';if(!active)mode(true);if(active)loadArchiveStatus();await status();await refresh();await health();}
   catch(_){$('feedback').textContent='扩展初始化失败，请重新加载';}
   setInterval(status,750);
+  pollArchBatch(); // 重开小窗时恢复正在进行的批量归档状态显示
 });

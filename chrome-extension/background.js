@@ -17,6 +17,8 @@ const OFFSCREEN_URL = 'offscreen/archive-worker.html';
 const RAW_SIZE_SOFTWARE_MAX = 32 * 1024 * 1024; // 软件通道原始大小上限
 const RAW_SIZE_DOWNLOADS_MAX = 20 * 1024 * 1024; // downloads 降级上限
 const ARCHIVE_CONFIG_TTL_MS = 30 * 1000; // getArchiveConfig 缓存 30s
+const ARCHIVE_BATCH_MAX_ROWS = 500; // 批量归档上限（契约 8.1）
+const ARCHIVE_BATCH_COLLECT_MS = 5000; // 逐页 collectPage 超时（契约 8.3）
 const STORE = 'lastBatch';
 
 // 批量提交状态（上游 v1.3.0）
@@ -335,6 +337,87 @@ async function handleStartArchive(payload, sendResponse) {
   sendResponse({ ok: true, msg: '归档已开始' });
 }
 
+// ---- archiveBatch：批量归档（契约 8.3）。collectPage 成功用 {modelId,modelVersionId,aboutText}；
+// 失败/超时/页面已关 → CftTabs.modelLink(url) 解析 {id,version} 兜底，aboutText 置空。 ----
+async function collectBatchRow(tabId) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const timer = setTimeout(() => done(null), ARCHIVE_BATCH_COLLECT_MS);
+    chrome.tabs.sendMessage(tabId, { __cft: true, to: 'content', type: 'collectPage', payload: {} })
+      .then((env) => { clearTimeout(timer); done((env && env.payload) ? env.payload : env); })
+      .catch(() => { clearTimeout(timer); done(null); });
+  });
+}
+function parseBatchRowByUrl(url) {
+  const link = CftTabs.modelLink(String(url || ''));
+  if (!link) return null;
+  return { modelId: link.id, modelVersionId: link.version || '', aboutText: '' };
+}
+async function handleArchiveBatchStart(payload) {
+  const rows = (payload && Array.isArray(payload.rows)) ? payload.rows : [];
+  if (!rows.length || rows.length > ARCHIVE_BATCH_MAX_ROWS) {
+    return { ok: false, msg: '请勾选 1–' + ARCHIVE_BATCH_MAX_ROWS + ' 个模型页' };
+  }
+  const items = [];
+  let skipped = 0;
+  for (const row of rows) {
+    const tabId = row && row.tabId;
+    const url = row && row.url;
+    if (!tabId || !url) { skipped++; continue; }
+    let collected = null;
+    try { collected = await collectBatchRow(tabId); } catch (_) { collected = null; }
+    let modelId = collected && collected.modelId;
+    let modelVersionId = collected ? String(collected.modelVersionId || '') : '';
+    let aboutText = collected ? String(collected.aboutText || '') : '';
+    if (!modelId) {
+      const fb = parseBatchRowByUrl(url);
+      if (!fb) { skipped++; continue; }
+      modelId = fb.modelId; modelVersionId = fb.modelVersionId; aboutText = '';
+    }
+    items.push({ tabId, url, modelId, modelVersionId, pageUrl: url, aboutText });
+  }
+  if (!items.length) return { ok: false, msg: '未能从勾选页面解析出有效模型页', skipped };
+  try {
+    await ensureOffscreen();
+  } catch (e) {
+    bgLog('error', 'offscreen 创建失败', e);
+    return { ok: false, msg: '离屏文档创建失败', skipped };
+  }
+  const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  let resp = null;
+  try {
+    resp = await chrome.runtime.sendMessage({
+      __cft: true, to: 'offscreen', type: 'archiveBatch', payload: { jobId, items },
+    });
+  } catch (e) {
+    bgLog('error', 'archiveBatch 下发离屏失败', e);
+    return { ok: false, msg: '归档批启动失败: ' + String((e && e.message) || e), skipped };
+  }
+  const r = (resp && typeof resp === 'object') ? resp : {};
+  if (r.ok && r.started) badge('0/' + items.length, '#1a73e8'); // 初始 badge 0/N，蓝色
+  return { ok: true, jobId, total: items.length, skipped, ...r };
+}
+// status/cancel 纯转发 offscreen，响应原样透传（契约 8.1/8.3）
+async function forwardBatchControl(type, payload) {
+  let resp = null;
+  try {
+    resp = await chrome.runtime.sendMessage({ __cft: true, to: 'offscreen', type, payload: payload || {} });
+  } catch (e) {
+    return { ok: false, msg: '转发离屏失败: ' + String((e && e.message) || e) };
+  }
+  return (resp && typeof resp === 'object') ? resp : { ok: true };
+}
+function handleArchiveBatchStatus(payload) { return forwardBatchControl('archiveBatchStatus', payload); }
+function handleArchiveBatchCancel(payload) { return forwardBatchControl('archiveBatchCancel', payload); }
+// offscreen 进度 badge：批结束发空文本，同时把背景色清回默认
+function handleArchiveBadge(payload) {
+  const text = String((payload && payload.text) || '');
+  chrome.action.setBadgeText({ text }).catch(() => {});
+  if (!text) chrome.action.setBadgeBackgroundColor({ color: '#d93025' }).catch(() => {}); // 清回 Chrome 默认色
+  return { ok: true };
+}
+
 // ---- saveSingleImage：ensureOffscreen 后原样重发给 offscreen，再把应答 relay 回 content ----
 // 说明：B 侧 offscreen 可能直接应答 content 的原消息；此处 relay 保证即使它只应答
 // 转发消息，content 也能拿到结果（重复 sendResponse 会被浏览器忽略，无害）。
@@ -383,6 +466,18 @@ ext.runtime.onMessage.addListener((msg, sender, respond) => {
           break;
         case 'saveSingleImage':
           forwardSaveSingleImage(payload, sender, respond);
+          break;
+        case 'archiveBatchStart':
+          respond(await handleArchiveBatchStart(payload));
+          break;
+        case 'archiveBatchStatus':
+          respond(await handleArchiveBatchStatus(payload));
+          break;
+        case 'archiveBatchCancel':
+          respond(await handleArchiveBatchCancel(payload));
+          break;
+        case 'archiveBadge':
+          respond(handleArchiveBadge(payload));
           break;
         default:
           respond({ ok: false, msg: '未知消息类型: ' + type });
