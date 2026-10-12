@@ -5453,14 +5453,26 @@ window.addEventListener('resize',()=>{const menu=$('#ctxMenu');if(menu)menu.styl
 const lib = {
   rows: [], total: 0, offset: 0, limit: 200,
   facets: null, tags: [], tagsLoaded: false,
-  filters: { kind: "", checkpoints: [], loras: [], dirs: [], tag_ids: [], starred: false, no_meta: false, q: "", sort: "time_desc", group_by: "" },
+  // samplers / schedulers / sizes / duration_min / duration_max 的键名与服务端 §15.2.4 严格一致，
+  // durations 用 null 表达「不限」（libBuildFlt 只在有值时才带上，别把 null 当 0 发出去）。
+  filters: { kind: "", checkpoints: [], loras: [], dirs: [], tag_ids: [], starred: false, no_meta: false, q: "", sort: "time_desc", group_by: "", samplers: [], schedulers: [], sizes: [], duration_min: null, duration_max: null },
   loading: false, thumbCache: new Map(), sel: new Set(), detail: null,
+  // ---- 多选与批量操作（sel 里的键一律存 String(id)，跟 data-id 同一口径）----
+  // selectMode：#libSelectMode 开关；current：非多选态下「详情对应的那张卡」；
+  // selAnchor：shift 范围选的锚点（lib.rows 下标，换筛选/重置即作废）；
+  // byId：id → {path, kind, hasMeta}，列表加载与「选中筛选结果全部」逐批登记时顺手记下来，
+  //        批量送逆向／送工作流要靠它拿路径（跨页选中的条目本地并没有行数据）。
+  // selTagIds/selTagMode：#libSelTagPop 里勾选的标签与本次是加还是摘；
+  // selFetching/selFetchToken：#libSelAllFilter 的逐批取 id 作业；batchRunning：一次只允许一个批量动作。
+  selectMode: false, current: null, selAnchor: null, byId: new Map(),
+  selTagIds: new Set(), selTagMode: "", selFetching: false, selFetchToken: 0, batchRunning: false,
+  prog: "",                                // 批量/取 id 进行中的播报文本（操作条与选择行共用，空串＝空闲）
   // 内部状态：请求令牌 + 定时器（切页时全部清理，避免后台继续请求、继续解码视频）
-  request: 0, detailRequest: 0, scanTimer: null, scrollTimer: null, qTimer: null,
+  request: 0, detailRequest: 0, scanTimer: null, scrollTimer: null, qTimer: null, durTimer: null,
   thumbBusy: false, scanRunning: false, noRoots: false, rootsState: [],
   posterTried: new Set(), posterTimers: [], vObs: null,      // vObs：全页共用的一个视频挂载观察器
   popKind: "", popAnchor: null, foldersOpen: false,
-  _dirsFromPanel: [],
+  _dirsFromPanel: [], _durError: "",
 };
 
 function libEl(id) { return document.getElementById(id); }
@@ -5482,6 +5494,22 @@ function libDay(ts) { const d = new Date(Number(ts || 0) * 1000); const p = (n) 
 function libDur(sec) {
   const s = Number(sec || 0); if (!s) return "";
   return s < 60 ? s.toFixed(1) + " 秒" : Math.floor(s / 60) + " 分" + String(Math.round(s % 60)).padStart(2, "0") + " 秒";
+}
+// 帧率：后端读得到才显示（§15.1.5 明确「拿不到就是 None，不得默认 30」），这里只做两位小数格式化
+function libFps(v) {
+  if (v == null || v === "") return "";
+  const n = Number(v);
+  return isFinite(n) && n > 0 ? n.toFixed(2) + " fps" : "";
+}
+// 参数来源标注：只有 extra.params_source 确实是 'field_name' 才标（§15.2 的 provenance），
+// 文案与 class 沿用提示词那一款（.dt-sec-hint「按字段名提取」），不另起一套样式；
+// params_fields 若有就放进 title，如实说明命中了哪些字段名。
+function libParamsSourceHint(extra) {
+  if (!extra || typeof extra !== "object" || extra.params_source !== "field_name") return "";
+  const fields = (Array.isArray(extra.params_fields) ? extra.params_fields : [])
+    .map((x) => String(x == null ? "" : x).trim()).filter(Boolean);
+  const tip = fields.length ? "参数按工作流里的字段名回收：" + fields.join("、") : "参数按工作流里的字段名回收，不是链条解析结果";
+  return '<span class="dt-sec-hint" title="' + esc(tip) + '">按字段名提取</span>';
 }
 // 任何我们创建过的 <video> 都要清理：只 pause 不够（本仓库修过一次"关掉还在播"的 bug），
 // 但摘掉 src 只用于"节点即将被重建"的场合；网格卡片走 libReleaseVideo，顺带撤销未完成的抓帧尝试
@@ -5520,6 +5548,7 @@ function libPopPosition(pop, anchor) {
 }
 function libHidePopovers() {
   libPopHide(libEl("libTagPop"));
+  libPopHide(libEl("libSelTagPop"));            // 批量标签浮层与它同属一套 portal，Esc/外点一起收
   const folders = libEl("libFoldersPanel");
   if (folders) folders.hidden = true;          // 目录面板靠 hidden 开关（A4 的 .folders-panel 绝对定位在 #libFoldersWrap 内）
   const btn = libEl("libFoldersBtn");
@@ -5554,6 +5583,7 @@ function libSetRootHint() {
 function libScanIfNeeded() {
   // 进页只做一次「是否该增量扫描」的判断（后端按 last_scan_at ≥60s 或有新文件迹象决定）
   libHookCardVideos(libEl("libGrid"));      // 回页先把在场的卡片交回观察器，哪怕本轮不重绘网格
+  libFacetRemeasure();                      // 页面刚转为可见：分面组溢出与否要按当前布局重量一次
   api.call("lib_rescan_if_stale").then((r) => {
     lib.noRoots = !!(r && r.reason === "no_roots");
     libSetRootHint();
@@ -5606,6 +5636,22 @@ function libStopScanPoll() {
 }
 
 // ---------- 列表加载 ----------
+// 时长输入：留空＝不限（不发给服务端）；非负数才有效；两端都填时下限不得大于上限。
+// 返回值 {min,max,error}——error 非空时调用方必须当场提示并且**不发请求**（§15.3.1）。
+function libParseDur(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return null;                        // 留空 = 这一端不限
+  const n = Number(s);
+  if (!isFinite(n) || n < 0) return NaN;      // 非数字 / 负数 = 非法
+  return n;
+}
+function libReadDurations() {
+  const min = libParseDur(libVal("libDurMin")), max = libParseDur(libVal("libDurMax"));
+  if (typeof min === "number" && isNaN(min)) return { min: null, max: null, error: "时长下限要是不小于 0 的秒数，留空表示不限" };
+  if (typeof max === "number" && isNaN(max)) return { min: null, max: null, error: "时长上限要是不小于 0 的秒数，留空表示不限" };
+  if (min != null && max != null && min > max) return { min: min, max: max, error: "时长下限不能大于上限（" + min + " 秒 > " + max + " 秒）" };
+  return { min: min, max: max, error: "" };
+}
 function libReadControls() {
   const f = lib.filters;
   f.kind = libVal("libKindF");
@@ -5620,23 +5666,41 @@ function libReadControls() {
   // 目录有两个入口：下拉（单选）与面板（多选）。下拉有值时以它为准，否则沿用面板的多选集合。
   if (dir) f.dirs = [dir]; else f.dirs = lib._dirsFromPanel.slice();
   f.q = libVal("libQ").trim();
+  // samplers / schedulers / sizes 的真相在 lib.filters（chip 组由 lib.filters 反着渲染，DOM 里没有独立状态），
+  // 这里不动它们；时长区间是输入框，照其它控件一样从 DOM 回收，非法值保留上一份有效值并记下 error。
+  const dur = libReadDurations();
+  lib._durError = dur.error;
+  if (!dur.error) { f.duration_min = dur.min; f.duration_max = dur.max; }
 }
 function libBuildFlt(offset) {
   const f = lib.filters;
-  return {
+  const flt = {
     kind: f.kind, checkpoints: f.checkpoints, loras: f.loras, dirs: f.dirs, tag_ids: f.tag_ids,
     starred: f.starred, no_meta: f.no_meta, q: f.q, sort: f.sort, group_by: f.group_by,
+    samplers: f.samplers, schedulers: f.schedulers, sizes: f.sizes,
     offset: offset, limit: libLimit(),
   };
+  // 留空就不传（§15.2.4 的口径：缺键＝该维度不限），别把 null 发过去让服务端按 0 处理
+  if (f.duration_min != null) flt.duration_min = f.duration_min;
+  if (f.duration_max != null) flt.duration_max = f.duration_max;
+  return flt;
 }
 function libHasFilter() {
   const f = lib.filters;
-  return !!(f.kind || f.q || f.starred || f.no_meta || f.checkpoints.length || f.loras.length || f.dirs.length || f.tag_ids.length);
+  return !!(f.kind || f.q || f.starred || f.no_meta || f.checkpoints.length || f.loras.length || f.dirs.length || f.tag_ids.length ||
+    f.samplers.length || f.schedulers.length || f.sizes.length || f.duration_min != null || f.duration_max != null);
 }
 async function libLoad(reset) {
   const grid = libEl("libGrid"); if (!grid) return;
-  if (reset) { lib.request++; lib.rows = []; lib.offset = 0; libReadControls(); }   // 重置即重读控件：筛选状态只有一个真相来源（DOM）
+  // 先读控件再作废当前列表：时长区间非法时只提示、直接返回，屏幕上的列表保持原样（不发请求）。
+  if (reset) {
+    libReadControls();
+    if (lib._durError) { setStatus(lib._durError); return; }
+    lib.request++; lib.rows = []; lib.offset = 0;
+  }
   const flt = libBuildFlt(reset ? 0 : lib.offset);
+  // 续拉分页不重算分面：真实库实测 facets ~130ms，是整页耗时的主要来源，翻页时用不上
+  flt.with_facets = reset ? 1 : 0;
   const token = lib.request;
   lib.loading = true; libSetLoading(true); libUpdateEmpty();
   let data = null;
@@ -5648,22 +5712,25 @@ async function libLoad(reset) {
   lib.loading = false; libSetLoading(false);
   if (!data || data.ok === false) {
     libSetScanHint("资源库读取失败" + (data && data.msg ? "：" + data.msg : ""));
-    libRenderGrid(); libUpdateStats(); libUpdateEmpty(); return;
+    libRenderGrid(); libUpdateStats(); libUpdateEmpty(); libUpdateSelUi(); return;
   }
   const items = Array.isArray(data.items) ? data.items : [];
   lib.total = Number(data.total || 0);
   if (Number(data.limit)) lib.limit = Number(data.limit);
   lib.offset = Number(flt.offset) + items.length;                  // 续拉偏移按实际返回条数推进，不受服务端回显影响
   if (reset) lib.rows = items; else lib.rows = lib.rows.concat(items);
-  if (data.facets) { lib.facets = data.facets; libFillFacets(); }
+  if (data.facets && !data.facets_skipped) { lib.facets = data.facets; libFillFacets(); }
   // #libScanHint 在空闲时改读「库里有多少」，别停在几轮前的"扫描中…"上
   if (!lib.scanRunning) {
     const cur = (libEl("libScanHint") || {}).textContent || "";
     if (!cur || /扫描中|未扫描|读取失败/.test(cur)) libSetScanHint(lib.noRoots ? "未配置资源目录" : "库内 " + lib.total + " 项");
   }
-  lib.sel.clear();
+  // 已选集合跨页、跨筛选保留（直到用户点「清除选择」或批量删除），所以这里**不再** lib.sel.clear()。
+  // 换筛选/重置时列表换了天地，shift 范围选的锚点下标必须先作废，否则会圈进不相干的条目。
+  if (reset) lib.selAnchor = null;
+  libRememberRows(items);
   if (reset) libRenderGrid(); else libAppendCards(items);
-  libUpdateStats(); libUpdateEmpty(); libUpdateMore(); libPrefetchThumbs();
+  libUpdateStats(); libUpdateEmpty(); libUpdateMore(); libUpdateSelUi(); libPrefetchThumbs();
 }
 function libGroupHtml(group, last) {
   if (!group || group === last) return "";
@@ -5671,6 +5738,7 @@ function libGroupHtml(group, last) {
 }
 function libCardHtml(it) {
   const isVid = it.kind === "video";
+  const selected = lib.sel.has(String(it.id));
   const dims = isVid ? libDur(it.duration) : (it.width && it.height ? it.width + "×" + it.height : "");
   const sub = [it.checkpoint ? short(String(it.checkpoint), 20) : "", dims].filter(Boolean).join(" · ");
   // 后端已经把 prompt 前 120 字算成 snippet：卡片没地方全文展示，就挂在文件名 tooltip 上（悬停即读）。
@@ -5686,8 +5754,12 @@ function libCardHtml(it) {
     : '<img class="ms-img" decoding="async" alt="" data-path="' + esc(it.path) + '"/>';
   const chips = (Array.isArray(it.tags) ? it.tags : []).slice(0, 3)
     .map((t) => '<span class="lib-chip"' + (t.color ? ' style="border-color:' + esc(t.color) + '"' : "") + ">" + esc(t.name) + "</span>").join("");
-  return '<div class="ms-card lib-card" tabindex="0" data-id="' + esc(String(it.id)) + '" data-path="' + esc(it.path) + '" data-kind="' + esc(it.kind) + '"' +
+  return '<div class="ms-card lib-card' + (selected ? " checked" : "") + (String(it.id) === String(lib.current) ? " is-current" : "") + '" tabindex="0" data-id="' + esc(String(it.id)) + '" data-path="' + esc(it.path) + '" data-kind="' + esc(it.kind) + '"' +
     ' title="' + esc(String(it.filename || "") + " · " + String(it.path || "")) + '">' +
+    // 多选态才可见的勾选框（可见性由 #libGrid.lib-selecting 管，见 style.css）：
+    // 结构、类名与模型库瀑布流完全一致（.ms-check + .cbox），卡片本身仍是单击切换的地方，
+    // 所以这里只当指示器，不给它自己的交互与语义（aria-hidden）。
+    '<span class="ms-check" aria-hidden="true">' + (selected ? '<span class="cbox on"></span>' : '<span class="cbox"></span>') + "</span>" +
     '<div class="ms-img-wrap" data-ph="' + ((isVid && !it.thumb) ? "ok" : "loading") + '">' + media +
     (isVid ? '<span class="thumb-video-badge">▶</span>' : "") +
     (it.has_meta ? "" : '<span class="lib-badge-meta" title="无内嵌元数据">?</span>') +
@@ -5703,6 +5775,9 @@ function libRenderGrid() {
   const vp = libEl("libViewport"), keepTop = vp ? vp.scrollTop : 0;   // 重绘不回顶部（收藏/删标签都会重绘）
   if (lib.vObs) lib.vObs.disconnect();                                 // 旧节点全部作废：先解绑再重挂，避免观察器攥着已丢弃的元素
   libTeardownVideos(grid);
+  // 多选态是网格上的一个类，重绘（含切页回来）都要照着 lib.selectMode 补回来，
+  // 不靠「切开关时重绘一次」——卡片 HTML 里的勾选框一直渲着，只由它决定可见与否。
+  grid.classList.toggle("lib-selecting", !!lib.selectMode);
   let last = "", html = "";
   for (const it of lib.rows) { const g = libGroupHtml(it.group, last); if (g) { last = it.group; html += g; } html += libCardHtml(it); }
   grid.innerHTML = html;
@@ -5756,6 +5831,552 @@ function libUpdateEmpty() {
   const t = empty.querySelector(".lib-empty-title"), h = empty.querySelector(".hint");
   if (t || h) { if (t) t.textContent = title; if (h) h.textContent = hint; }
   else empty.textContent = title + "：" + hint;
+}
+
+// ---------- 多选与批量操作 ----------
+// 分片口径：服务端 _LIB_BATCH_MAX = 2000 个 id 一次（webui.py），前端按 500 一片提交，
+// 每片各自累计成功数；某片抛错/返回 ok=false 只把该片 id 记成失败，后面的片照发（不因一条坏数据废掉整批）。
+const LIB_BATCH_CHUNK = 500;
+const LIB_SWEEP_LIMIT = 500;          // #libSelAllFilter 逐批取 id 的 limit（服务端硬上限也是 500）
+const LIB_SWEEP_MAX_BATCHES = 200;    // 单次最多发多少批，兜住 total 回显异常时的死循环
+const LIB_SWEEP_MAX_IDS = 50000;      // 单次最多取回多少个 id；到顶就如实说「其余未选」
+const LIB_BYID_MAX = 30000;           // id→路径 台账的会话上限（超了先丢掉用不上的）
+
+function libChunk(arr) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += LIB_BATCH_CHUNK) out.push(arr.slice(i, i + LIB_BATCH_CHUNK));
+  return out;
+}
+function libSelIds() { return Array.from(lib.sel).map((s) => Number(s)).filter((n) => n > 0); }
+// id → {path, kind, hasMeta}：列表加载与「选中筛选全部」都会登记。跨页选中的条目本地没有行数据，
+// 送逆向／送工作流要靠这本账把 id 还原成文件路径；拿不到就如实跳过并报数，绝不猜。
+function libRememberRows(items) {
+  if (lib.byId.size > LIB_BYID_MAX) libPruneById();
+  for (const it of items) {
+    if (!it || it.id == null) continue;
+    lib.byId.set(String(it.id), { path: String(it.path || ""), kind: String(it.kind || ""), hasMeta: !!it.has_meta });
+  }
+}
+function libPruneById() {
+  const keep = new Set(lib.sel);
+  for (const r of lib.rows) keep.add(String(r.id));
+  for (const k of Array.from(lib.byId.keys())) if (!keep.has(k)) lib.byId.delete(k);
+}
+function libByIdOf(id) {
+  const k = String(id);
+  const rec = lib.byId.get(k);
+  if (rec && rec.path) return rec;
+  const row = libRowById(k);
+  if (row) return { path: String(row.path || ""), kind: String(row.kind || ""), hasMeta: !!row.has_meta };
+  return rec || null;
+}
+// 已选里哪些真能送出去：逆向沿用单条详情的口径（只有图片送），工作流沿用「有内嵌元数据才按」
+function libSelTargets() {
+  const out = { reverse: [], workflow: [], noPath: 0, video: 0 };
+  for (const k of lib.sel) {
+    const rec = libByIdOf(k);
+    if (!rec || !rec.path) { out.noPath++; continue; }
+    if (rec.kind === "video") { out.video++; continue; }
+    out.reverse.push(rec.path);
+    if (rec.hasMeta) out.workflow.push(rec.path);
+  }
+  return out;
+}
+
+function libCardEl(id) {
+  const grid = libEl("libGrid"); if (!grid) return null;
+  return grid.querySelector('.lib-card[data-id="' + CSS.escape(String(id)) + '"]');
+}
+function libPaintCard(card) {
+  if (!card) return;
+  const on = lib.sel.has(card.dataset.id);
+  card.classList.toggle("checked", on);
+  const chk = card.querySelector(".ms-check");
+  if (chk) chk.innerHTML = on ? '<span class="cbox on"></span>' : '<span class="cbox"></span>';
+}
+function libPaintAllCards() {
+  const grid = libEl("libGrid"); if (!grid) return;
+  grid.querySelectorAll(".lib-card").forEach(libPaintCard);
+}
+// 开关多选：只切网格上的一个类 + 显示选择行。不重绘网格（勾选框本来就在卡片里，靠 CSS 决定显隐），
+// 这样缩略图缓存、视频懒挂载、滚动位置都不受开关影响；已选集合也不动。
+function libSetSelectMode(on) {
+  lib.selectMode = !!on;
+  const grid = libEl("libGrid");
+  if (grid) grid.classList.toggle("lib-selecting", lib.selectMode);
+  const row = libEl("libSelRow");
+  if (row) row.hidden = !lib.selectMode;
+  libUpdateSelUi();
+}
+function libActivateCard(card, shift) {
+  if (!card) return;
+  const id = card.dataset.id;
+  if (lib.selectMode) { libSelectClick(id, shift); return; }
+  // 非多选态：单击行为与改动前一致（打开详情）。只是高亮类分了家——.checked 归批量已选、
+  // 当前详情对应的那张卡用 .is-current，批量选择不会再被「顺手点一张卡」冲掉。
+  lib.current = String(id);
+  const grid = libEl("libGrid");
+  if (grid) grid.querySelectorAll(".lib-card.is-current").forEach((c) => { if (c !== card) c.classList.remove("is-current"); });
+  card.classList.add("is-current");
+  libShowDetail(id);
+}
+// 多选态单击＝切换选中；shift 点选在「当页」（= lib.rows 已加载的这段）里做范围选
+function libSelectClick(id, shift) {
+  const k = String(id);
+  const idx = lib.rows.findIndex((r) => String(r.id) === k);
+  if (shift && lib.selAnchor != null && idx >= 0) {
+    const a = Math.min(lib.selAnchor, idx), b = Math.max(lib.selAnchor, idx);
+    for (let i = a; i <= b; i++) { const r = lib.rows[i]; if (r && r.id != null) lib.sel.add(String(r.id)); }
+    libPaintAllCards();                     // 范围可能横跨几十张卡，整网格刷一遍比逐张 querySelector 便宜
+  } else {
+    if (lib.sel.has(k)) lib.sel.delete(k); else lib.sel.add(k);
+    lib.selAnchor = idx >= 0 ? idx : null;
+    libPaintCard(libCardEl(k));
+  }
+  libUpdateStats(); libUpdateSelUi();
+}
+function libSelAllPage() {
+  if (lib.selFetching || lib.batchRunning) { setStatus("有作业在跑，请等它结束"); return; }
+  if (!lib.rows.length) { setStatus("当页还没加载出条目：先滚动加载更多，或回上面重新扫描"); return; }
+  libRememberRows(lib.rows);
+  let added = 0;
+  for (const r of lib.rows) { if (r && r.id != null && !lib.sel.has(String(r.id))) { lib.sel.add(String(r.id)); added++; } }
+  libPaintAllCards(); libUpdateStats(); libUpdateSelUi();
+  setStatus("已选中当页已加载的 " + lib.rows.length + " 项（本次新增 " + added + " 项，累计已选 " + lib.sel.size + " 项）");
+}
+function libSelClear() {
+  if (lib.batchRunning) { setStatus("批量动作还在跑，请等它结束"); return; }
+  if (!lib.sel.size) { setStatus("已选集合本来就是空的"); return; }
+  const n = lib.sel.size;
+  lib.sel.clear(); lib.selTagIds.clear(); lib.selAnchor = null; libSetProg("");
+  libPaintAllCards(); libUpdateStats(); libUpdateSelUi();
+  setStatus("已清除 " + n + " 项选择（只清选择，没动任何文件与库里的行）");
+}
+// 「选中当前筛选条件下的全部结果」：服务端分页，本地只有 lib.rows，所以用同一份 flt
+// 以 limit=500 逐批把 id 拉全再并入。这里不碰 lib.request／lib.rows——列表本身不重绘，
+// 只在已选集合上累加，避免把用户正在看的滚动位置打断。
+async function libSelAllFilter() {
+  if (lib.batchRunning) { setStatus("批量动作还在跑，请等它结束"); return; }
+  if (lib.selFetching) {                     // 再点一次＝停：令牌作废，已并入的部分留着
+    lib.selFetchToken++; lib.selFetching = false; libSetProg(""); libUpdateSelUi();
+    setStatus("已停止取 id，已并入的 " + lib.sel.size + " 项保留");
+    return;
+  }
+  libReadControls();
+  if (lib._durError) { setStatus(lib._durError); return; }   // 非法区间当场拦住，不发查询
+  const token = ++lib.selFetchToken;
+  lib.selFetching = true; libUpdateSelUi();
+  let offset = 0, fetched = 0, total = 0, added = 0, calls = 0, stop = "";
+  while (true) {
+    if (token !== lib.selFetchToken || !libPageActive()) { stop = stop || "已离开资源库页"; break; }
+    const flt = libBuildFlt(offset);
+    flt.limit = LIB_SWEEP_LIMIT;
+    let data = null;
+    try {
+      const raw = await api.call("lib_list", JSON.stringify(flt));
+      data = typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || null);
+    } catch (e) { data = null; }
+    calls++;
+    if (!data || data.ok === false) { stop = "第 " + calls + " 批读取失败" + (data && data.msg ? "（" + short(String(data.msg), 40) + "）" : ""); break; }
+    const items = Array.isArray(data.items) ? data.items : [];
+    total = Number(data.total || 0);
+    libRememberRows(items);
+    for (const it of items) { if (it && it.id != null && !lib.sel.has(String(it.id))) { lib.sel.add(String(it.id)); added++; } }
+    fetched += items.length;
+    offset = Number(flt.offset) + items.length;
+    libSetProg("正在按当前筛选取 id：" + fetched + " / " + total + "（第 " + calls + " 批 ×" + LIB_SWEEP_LIMIT + "）");
+    if (calls % 10 === 0) setStatus("取 id 中：已取 " + fetched + "/" + total + "（" + calls + " 批）");
+    if (!items.length || offset >= total) break;
+    if (fetched >= LIB_SWEEP_MAX_IDS) { stop = "已达单次上限 " + LIB_SWEEP_MAX_IDS + " 项"; break; }
+    if (calls >= LIB_SWEEP_MAX_BATCHES) { stop = "已达单次上限 " + LIB_SWEEP_MAX_BATCHES + " 批"; break; }
+  }
+  lib.selFetching = false; libSetProg("");
+  libPaintAllCards(); libUpdateStats(); libUpdateSelUi();
+  setStatus("已按当前筛选并入 " + added + " 项，累计已选 " + lib.sel.size + " 项（取 id " + calls + " 批 ×" + LIB_SWEEP_LIMIT + "）" + (stop ? "，" + stop + "，其余未选" : ""));
+}
+
+// ---------- 批量动作的公共骨架 ----------
+function libSetProg(text) {
+  lib.prog = String(text || "");
+  const p = libEl("libSelProg");
+  if (p) { p.textContent = lib.prog; p.hidden = !lib.prog; }
+  const cnt = libEl("libSelBarCount");
+  if (cnt) cnt.textContent = lib.prog || ("已选 " + lib.sel.size + " 项");
+}
+function libUpdateSelUi() {
+  const n = lib.sel.size, busy = !!(lib.batchRunning || lib.selFetching);
+  const bar = libEl("libSelBar");
+  if (bar) bar.hidden = !n;                                   // 空集合不浮操作条，免得一屋子禁用按钮
+  libSetProg(lib.prog);
+  const st = libEl("libSelState");
+  if (st) st.textContent = lib.prog || (n ? "已选 " + n + " 项" : (lib.selectMode ? "未选中任何项" : "多选已关闭"));
+  const set = (id, on, tip) => {
+    const el = libEl(id); if (!el) return;
+    el.disabled = busy || !on;
+    // 动态说明写 data-tip（本仓库自己的悬浮提示读它），不要写 title：
+    // 写了就会同时冒出浏览器原生气泡 + 软件气泡，两层提示叠着看很乱。
+    if (tip !== undefined) el.dataset.tip = tip;
+  };
+  const allPage = libEl("libSelAllPage");
+  if (allPage) { allPage.disabled = busy; allPage.textContent = lib.rows.length ? ("选中当页已加载 " + lib.rows.length + " 项") : "选中当页已加载"; }
+  const allFilter = libEl("libSelAllFilter");
+  if (allFilter) { allFilter.disabled = lib.batchRunning; allFilter.textContent = lib.selFetching ? "停止取 id" : "选中筛选结果全部"; }
+  const clear = libEl("libSelClear"); if (clear) clear.disabled = busy || !n;
+  const t = libSelTargets();
+  set("libSelStar", n > 0, "批量收藏已选的 " + n + " 项：只改库里的标记，不动文件");
+  set("libSelUnstar", n > 0, "批量取消收藏已选的 " + n + " 项");
+  set("libSelTagAdd", n > 0, "给已选的 " + n + " 项加标签（并集，不动原有标签）");
+  set("libSelTagRemove", n > 0, "从已选的 " + n + " 项摘标签");
+  set("libSelDelete", n > 0, "删除已选的 " + n + " 项：文件进回收站，同名 .json 不删");
+  // 送分析两个按钮要能把 id 还原成文件路径才有意义：能送的数写在 title 里，
+  // 一个都还原不出来时说明原因，而不是摆个「点了没反应」的按钮。
+  const revTip = t.reverse.length
+    ? ("把这 " + t.reverse.length + " 张图片按文件哈希加入反向解析列表" +
+       ((t.video || t.noPath) ? "（已跳过 " + t.video + " 个视频、" + t.noPath + " 个本地取不到路径的）" : ""))
+    : ("已选里没有能送去逆向解析的图片（只有图片能送，且本地要取到文件路径；共 " + n + " 项已选）");
+  set("libSelReverse", t.reverse.length > 0, revTip);
+  const wfTip = t.workflow.length
+    ? ("送工作流分析：分析页一次只展示一个结果，会送这 " + t.workflow.length + " 个里的第 1 个")
+    : "已选里没有能分析的文件（要带内嵌元数据，且本地能取到文件路径）";
+  set("libSelWorkflow", t.workflow.length > 0, wfTip);
+}
+async function libRunChunks(label, chunks, run) {
+  const totalIds = chunks.reduce((s, c) => s + c.length, 0);
+  let processed = 0, done = 0, failed = 0, lastMsg = "";
+  for (const chunk of chunks) {
+    let r = null;
+    try { r = await run(chunk); } catch (e) { r = null; }
+    processed += chunk.length;
+    if (r && r.ok) done += Number(r.count != null ? r.count : chunk.length);
+    else { failed += chunk.length; lastMsg = (r && r.msg) || "请求失败"; }
+    const prog = label + "：已处理 " + processed + "/" + totalIds + (failed ? "（失败 " + failed + "）" : "");
+    libSetProg(prog); setStatus(prog);                       // §7：过程用 setStatus 播报
+  }
+  return { done, failed, processed: totalIds, chunks: chunks.length, lastMsg };
+}
+function libBatchSummary(label, res, extra) {
+  const bits = [label + "完成：" + res.done + " 项生效"];
+  if (res.failed) bits.push(res.failed + " 项失败" + (res.lastMsg ? "（" + short(String(res.lastMsg), 40) + "）" : ""));
+  const ignored = res.processed - res.done - res.failed;      // 服务端 count 只算库里真存在的行，未知 id 自动忽略
+  if (ignored > 0) bits.push(ignored + " 项库里已查不到");
+  if (extra) bits.push(extra);
+  bits.push("共 " + res.chunks + " 片 ×" + LIB_BATCH_CHUNK);
+  return bits.join("，");
+}
+async function libBatchAction(label, run) {
+  if (lib.batchRunning) { setStatus("上一个批量动作还在跑，请等它结束"); return null; }
+  if (lib.selFetching) { setStatus("「选中筛选结果全部」还在取 id，请等它结束或再点一次停止"); return null; }
+  const ids = libSelIds();
+  if (!ids.length) { setStatus("先勾选要批量操作的资源：筛选行里打开「多选」，单击卡片即选中"); return null; }
+  const chunks = libChunk(ids);
+  lib.batchRunning = true; libUpdateSelUi();
+  let res = null;
+  try { res = await libRunChunks(label, chunks, run); }
+  finally { lib.batchRunning = false; libSetProg(""); libUpdateSelUi(); }
+  return res;
+}
+// 批量改完数据后的统一收尾：走既有的重载路径（libLoad(true) 顺带把 facets 计数与统计条一起刷新）
+function libAfterBatchMutate() {
+  libUpdateStats(); libUpdateSelUi();
+  return libLoad(true);
+}
+function libBatchStar(on) {
+  const label = on ? "批量收藏" : "批量取消收藏";
+  return libBatchAction(label, (c) => api.call("lib_set_star_batch", JSON.stringify(c), on))
+    .then((res) => { if (!res) return; setStatus(libBatchSummary(label, res)); return libAfterBatchMutate(); });
+}
+function libMergeRowTags(byId) {
+  for (const k of Object.keys(byId || {})) {
+    const row = libRowById(k);
+    if (row) row.tags = Array.isArray(byId[k]) ? byId[k] : [];   // 服务端回的是结果态（并集/已摘），直接落到行数据
+  }
+}
+function libBatchTags(mode, tagIds) {
+  const method = mode === "add" ? "lib_tag_add_batch" : "lib_tag_remove_batch";
+  const label = mode === "add" ? "批量加标签" : "批量摘标签";
+  return libBatchAction(label, (c) => api.call(method, JSON.stringify(c), JSON.stringify(tagIds)).then((r) => {
+    if (r && r.ok && r.tags) libMergeRowTags(r.tags);
+    return r;
+  })).then((res) => {
+    if (!res) return;
+    setStatus(libBatchSummary(label, res, "标签 " + tagIds.length + " 个"));
+    lib.selTagIds.clear();
+    // 标签计数变了：#libTagF 与浮层要跟着换（libEnsureTags→libAfterTagChange），再走列表重载
+    return libEnsureTags().then(() => { libAfterTagChange(); return libAfterBatchMutate(); });
+  });
+}
+function libDeleteConfirmText(n) {
+  return "删除已选的 " + n + " 项？文件会被移进系统回收站（不是彻底删除，可从回收站还原），库里的行同时标记为已删除。" +
+    "同名 .json 工作流文件不会删除：ComfyUI 用它同时存放本媒体与同名兄弟文件（图片／视频共用一份生成数据）的元数据，删掉会连带毁掉兄弟文件的元数据。" +
+    "这一步只碰本地文件，不访问 C 站，也不动模型库。";
+}
+async function libBatchDelete() {
+  if (lib.batchRunning || lib.selFetching) { setStatus("有作业在跑，请等它结束"); return; }
+  const ids = libSelIds();
+  if (!ids.length) { setStatus("先勾选要批量删除的资源"); return; }
+  if (!(await confirmBox(libDeleteConfirmText(ids.length)))) { setStatus("已取消删除，什么都没动"); return; }
+  const chunks = libChunk(ids);
+  lib.batchRunning = true; libUpdateSelUi();
+  let processed = 0, deleted = 0, missing = 0, failed = 0, lastMsg = "";
+  try {
+    for (const chunk of chunks) {
+      let r = null;
+      try { r = await api.call("lib_delete_batch", JSON.stringify(chunk)); } catch (e) { r = null; }
+      processed += chunk.length;
+      if (r && r.ok) { deleted += Number(r.deleted || 0); missing += Number(r.missing || 0); }
+      else { failed += chunk.length; lastMsg = (r && r.msg) || "请求失败"; }
+      const prog = "批量删除：已处理 " + processed + "/" + ids.length + (deleted ? "（已进回收站 " + deleted + "）" : "");
+      libSetProg(prog); setStatus(prog);
+    }
+  } finally {
+    lib.batchRunning = false; libSetProg("");
+  }
+  // 删除后这些 id 必须从已选集合摘掉（否则操作条攥着一堆已经不存在的行），顺带清掉它们的本地台账与缩略图缓存
+  const paths = [];
+  for (const id of ids) {
+    const k = String(id), rec = lib.byId.get(k);
+    if (rec && rec.path) paths.push(rec.path);
+    lib.sel.delete(k); lib.byId.delete(k);
+  }
+  for (const p of paths) { lib.thumbCache.delete(p); lib.posterTried.delete(p); }
+  if (lib.current != null && ids.some((id) => String(id) === String(lib.current))) lib.current = null;
+  const bits = ["批量删除完成：" + deleted + " 个文件已进回收站"];
+  if (missing) bits.push(missing + " 项文件本来就不在磁盘上（只标记，没报错）");
+  if (failed) bits.push(failed + " 项失败" + (lastMsg ? "（" + short(lastMsg, 40) + "）" : ""));
+  setStatus(bits.join("，") + "，共 " + chunks.length + " 片 ×" + LIB_BATCH_CHUNK + "；同名 .json 侧车有意保留");
+  await libAfterBatchMutate();
+}
+function libBatchReverse() {
+  if (lib.batchRunning || lib.selFetching) { setStatus("有作业在跑，请等它结束"); return; }
+  const t = libSelTargets();
+  if (!t.reverse.length) {
+    setStatus("已选里没有能送去逆向解析的图片" + (t.noPath ? "（" + t.noPath + " 项本地取不到文件路径，先用「选中筛选结果全部」把 id 与路径取回来）" : "（只有图片能送，视频按单条详情的同一口径不送）"));
+    return;
+  }
+  const chunks = libChunk(t.reverse);
+  let sent = 0, failed = 0, blocked = false;
+  const step = (i) => {
+    if (i >= chunks.length) return Promise.resolve();
+    return api.call("rp_add_paths", chunks[i]).then((ok) => {
+      if (ok) { sent += chunks[i].length; setStatus("送逆向解析：已处理 " + Math.min(i * LIB_BATCH_CHUNK + chunks[i].length, t.reverse.length) + "/" + t.reverse.length); return step(i + 1); }
+      // 返回 false＝api 包装层拦下了（缺 Civitai Key：它已经提示并弹引导），
+      // 这里不再叠一条状态、也不再往后发，与单条详情「if (!ok) return」同一处理。
+      blocked = true;
+      return Promise.resolve();
+    }).catch(() => { failed += chunks[i].length; return step(i + 1); });     // 单片抛错不中断整批
+  };
+  return step(0).then(() => {
+    if (blocked) return;
+    if (!sent) { setStatus("送去反向解析失败：列表一个文件都没收到（可以再去反向解析页确认）"); return; }
+    libLeavePage();
+    switchPage("reverse");
+    if (typeof rpRefresh === "function") rpRefresh();
+    const skip = [];
+    if (t.video) skip.push(t.video + " 个视频");
+    if (t.noPath) skip.push(t.noPath + " 个取不到路径的");
+    setStatus("已送去逆向解析 " + sent + " 张图片" + (failed ? "，" + failed + " 个提交失败" : "") + (skip.length ? "，跳过 " + skip.join("、") : "") + "：在反向解析页点「开始反查」才会联网查询");
+  });
+}
+function libBatchWorkflow() {
+  if (lib.batchRunning || lib.selFetching) { setStatus("有作业在跑，请等它结束"); return; }
+  const t = libSelTargets();
+  if (!t.workflow.length) { setStatus("已选里没有能分析的文件：要带内嵌元数据、且本地能取到文件路径"); return; }
+  const first = String(t.workflow[0] || "");
+  libCloseDetail(); libLeavePage();
+  switchPage("workflow");
+  if (typeof wfAnalyze === "function") wfAnalyze(first); else api.call("analyze_workflow", first).catch(() => { });
+  setStatus(t.workflow.length > 1
+    ? "工作流分析一次只展示一个结果：已送已选里第 1 个（" + short(first.split(/[\\/]/).pop() || "", 24) + "），另有 " + (t.workflow.length - 1) + " 个可分析"
+    : "已送工作流分析：" + short(first.split(/[\\/]/).pop() || "", 24));
+}
+
+// ---------- 批量标签浮层（先勾标签，再一次应用） ----------
+function libSelTagSlot(pop) { return pop.querySelector("[data-lib-slot='sel-chips']") || pop; }
+function libToggleSelTagPop(anchor, mode) {
+  if (lib.popKind === "seltags" && lib.selTagMode === mode) { libHidePopovers(); return; }   // 同一个按钮再点＝收起
+  libOpenSelTagPop(anchor, mode);
+}
+function libOpenSelTagPop(anchor, mode) {
+  const pop = libEl("libSelTagPop");
+  if (!pop) return;
+  if (!lib.sel.size) { setStatus("先勾选要批量打标签的资源"); return; }
+  lib.popKind = "seltags"; lib.selTagMode = mode === "remove" ? "remove" : "add";
+  lib.selTagIds.clear();                                       // 每次开浮层都从空勾选开始，避免「上次没点的标签被带进这次」
+  libPopShow(pop, anchor);
+  libSelTagSlot(pop).innerHTML = '<span class="dt-dim">读取标签中…</span>';
+  libRenderSelTagPop(pop);                                     // 说明与「应用」按钮的数是本地已知数，先给出来
+  libEnsureTags().then(() => { if (lib.popKind === "seltags" && !pop.hidden) libRenderSelTagPop(pop); });
+}
+function libRenderSelTagPop(pop) {
+  if (!pop) return;
+  const mode = lib.selTagMode === "remove" ? "remove" : "add", n = lib.sel.size;
+  const hint = libEl("libSelTagHint");
+  if (hint) hint.textContent = mode === "add"
+    ? "点一下选中要添加的标签，可多选。加上去是并集，不会动这些条目原有的标签。"
+    : "点一下选中要摘掉的标签，可多选。只从已选的 " + n + " 项上摘，其它条目不受影响。";
+  libSelTagSlot(pop).innerHTML = (lib.tags && lib.tags.length)
+    ? lib.tags.map((tg) => {
+        const on = lib.selTagIds.has(Number(tg.id));
+        return '<span class="lib-chip" role="button" tabindex="0" aria-pressed="' + (on ? "true" : "false") + '" data-lib-sel-tag="' + esc(String(tg.id)) + '"' +
+          (tg.color ? ' style="border-color:' + esc(tg.color) + '"' : "") + ' title="点击' + (on ? "取消勾选" : "勾选") + '">' +
+          esc(tg.name) + (tg.count != null ? " · " + tg.count : "") + "</span>";
+      }).join("")
+    : '<span class="dt-dim">还没有标签：先在单条详情的「打标签」里新建一个</span>';
+  const apply = libEl("libSelTagApply");
+  if (apply) { apply.textContent = mode === "add" ? ("添加到已选 " + n + " 项") : ("从已选 " + n + " 项摘除"); apply.disabled = !lib.selTagIds.size; }
+  const cnt = libEl("libSelTagCount");
+  if (cnt) cnt.textContent = lib.selTagIds.size ? ("已勾 " + lib.selTagIds.size + " 个标签") : "未勾标签";
+}
+function libRunSelTagBatch() {
+  const tagIds = Array.from(lib.selTagIds).map(Number).filter((n) => n > 0);
+  if (!tagIds.length) { setStatus("先在浮层里勾一个标签"); return; }
+  const mode = lib.selTagMode === "remove" ? "remove" : "add";
+  libHidePopovers();
+  return libBatchTags(mode, tagIds);
+}
+// 选择行 / 操作条 / 标签浮层上所有 data-lib-act^="sel-" 的按钮都汇到这里
+function libSelBarAction(act, btn) {
+  if (act === "sel-all-page") return libSelAllPage();
+  if (act === "sel-all-filter") return libSelAllFilter();
+  if (act === "sel-clear") return libSelClear();
+  if (act === "sel-star") return libBatchStar(true);
+  if (act === "sel-unstar") return libBatchStar(false);
+  if (act === "sel-tag-add") return libToggleSelTagPop(btn, "add");
+  if (act === "sel-tag-remove") return libToggleSelTagPop(btn, "remove");
+  if (act === "sel-tag-apply") return libRunSelTagBatch();
+  if (act === "sel-reverse") return libBatchReverse();
+  if (act === "sel-workflow") return libBatchWorkflow();
+  if (act === "sel-delete") return libBatchDelete();
+}
+
+// ---------- 标注导出 / 导入（§18）----------
+// 导出的档案只含「人工做过的事」：收藏 + 标签。身份键是库内相对路径 relpath（＋大小），
+// 换盘符/改目录名后仍认得回来；机器解析出来的提示词与参数不进档案（它们跟着文件走，重扫即得）。
+// 写文件这一步完全在前端做（Blob + a.download，与 image-viewer.js 的 #ivExport 同一条已验证写法，
+// 两种界面模式都可用），不新增任何后端写文件通路。
+const LIB_ANN_KIND = "cft-media-annotations";        // 后端 export_annotations() 里的 kind 字面量
+
+// pywebview 直接给对象、浏览器模式可能给 JSON 字符串：与 lib_detail/lib_tags 同一口径兜一层
+function libAnnObj(raw) {
+  if (typeof raw === "string") { try { return JSON.parse(raw || "null"); } catch (e) { return null; } }
+  return raw && typeof raw === "object" ? raw : null;
+}
+function libAnnNum(v) { const n = Number(v || 0); return isFinite(n) ? n : 0; }
+// 文件名时间戳：资源库标注-20261012-2030.json（本地时区，精确到分：同一分钟里重复导出会撞名，
+// 但浏览器自己会给第二个同名文件加 (1)，比在名字里塞秒更好读）
+function libAnnStamp() {
+  const d = new Date(), p = (n) => String(n).padStart(2, "0");
+  return String(d.getFullYear()) + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes());
+}
+// 两个入口按钮互斥：一次只允许一个作业在跑（导出 23ms／导入试算 38ms，但选文件与确认框会挂着人）
+function libAnnBusy(busy) {
+  const a = libEl("libExportAnn"), b = libEl("libImportAnn");
+  if (a) a.disabled = !!busy;
+  if (b) b.disabled = !!busy;
+}
+async function libExportAnnotations() {
+  if (libEl("libExportAnn") && libEl("libExportAnn").disabled) return;
+  libAnnBusy(true);
+  let res = null;
+  try { res = libAnnObj(await api.call("lib_export_annotations")); } catch (e) { res = null; }
+  finally { libAnnBusy(false); }
+  if (!res) { setStatus("导出标注失败：后端没有返回结果（请确认程序已更新到含标注导出的版本）"); return; }
+  if (!res.ok) { setStatus("导出标注失败：" + ((res && res.msg) || "后端返回 ok=false")); return; }
+  const count = libAnnNum(res.count);
+  if (count <= 0) { setStatus("还没有收藏或标签可导出：先在卡片或详情里点「收藏」、打标签，再来导出"); return; }
+  const data = libAnnObj(res.data);        // data 是完整档案对象；异常就当没拿到，不发空文件
+  if (!data || !Array.isArray(data.items)) { setStatus("导出标注失败：后端没有回档案内容（data 缺失）"); return; }
+  const name = "资源库标注-" + libAnnStamp() + ".json";
+  try {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (e) { setStatus("导出标注失败：浏览器不允许下载（" + ((e && e.message) || "Blob 或下载被拦截") + "）"); return; }
+  setStatus("已导出 " + count + " 条标注 → " + name + "（只含收藏与标签，不含机器解析的元数据）");
+}
+// 坏档案当场报错：不是 JSON / 顶层不是对象 / kind 不对 / 缺 items，都说清是哪一步、为什么。
+// 后端 import_annotations 也会再判一遍（两条口径一致），这里先拦是为了不把一个明显不能用的文件发过去。
+function libAnnCheck(text) {
+  let payload = null;
+  try { payload = JSON.parse(String(text || "")); }
+  catch (e) { return "这个文件不是合法的 JSON（" + ((e && e.message) || "解析失败") + "），多半选错了文件或文件被截断"; }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "档案顶层不是对象（正常导出的最外层是 {kind, version, items…}）";
+  if (payload.kind !== LIB_ANN_KIND) return "档案 kind 是「" + (payload.kind == null ? "（缺失）" : String(payload.kind)) + "」，不是资源库标注导出（" + LIB_ANN_KIND + "）";
+  if (!Array.isArray(payload.items)) return "档案缺少 items 条目列表，读不出要导入的标注";
+  if (!payload.items.length) return "档案里 0 条标注（items 是空列表），没有可导入的东西";
+  return "";
+}
+function libAnnReadFile(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result == null ? "" : fr.result));
+    fr.onerror = () => reject(new Error("文件读不出来（可能被别的程序占用，或没有读取权限）"));
+    fr.readAsText(file, "utf-8");
+  });
+}
+function libPickImportFile() {
+  if (libEl("libImportAnn") && libEl("libImportAnn").disabled) return;
+  const input = libEl("libImportFile");
+  if (!input) { setStatus("导入标注不可用：页面上没有选文件控件（#libImportFile 未就位）"); return; }
+  input.value = "";                       // 允许连着两次选同一个文件：change 只在值变化时发
+  input.click();
+}
+function libAnnCountRow(label, value, hint) {
+  return '<div class="lib-ann-row"><span class="lib-ann-k">' + esc(label) + '</span><b class="lib-ann-v">' + libAnnNum(value) +
+    '</b><span class="lib-ann-h">' + esc(hint) + "</span></div>";
+}
+// 六个计数原样摆出来（含认不出的数量），外加「只补不删」这条口径 —— 全部是后端回的真实数字，不编统计。
+function libAnnPreviewHtml(fileName, s) {
+  const rows = [
+    libAnnCountRow("匹配到", s.matched, "档案里的条目在当前库里认得了（按相对路径＋文件大小）"),
+    libAnnCountRow("要收藏", s.starred, "其中会标成收藏的条目数"),
+    libAnnCountRow("标签关联", s.tags_applied, "要往条目上挂的标签次数（一个条目可带多个标签）"),
+    libAnnCountRow("新建标签", s.tags_created, "库里还没有、导入时会按名字创建的标签数"),
+    libAnnCountRow("认不出", s.unmatched, "当前库里没有这些相对路径：文件被移走/改名，或档案来自另一套目录"),
+    libAnnCountRow("有歧义", s.ambiguous, "同一个相对路径对上多个条目（重名或改过大小），这次不动它们"),
+  ].join("");
+  const skipped = libAnnNum(s.unmatched) + libAnnNum(s.ambiguous);
+  return '<p class="lib-ann-file">档案：<b>' + esc(String(fileName || "")) + "</b>　<span class=\"lib-ann-note\">下面是试算结果，还没有写进库</span></p>" +
+    '<div class="lib-ann-rows">' + rows + "</div>" +
+    '<p class="lib-ann-rule">导入只新增收藏与标签，不会取消或删除你已有的任何标注；同名标签按名字合并。</p>' +
+    (skipped > 0 ? '<p class="lib-ann-skip">其中 ' + skipped + " 项认不出或有歧义，会被原样跳过（只计数、不改动），档案里其余部分照常导入。</p>" : "") +
+    '<p class="lib-ann-skip">点「确定」才会真写进库；想先看看就点「取消」，库里一切不动。</p>';
+}
+function libAnnSummary(prefix, r) {
+  return prefix + "：匹配 " + libAnnNum(r.matched) + " 项，收藏 " + libAnnNum(r.starred) + " 项，标签关联 " + libAnnNum(r.tags_applied) +
+    " 次，新建标签 " + libAnnNum(r.tags_created) + " 个，认不出 " + libAnnNum(r.unmatched) + " 项，有歧义 " + libAnnNum(r.ambiguous) + " 项";
+}
+async function libOnImportFileChosen(ev) {
+  const input = ev && ev.target ? ev.target : null;
+  const file = input && input.files && input.files[0] ? input.files[0] : null;
+  if (!file) return;                      // 系统文件框里按取消：change 带着空列表过来，什么都不做
+  if (input) input.value = "";            // 先释放选择，后面无论走到哪一步都不会留着上次挑的文件
+  libAnnBusy(true);
+  let text = "", readErr = "";
+  try { text = await libAnnReadFile(file); } catch (e) { readErr = (e && e.message) || "文件读不出来"; }
+  if (readErr) { libAnnBusy(false); setStatus("导入标注失败：" + readErr); return; }
+  const bad = libAnnCheck(text);
+  if (bad) { libAnnBusy(false); setStatus("导入标注失败：" + bad + "。库里的收藏与标签没有被动过"); return; }
+  // 第一趟：dry_run 试算。后端的试算计数与真写口径一致（实测两边数字相同），所以预览不是猜。
+  let trial = null;
+  try { trial = libAnnObj(await api.call("lib_import_annotations", text, true)); } catch (e) { trial = null; }
+  if (!trial) { libAnnBusy(false); setStatus("导入标注失败：试算没有返回结果（后端未就绪），没有写入任何数据"); return; }
+  libAnnBusy(false);
+  if (!trial.ok) { setStatus("导入标注失败：" + ((trial && trial.msg) || "后端不认这份档案") + "。没有写入任何数据"); return; }
+  if (trial.dry_run === false) { setStatus("导入标注中止：后端回的不是试算结果（dry_run=false），没有继续"); return; }
+  const ok = await confirmBoxRaw(libAnnPreviewHtml(file.name, trial), "导入资源库标注（共 " + libAnnNum(trial.matched) + " 项匹配）");
+  if (!ok || !ok.root) { setStatus("已取消导入，库里一切未改（刚才只是试算）"); return; }
+  ok.root.remove();                       // confirmBoxRaw 确定时只摘遮罩，内容框要调用方自己收
+  libAnnBusy(true);
+  let res = null;
+  try { res = libAnnObj(await api.call("lib_import_annotations", text, false)); } catch (e) { res = null; }
+  finally { libAnnBusy(false); }
+  if (!res) { setStatus("导入标注失败：写入没有返回结果，请刷新列表后核对（可能已部分写入）"); return; }
+  if (!res.ok) { setStatus("导入标注失败：" + ((res && res.msg) || "后端返回 ok=false")); return; }
+  setStatus(libAnnSummary("导入完成", res) + "；只新增收藏与标签，已有标注未取消");
+  // 收尾走既有路径：列表 + 分面 + 统计（libLoad(true)）、标签下拉（libEnsureTags → libAfterTagChange）
+  return libEnsureTags().then(() => { libAfterTagChange(); return libLoad(true); });
 }
 
 // ---------- 缩略图与视频海报 ----------
@@ -5936,7 +6557,121 @@ function libFillFacets() {
   libFillSelect("libLoraF", Array.isArray(f.loras) ? f.loras.slice(0, 300) : [], "全部 LoRA", (r) => r.name, (r) => r.name + "（" + r.count + "）");
   libFillSelect("libDirF", Array.isArray(f.dirs) ? f.dirs.slice(0, 300) : [], "全部文件夹", (r) => String(r.path != null ? r.path : r.name), (r) => short(String(r.name || r.path || ""), 26) + "（" + r.count + "）");
   libFillSelect("libTagF", Array.isArray(f.tags) ? f.tags.slice(0, 300) : [], "全部标签", (r) => String(r.id), (r) => r.name + "（" + r.count + "）");
+  libFillChipFacets();
   if (lib.foldersOpen) libRenderFolders();
+}
+
+// 展开控件要不要挂靠真实布局测量决定，前提是「测量时这一组是可见且有高度的」：
+// 进页（刚从隐藏切成可见）和窗口改宽度（chip 换行位置变了）都要重量一次，否则判断会停在旧布局上。
+function libFacetRemeasure() {
+  for (const g of LIB_CHIP_FACETS) { const s = libChipFacetSlot(g.id); if (s) s._sig = null; }
+  libFillChipFacets();
+}
+let libFacetResizeTimer = 0;
+window.addEventListener("resize", () => {
+  clearTimeout(libFacetResizeTimer);
+  libFacetResizeTimer = setTimeout(() => {
+    const p = document.getElementById("page-library");
+    if (p && p.classList.contains("active")) libFacetRemeasure();
+  }, 220);
+});
+
+// ---------- 分面 chip 组（采样器 / 调度器 / 尺寸：同维度多选＝OR，跨维度＝AND）----------
+// 三组的 facets 形状与 checkpoints 完全一致（§15.2.5：[{"name","count"}]，count DESC、上限 300），
+// 所以只认 name；key 必须与服务端 flt 的键名逐字相同（lib.filters 用的就是这些键，改名要一起改）。
+const LIB_CHIP_FACETS = [
+  { id: "libSamplerFacet", key: "samplers", title: "采样器" },
+  { id: "libSchedulerFacet", key: "schedulers", title: "调度器" },
+  { id: "libSizeFacet", key: "sizes", title: "尺寸" },
+];
+const LIB_FACET_LIMIT = 300;                    // §7：facet 上限 300 项，超出按 count 截断（服务端已经截，这里再兜一层）
+function libChipFacetSlot(id) {
+  const box = libEl(id); if (!box) return null;
+  return box.querySelector("[data-lib-slot='facet-opts']") || box;
+}
+function libFacetChipHtml(g, name, count, ghost) {
+  const picked = (lib.filters[g.key] || []).indexOf(name) >= 0;
+  const label = esc(name) + (count == null ? "" : "（" + esc(String(count)) + "）");
+  const tip = ghost ? name + "：这一项已经不在当前分面计数里（多半是重扫后没有文件再带它），点 × 取消筛选"
+    : (picked ? "已选中，点一下取消" + g.title + "筛选" : "点一下按" + g.title + "筛选");
+  return '<span class="lib-chip lib-facet-chip' + (ghost ? " is-ghost" : "") + '" role="button" tabindex="0" aria-pressed="' + (picked ? "true" : "false") + '"' +
+    ' data-lib-facet="' + esc(g.key) + '" data-lib-facetval="' + esc(name) + '" title="' + esc(tip) + '">' + label +
+    (picked ? '<button class="lib-chip-x" type="button" data-lib-facetdel="' + esc(g.key) + '" data-lib-facetval="' + esc(name) + '" aria-label="移除' + esc(g.title + "筛选：" + name) + '">×</button>' : "") +
+    "</span>";
+}
+function libFacetMoreEl(g, total, open) {
+  const el = document.createElement("span");
+  el.className = "lib-chip lib-facet-more";
+  el.setAttribute("role", "button");
+  el.tabIndex = 0;
+  el.dataset.libFacetmore = g.key;
+  el.textContent = open ? "收起" : "展开（共 " + total + " 项）";
+  el.title = open ? "已经展开（高度按窗口给上限，没看全就在组里滚动），点一下收回两行"
+    : "共 " + total + " 个" + g.title + "值没露全，展开后一次能多看到一批（也可以直接在组里滚动）";
+  return el;
+}
+function libToggleFacetMore(key) {
+  const g = LIB_CHIP_FACETS.find((x) => x.key === key); if (!g) return;
+  const slot = libChipFacetSlot(g.id); if (!slot) return;
+  slot._open = !slot._open;
+  slot._sig = null;                                     // 展开态变了必须重画，否则点一下没反应
+  slot.scrollTop = 0;
+  libFillChipFacets();
+}
+function libFillChipFacets() {
+  const f = lib.facets || {};
+  for (const g of LIB_CHIP_FACETS) {
+    const slot = libChipFacetSlot(g.id); if (!slot) continue;
+    const host = slot.parentElement || slot;
+    const act = document.activeElement;
+    // 重画会把焦点丢掉（元素被整个替换），键盘用户按一次「展开」就得从头 Tab。记下焦点落在哪个控件上，画完接回去。
+    let focusKey = "";
+    if (act && host.contains(act)) {
+      if (act.dataset && act.dataset.libFacetmore === g.key) focusKey = "more";
+      else if (act.dataset && act.dataset.libFacetval) focusKey = "v" + act.dataset.libFacetval;
+    }
+    const rows = Array.isArray(f[g.key]) ? f[g.key].slice(0, LIB_FACET_LIMIT) : [];
+    const names = [], counts = Object.create(null);
+    for (const r of rows) {
+      const n = String((r && r.name != null) ? r.name : "");
+      if (!n || counts[n] != null) continue;              // 后端已按 count 降序，重名只留第一条
+      counts[n] = Number(r.count || 0); names.push(n);
+    }
+    const chosen = Array.isArray(lib.filters[g.key]) ? lib.filters[g.key] : [];
+    // 选中但本轮分面里已经没有的值要继续画出来（标成 ghost）：否则用户会卡在「筛出 0 项、又没地方取消」的死角。
+    // 下拉那套可以靠 libPruneFacet 静默清掉（它有「全部」这个天然回落值），chip 组没有，所以这里不裁剪。
+    const ghosts = chosen.filter((v) => names.indexOf(v) < 0);
+    const total = names.length + ghosts.length;
+    const sig = names.map((n) => n + ":" + counts[n]).join("|") + "#" + chosen.slice().sort().join("|") +
+      "#" + (slot._open ? "1" : "0");
+    if (slot._sig === sig) continue;                       // 签名不变不重画：重画会丢滚动位置和键盘焦点
+    slot._sig = sig;
+    const keepTop = slot._open ? 0 : slot.scrollTop;
+    slot.classList.toggle("is-open", !!slot._open);
+    slot.innerHTML = total
+      ? names.map((n) => libFacetChipHtml(g, n, counts[n], false)).join("") + ghosts.map((n) => libFacetChipHtml(g, n, null, true)).join("")
+      // 空维度只占位、不隐藏整组：D1/D2 落地前后布局不跳（§15.3.1）
+      : '<span class="lib-facet-empty" title="' + esc("扫到带" + g.title + "的条目后就能点选筛选") + '">暂无数据</span>';
+    slot.scrollTop = keepTop;
+    // 展开/收起控件挂在「组」上而不是滚动容器里：塞在容器内它自己就正好落在折行以下，等于看不见。
+    // 两行封顶时组内滚动条也很难被察觉（真实窗口 1266px 实测：尺寸组一屏只露 4 个值），
+    // 所以先量一次真实溢出，只有真的没露全才挂这个控件。
+    const oldMore = host.querySelector(":scope > [data-lib-facetmore]");
+    if (oldMore) oldMore.remove();
+    if (slot._open || (total && slot.scrollHeight > slot.clientHeight + 2)) host.appendChild(libFacetMoreEl(g, total, !!slot._open));
+    if (focusKey === "more") { const m = host.querySelector(":scope > [data-lib-facetmore]"); if (m) m.focus(); }
+    else if (focusKey) { const c = slot.querySelector('[data-lib-facetval="' + CSS.escape(focusKey.slice(1)) + '"]'); if (c) c.focus(); }
+  }
+}
+function libToggleFacetChip(key, name, on) {
+  const arr = lib.filters[key];
+  if (!Array.isArray(arr) || !name) return;
+  const i = arr.indexOf(name);
+  const want = on === undefined ? i < 0 : !!on;           // chip 本体＝切换，× ＝强制取消选中
+  if (want) { if (i >= 0) return; arr.push(name); }
+  else { if (i < 0) return; arr.splice(i, 1); }
+  libFillChipFacets();                                     // 先按新状态重画（含 × 的出现/消失）
+  libOnFilterChange();                                     // 再走既有的「筛选变化后刷新」路径：libLoad(true) → 统计条「筛选 N 项 / 共 M 项」
 }
 // 标签增删改之后筛选下拉必须自己跟上：facets 只在 lib_list 时回来，不重开页面就一直是旧列表。
 // lib_tags 是权威全量（含 count），读过就用它，没读过拿 facets.tags 兜底；libFillSelect 会保住当前选中项。
@@ -6064,6 +6799,61 @@ function libDeleteTag(id, name, count) {
 }
 
 // ---------- 详情 ----------
+// 详情内翻页（← / → 与面板上的 #libDetailPrev / #libDetailNext）：
+// 顺序按「当前已加载的这一批 lib.rows」走（服务端是分页的，lib.rows 就是当页已加载的段），
+// 到头就停：不循环、不自动换页、也不偷偷去拉下一页——跨页翻页不在本期范围，提示里如实说明。
+// 明确不接模型库的 openImageViewer：那是 Civitai 示例图语义（covers 缓存键跟 api_key 绑定、还有
+// 「打开 C站原图页」），把本地资源硬塞进去只会污染它。资源库详情本身就有大图与视频内联播放，
+// 翻页只做「换一件」，图片与视频都支持（libShowDetail 换内容前会 teardown 上一个 <video>）。
+function libDetailIndex() {
+  const d = lib.detail; if (!d) return -1;
+  const k = String(d.id);
+  return lib.rows.findIndex((r) => r && String(r.id) === k);
+}
+function libDetailNavHtml() {
+  const idx = libDetailIndex(), n = lib.rows.length, has = idx >= 0;
+  const pos = (has ? (idx + 1) : "—") + " / " + n;
+  const tip = "这是当前页内的序号（第 " + (has ? idx + 1 : "?") + " 张 / 本批已加载 " + n + " 项，库内共 " + lib.total +
+    " 项）。← → 只在这一批里前后换一件，到头就停；列表是服务端分页的，跨页翻页不在本期范围，要往后走得先滚动加载更多。";
+  return '<span class="lib-dt-pos" id="libDetailPos" role="status" aria-live="polite" title="' + esc(tip) + '">' + esc(pos) + "</span>" +
+    '<button class="icon-btn lib-dt-nav" id="libDetailPrev" type="button" data-lib-act="prev" aria-label="上一件资源（当前页内）" title="上一件（←）"' + (has && idx > 0 ? "" : " disabled") + ">&#8249;</button>" +
+    '<button class="icon-btn lib-dt-nav" id="libDetailNext" type="button" data-lib-act="next" aria-label="下一件资源（当前页内）" title="下一件（→）"' + (has && idx < n - 1 ? "" : " disabled") + ">&#8250;</button>";
+}
+function libDetailNav(delta) {
+  if (!lib.detail) return;
+  const idx = libDetailIndex(), n = lib.rows.length;
+  if (idx < 0) { setStatus("详情对应的条目已不在当前列表里（列表重新加载过了）：先关掉详情，再点一次卡片"); return; }
+  const to = idx + delta;
+  if (to < 0) { setStatus("已经是这一批的第一张（本批 " + n + " 项 / 库内共 " + lib.total + " 项）：到头就停，不循环"); return; }
+  if (to >= n) { setStatus("已经是这一批的最后一张（本批 " + n + " 项 / 库内共 " + lib.total + " 项）：跨页翻页不在本期范围，往下滚动加载更多才会有新的"); return; }
+  const row = lib.rows[to];
+  if (!row || row.id == null) { setStatus("翻页失败：这一条读不到 id（列表数据异常），没有改动任何东西"); return; }
+  const id = String(row.id);
+  // 高亮跟着详情走（lib.current 是「当前详情对应的那张卡」）。这里绝不碰 lib.sel：
+  // 多选态下翻页只是换一件看，选中集合不许因此增减。
+  lib.current = id;
+  const grid = libEl("libGrid");
+  if (grid) {
+    grid.querySelectorAll(".lib-card.is-current").forEach((c) => { if (c.dataset.id !== id) c.classList.remove("is-current"); });
+    const card = libCardEl(id);
+    if (card) { card.classList.add("is-current"); try { card.scrollIntoView({ block: "nearest" }); } catch (e) { } }
+  }
+  libShowDetail(id);
+}
+// ← / → 的否决顺序就是事件纪律，任何一条命中就完全不接管（顺序有意：先让在跑的快捷键系统知道）
+function libDetailKeyNav(e) {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  if (e.defaultPrevented || e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;   // 已被处理过 / 带修饰的组合键不抢
+  if (!libPageActive()) return;                       // 只有资源库页活着才谈得上
+  const mask = libEl("detailMask");
+  if (!lib.detail || !mask || mask.style.display !== "flex") return;   // 详情没开（含 Esc 已关掉）就不接管，也不许把它重新拉开
+  if (document.getElementById("imageViewer")) return;                  // 全屏查看器在＝完全不接管（它的 ←→ 是示例图语义）
+  if (document.querySelector(".rd-mask, .df-mask, .settings-exit-mask")) return;  // 确认框/浮在详情之上的弹窗打开时，方向键归它
+  const t = e.target;
+  if (t && t.closest && t.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]')) return;  // 输入焦点不抢
+  e.preventDefault();
+  libDetailNav(e.key === "ArrowLeft" ? -1 : 1);
+}
 async function libShowDetail(id) {
   const row = libRowById(id);
   const request = ++lib.detailRequest;
@@ -6084,6 +6874,9 @@ async function libShowDetail(id) {
   lib.detail = d;
   const panel = libEl("detailPanel"), mask = libEl("detailMask");
   if (!panel || !mask) return;
+  // 换内容前先把标签浮层收掉：浮层 portal 在 body 上，不主动收就会攥着上一个「打标签」按钮的
+  // 锚点飘在新详情上面（翻页时按键盘最容易撞见）。单击路径里文档级委托已经收过一遍，这里是补键盘路径。
+  libHidePopovers();
   libTeardownVideos(panel);
   panel.innerHTML = libDetailHtml(d);
   mask.style.display = "flex";
@@ -6109,7 +6902,15 @@ function libDetailHtml(d) {
   // 提示词来源要诚实：name_fallback 是后端按字段名（prompt/text 等）回退捞出来的，
   // 不是链条解析结果。extra 里没这个字段就不标注，不编造来源说明。
   const srcHint = (d.extra && d.extra.prompt_source === "name_fallback") ? '<span class="dt-sec-hint">按字段名提取</span>' : "";
-  return '<div class="dt-head"><div class="dt-head-t">资源详情</div><div class="dt-head-r">' +
+  // 生成参数独立成组：只在有值时渲染（libDetailRow 空值回 ""），七个字段全空就整组不出现——
+  // 实测 532 条视频这五项全为空（§15.0），不能摆一排「—」假装有数据。
+  const paramRows = [
+    libDetailRow("种子", d.seed), libDetailRow("步数", d.steps), libDetailRow("CFG", d.cfg),
+    libDetailRow("采样器", d.sampler), libDetailRow("调度器", d.scheduler),
+    libDetailRow("帧率", libFps(d.fps)), libDetailRow("时长", libDur(d.duration)),
+  ].filter(Boolean).join("");
+  const paramsHint = libParamsSourceHint(d.extra);
+  return '<div class="dt-head"><div class="dt-head-t">资源详情</div><div class="dt-head-r">' + libDetailNavHtml() +
     '<button class="icon-btn dt-close" data-lib-act="close" aria-label="关闭详情" title="关闭">' + _icon("x") + "</button></div></div>" +
     '<div class="dt-body"><div class="detail-left">' + media +
     (d.exists === false ? '<p class="binding-warning">文件已不在磁盘上（索引保留 30 天后清除）</p>' : "") +
@@ -6119,15 +6920,13 @@ function libDetailHtml(d) {
       libDetailRow("类型", isVid ? "视频 " + String(d.ext || "") : "图片 " + String(d.ext || "")) +
       libDetailRow("底模", d.checkpoint) +
       libDetailRow("尺寸", d.width && d.height ? d.width + " × " + d.height : "") +
-      libDetailRow("时长", libDur(d.duration)) +
       libDetailRow("大小", fmtSize(d.size)) +
       libDetailRow("生成时间", d.mtime ? fmtTime(d.mtime) : "") +
       libDetailRow("入库时间", d.added_at ? fmtTime(d.added_at) : "") +
       libDetailRow("元数据来源", d.meta_source || (d.has_meta ? "" : "无内嵌元数据")) +
-      libDetailRow("seed", d.seed) + libDetailRow("steps", d.steps) + libDetailRow("cfg", d.cfg) +
-      libDetailRow("采样器", d.sampler) + libDetailRow("调度器", d.scheduler) +
       libDetailRow("路径", d.path, true) +
     "</div>" +
+    (paramRows ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("settings") + '生成参数' + paramsHint + '</div><div class="dt-mrs">' + paramRows + "</div></div>" : "") +
     (d.note ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("info") + '解析备注</div><div class="detail-desc">' + esc(d.note) + "</div></div>" : "") +
     '<div class="dt-sec"><div class="dt-sec-h">' + _icon("file") + '正面提示词' + srcHint +
       (d.prompt ? '<button class="btn dt-copy" data-lib-act="copy-prompt" type="button">' + _icon("copy") + "复制</button>" : "") +
@@ -6162,6 +6961,10 @@ function libCloseDetail() {
   if (mask) mask.style.display = "none";
   if (panel) panel.innerHTML = "";
   lib.detail = null;
+  // 详情关掉后「当前卡」的高亮也就没意义了；批量已选的 .checked 不受影响（它跨页保留）
+  lib.current = null;
+  const grid = libEl("libGrid");
+  if (grid) grid.querySelectorAll(".lib-card.is-current").forEach((c) => c.classList.remove("is-current"));
   libHidePopovers();
 }
 async function libGotoModel(name) {
@@ -6196,11 +6999,13 @@ function libDeleteItem() {
     return api.call("lib_delete", Number(d.id)).then((r) => {
       if (!r || !r.ok) { setStatus((r && r.msg) || "删除失败：文件可能被其它程序占用"); return; }
       lib.thumbCache.delete(d.path); lib.posterTried.delete(d.path);
+      // 单条删除也要把这一项从批量已选里摘掉：留着它，下一次批量动作就会打到一个已不存在的行上
+      lib.sel.delete(String(d.id)); lib.byId.delete(String(d.id));
       const idx = lib.rows.findIndex((x) => String(x.id) === String(d.id));
       if (idx >= 0) lib.rows.splice(idx, 1);
       lib.total = Math.max(0, lib.total - 1);
       libCloseDetail();
-      libRenderGrid(); libUpdateStats(); libUpdateEmpty(); libUpdateMore();
+      libRenderGrid(); libUpdateStats(); libUpdateEmpty(); libUpdateMore(); libUpdateSelUi();
       setStatus("已删除（文件在回收站里）");
     });
   }).catch(() => setStatus("删除失败"));
@@ -6208,6 +7013,9 @@ function libDeleteItem() {
 function libDetailAction(act, btn) {
   const d = lib.detail; if (!d) return;
   if (act === "close") { libCloseDetail(); return; }
+  // 详情头的翻页钮与 ←/→ 同一条路（libDetailKeyNav 只做判定，真正的换一件在这里）
+  if (act === "prev") { libDetailNav(-1); return; }
+  if (act === "next") { libDetailNav(1); return; }
   if (act === "star") return libSetStar(!d.starred);
   if (act === "tags") { libOpenTagPop(btn); return; }
   if (act === "delete") return libDeleteItem();
@@ -6244,6 +7052,13 @@ function libDetailAction(act, btn) {
 
 // ---------- 分页 / 筛选 ----------
 function libOnFilterChange() { libLoad(true); }
+// 时长筛选的唯一入口（防抖 input 与 change 都收敛到这里）：非法就当场提示、不发请求，
+// 合法才走 libOnFilterChange → libLoad(true) → libReadControls/libBuildFlt 的既有路径。
+function libApplyDurationFilter() {
+  libReadControls();
+  if (lib._durError) { setStatus(lib._durError); return; }
+  libOnFilterChange();
+}
 function libMaybeMore() {
   if (lib.loading || lib.scanRunning) return;
   if (lib.rows.length >= lib.total) return;
@@ -6292,6 +7107,7 @@ function libLeavePage() {
   libStopScanPoll();
   if (lib.scrollTimer) { clearTimeout(lib.scrollTimer); lib.scrollTimer = null; }
   if (lib.qTimer) { clearTimeout(lib.qTimer); lib.qTimer = null; }
+  if (lib.durTimer) { clearTimeout(lib.durTimer); lib.durTimer = null; }
   lib.request++;                    // 让在途的列表/缩略图响应作废
   lib.thumbBusy = false;
   lib.posterTimers.forEach((t) => clearTimeout(t)); lib.posterTimers = [];
@@ -6302,7 +7118,7 @@ function libLeavePage() {
 }
 
 // ---------- 事件绑定（一律文档级委托：A4 的标记若有出入也不会因缺节点抛错） ----------
-const LIB_FILTER_IDS = ["libKindF", "libSort", "libGroup", "libCkF", "libLoraF", "libTagF", "libDirF", "libStarOnly", "libNoMeta"];
+const LIB_FILTER_IDS = ["libKindF", "libSort", "libGroup", "libCkF", "libLoraF", "libTagF", "libDirF", "libStarOnly", "libNoMeta", "libDurMin", "libDurMax"];
 document.addEventListener("click", (e) => {
   const t = e.target;
   if (!t || !t.closest) return;
@@ -6312,8 +7128,16 @@ document.addEventListener("click", (e) => {
   if (navTab && navTab.dataset.page !== "library") libLeavePage();
   if (id === "libScanBtn") { libStartScan(); return; }
   if (id === "libStopScanBtn") { libStopScan(); return; }
+  // 标注导出／导入：按 closest 而不是 t.id——按钮里包着 <svg>/<use>，点在图标上时 target 自己没有 id
+  if (t.closest("#libExportAnn")) { libExportAnnotations(); return; }
+  if (t.closest("#libImportAnn")) { libPickImportFile(); return; }
   if (id === "libMore") { libMaybeMore(); return; }
   if (id === "libRootDetect") { libDetectRoots(); return; }
+  // 多选：选择行三个控件 + 操作条七个动作 + 标签浮层的应用按钮。
+  // 走 [data-lib-act^="sel-"] 的 closest 而不是 t.id：带图标的按钮里 target 常常是 <svg>/<use>，
+  // 它自己没有 id，按 id 判会「点到图标就没反应」。disabled 的按钮浏览器不发 click，这里不用再判可点性。
+  const selBtn = t.closest('[data-lib-act^="sel-"]');
+  if (selBtn) { libSelBarAction(selBtn.dataset.libAct, selBtn); return; }
   if (id === "libFoldersBtn") {
     const panel = libEl("libFoldersPanel");
     if (!panel) return;
@@ -6330,6 +7154,21 @@ document.addEventListener("click", (e) => {
   const dirItem = t.closest('[data-lib-dir]');
   if (dirItem) { libToggleDir(dirItem.dataset.libDir); return; }
   if (t.closest('[data-lib-act="dirs-none"]')) { lib.filters.dirs = []; lib._dirsFromPanel = []; const s = libEl("libDirF"); if (s) s.value = ""; libRenderFolders(); libOnFilterChange(); return; }
+  // 分面 chip：× 必须先判（它自己也带 data-lib-facetval，落到下一条就会「取消又选中」＝点了没反应）
+  const facetMore = t.closest("[data-lib-facetmore]");
+  if (facetMore) { libToggleFacetMore(facetMore.dataset.libFacetmore); return; }
+  const facetDel = t.closest("[data-lib-facetdel]");
+  if (facetDel) { libToggleFacetChip(facetDel.dataset.libFacetdel, facetDel.dataset.libFacetval, false); return; }
+  const facetChip = t.closest(".lib-facet-chip[data-lib-facetval]");
+  if (facetChip) { libToggleFacetChip(facetChip.dataset.libFacet, facetChip.dataset.libFacetval); return; }
+  // 批量标签浮层里的 chip：只勾/取消勾，真正的增删等点「应用」（属性名与单条浮层的 data-lib-tag 分开，互不误伤）
+  const selTagChip = t.closest("[data-lib-sel-tag]");
+  if (selTagChip) {
+    const tid = Number(selTagChip.dataset.libSelTag);
+    if (lib.selTagIds.has(tid)) lib.selTagIds.delete(tid); else lib.selTagIds.add(tid);
+    libRenderSelTagPop(libEl("libSelTagPop"));
+    return;
+  }
   const delTag = t.closest("[data-lib-tagdel]");
   if (delTag) { libDeleteTag(Number(delTag.dataset.libTagdel), delTag.dataset.libTagname, Number(delTag.dataset.libTagcount)); return; }
   const tagItem = t.closest("[data-lib-tag]");
@@ -6356,12 +7195,8 @@ document.addEventListener("click", (e) => {
   const card = t.closest("#libGrid .lib-card");
   if (card) {
     if (e.detail > 1) return;
-    const grid = libEl("libGrid");
-    lib.sel.clear(); lib.sel.add(card.dataset.id);
-    if (grid) grid.querySelectorAll(".lib-card.checked").forEach((c) => c.classList.remove("checked"));
-    card.classList.add("checked");
-    libUpdateStats();
-    libShowDetail(card.dataset.id);
+    // 多选态＝切换选中；非多选态＝保持原样打开详情（高亮类的分工见 libActivateCard）
+    libActivateCard(card, e.shiftKey);
     return;
   }
   const main = t.closest("#detailPanel #dMain");
@@ -6379,7 +7214,7 @@ document.addEventListener("click", (e) => {
     return;
   }
   // 浮层外点击即关（浮层已 portal 到 body，只判断自身与锚点）
-  if (lib.popKind && !t.closest("#libTagPop") && !t.closest("#libFoldersPanel") && !(lib.popAnchor && lib.popAnchor.contains(t))) libHidePopovers();
+  if (lib.popKind && !t.closest("#libTagPop") && !t.closest("#libSelTagPop") && !t.closest("#libFoldersPanel") && !(lib.popAnchor && lib.popAnchor.contains(t))) libHidePopovers();
 });
 document.addEventListener("mouseover", (e) => {
   const v = e.target && e.target.closest ? e.target.closest("#libGrid video.lib-vid") : null;
@@ -6399,6 +7234,12 @@ document.addEventListener("input", (e) => {
     lib.qTimer = setTimeout(() => { lib.filters.q = String(t.value || "").trim(); libOnFilterChange(); }, 300);
     return;
   }
+  // 时长区间：与 #libQ 同一条 300ms 防抖节奏，非法值在 libApplyDurationFilter 里当场拦掉
+  if (t.id === "libDurMin" || t.id === "libDurMax") {
+    clearTimeout(lib.durTimer);
+    lib.durTimer = setTimeout(() => { lib.durTimer = null; libApplyDurationFilter(); }, 300);
+    return;
+  }
   if (t.id === "setMediaRoots") { t.dataset.touched = "1"; libCfgSet("media_roots", String(t.value || "").split("\n").map((s) => s.trim()).filter(Boolean)); return; }
   if (t.id === "setMediaExclude") { t.dataset.touched = "1"; libCfgSet("media_exclude_dirs", String(t.value || "").split("\n").map((s) => s.trim()).filter(Boolean)); return; }
   if (t.id === "setMediaPageSize") { t.dataset.touched = "1"; libCfgSet("media_page_size", Number(t.value) || 200); }
@@ -6412,11 +7253,25 @@ document.addEventListener("focusin", (e) => {
 });
 document.addEventListener("change", (e) => {
   const t = e.target; if (!t || !t.id) return;
+  // 多选开关不是筛选：不重发 lib_list、不清已选（切换只改交互语义，见 libSetSelectMode）
+  if (t.id === "libSelectMode") {
+    libSetSelectMode(t.checked);
+    setStatus(lib.selectMode
+      ? "多选已打开：单击卡片切换选中，Shift 点选在当页里做范围选；已选 " + lib.sel.size + " 项"
+      : "多选已关闭：单击卡片回到「打开详情」。已选的 " + lib.sel.size + " 项仍然保留（跨页、跨筛选），要清掉点选择行里的「清除选择」");
+    return;
+  }
   if (LIB_FILTER_IDS.indexOf(t.id) < 0) return;
   if (t.id === "libDirF") { lib.filters.dirs = t.value ? [t.value] : []; lib._dirsFromPanel = []; if (lib.foldersOpen) libRenderFolders(); }
+  // 时长输入：失焦 / 回车 / 步进箭头触发的 change 清掉在等的防抖，避免同一次改动发两个请求
+  if (t.id === "libDurMin" || t.id === "libDurMax") { if (lib.durTimer) { clearTimeout(lib.durTimer); lib.durTimer = null; } libApplyDurationFilter(); return; }
   libReadControls();
   libOnFilterChange();
 });
+// 详情打开时 ← / → 换一件（判定与互斥全在 libDetailKeyNav 里，含多选态/Esc/全屏查看器的纪律）。
+// 挂在冒泡阶段的末尾：app.js 在 commands.js 之后加载，所以用户自绑的快捷键先跑，它们 preventDefault 过
+// 我就让开（libDetailKeyNav 第一件事就是查 e.defaultPrevented）。
+document.addEventListener("keydown", libDetailKeyNav);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!lib.popKind) return;                 // 浮层打开时 Esc 只关浮层，不同时关掉详情（捕获阶段抢在既有 Esc 处理之前）
@@ -6426,14 +7281,25 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " ") return;
   if (!e.target || !e.target.closest) return;
+  // 分面 chip 是 role=button 的 span，键盘要能按；焦点落在里面的 × 时交给浏览器原生按钮激活，
+  // 这里再 click 一次就成了「取消 + 重新选中」＝没反应（Space 的原生 click 在 keyup，还会再触发一次）。
+  const fchip = e.target.closest(".lib-facet-chip[data-lib-facetval]");
+  if (fchip) { if (e.target.closest("button")) return; e.preventDefault(); fchip.click(); return; }
+  const fmore = e.target.closest("[data-lib-facetmore]");
+  if (fmore) { e.preventDefault(); fmore.click(); return; }        // 展开/收起也是 role=button 的 span
   const chip = e.target.closest("#libTagPop [data-lib-tag]");
   if (chip) { e.preventDefault(); chip.click(); return; }      // chip 是 role=button 的 span，键盘要能按
+  const selChip = e.target.closest("#libSelTagPop [data-lib-sel-tag]");
+  if (selChip) { e.preventDefault(); selChip.click(); return; }
   const card = e.target.closest("#libGrid .lib-card");
   if (!card) return;
   e.preventDefault();
-  libShowDetail(card.dataset.id);
+  libActivateCard(card, e.shiftKey);      // 多选态下 Enter/Space 同样是切换选中（shift 做范围选）
 });
-window.addEventListener("resize", () => { if (lib.popKind === "tags") libPopPosition(libEl("libTagPop"), lib.popAnchor); });
+window.addEventListener("resize", () => {
+  if (lib.popKind === "tags") libPopPosition(libEl("libTagPop"), lib.popAnchor);
+  else if (lib.popKind === "seltags") libPopPosition(libEl("libSelTagPop"), lib.popAnchor);
+});
 
 function libInit() {
   const vp = libEl("libViewport");
@@ -6441,5 +7307,11 @@ function libInit() {
   window.addEventListener("scroll", libOnScroll, { passive: true });
   libSetScanBtns(false);
   libSetRootHint();
+  // 多选相关控件的初始态：选择行与操作条都藏着、动作按钮全禁用（没有已选就没有能点的动作）
+  libSetSelectMode(false);
+  // 导入标注：选完文件才走「读文本 → 试算 → 确认 → 写入」。在系统文件框里按取消不会发 change，
+  // 发了空列表也在 handler 里当场返回，不会有半开状态。
+  const importFile = libEl("libImportFile");
+  if (importFile) importFile.addEventListener("change", libOnImportFileChosen);
 }
 try { libInit(); } catch (e) { /* 资源库标记未就位时不影响其它页面 */ }

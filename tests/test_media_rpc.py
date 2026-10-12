@@ -214,7 +214,8 @@ class EnvelopeTests(LibRPCTestBase):
                     self.assertIsInstance(r, str, "%s 必须以 JSON 字符串返回（规避 js_api 大 list）" % name)
                     self.assertIsInstance(json.loads(r), (dict, list))
             listed = json.loads(a.lib_list(json.dumps({"offset": 40, "limit": 99999})))
-            self.assertEqual(set(listed), {"ok", "items", "total", "offset", "limit", "facets"})
+            self.assertEqual(set(listed), {"ok", "items", "total", "offset", "limit", "facets",
+                                       "facets_skipped"})
             self.assertTrue(listed["ok"])
             self.assertEqual((listed["offset"], listed["limit"]), (40, 99999))
             self.assertEqual(listed["total"], 1)
@@ -782,6 +783,30 @@ class BatchTests(LibRPCTestBase):
             msg = a.lib_scan_state()["msg"]
             self.assertNotIn("补解析", msg)                # 平常的增量扫描不许显示升级文案
             self.assertNotIn("搬家", msg)
+
+    def test_list_can_skip_facets_for_appended_pages(self):
+        """续拉分页跳过分面（真实库实测 facets ~130ms 占整页大头），首屏与筛选变化仍要算。"""
+        a, lib, mod = self.make_api()
+        r = json.loads(a.lib_list(json.dumps({"limit": 10, "with_facets": 0})))
+        self.assertTrue(r["facets_skipped"])
+        self.assertEqual(r["facets"], {})
+        self.assertEqual([c for c in lib.calls if c[0] == "facets"], [])      # 一次分面查询都没发
+        for val in ("false", "0", "", None):
+            if val is None:
+                continue
+            self.assertTrue(json.loads(a.lib_list(json.dumps({"with_facets": val})))["facets_skipped"], val)
+        back = json.loads(a.lib_list(json.dumps({"limit": 10, "with_facets": 1})))
+        self.assertFalse(back["facets_skipped"])
+        self.assertTrue(any(c[0] == "facets" for c in lib.calls))   # 首屏/筛选变化仍要算分面
+
+    def test_seed_above_js_safe_integer_is_sent_as_string(self):
+        a, lib, mod = self.make_api()
+        big = 2 ** 53 + 12345
+        lib.detail_val = {"id": 1, "path": "", "kind": "image", "seed": big, "starred": 0}
+        d = json.loads(a.lib_detail(1))
+        self.assertEqual(d["seed"], str(big))               # 直接发 number 会在 JS 侧掉精度
+        lib.detail_val = {"id": 1, "path": "", "kind": "image", "seed": 123}
+        self.assertEqual(json.loads(a.lib_detail(1))["seed"], 123)
 
 
 class TransferTests(LibRPCTestBase):

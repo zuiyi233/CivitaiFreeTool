@@ -339,6 +339,13 @@
             <span class="mm-search-field"><input id="libQ" class="input" type="search" aria-label="搜索资源关键词" placeholder="搜索提示词 / 文件名 / 模型名…" data-tip="在生成元数据全文里搜索：提示词、负面提示词、模型名、文件名。输入停顿 300 毫秒后自动查询"/></span>
             <select class="input" id="libSort" aria-label="资源排序方式" data-tip="排序只接受固定几种方式，未知值回落「生成时间（新→旧）」。"><option value="time_desc">排序：生成时间（新→旧）</option><option value="time_asc">排序：生成时间（旧→新）</option><option value="name_asc">排序：文件名 A→Z</option><option value="size_desc">排序：文件体积（大→小）</option><option value="added_desc">排序：入库时间（最近入库）</option></select>
             <select class="input" id="libGroup" aria-label="资源分组方式" data-tip="分组标题横跨整行；按日期分组用本地时区，只影响显示不改文件位置"><option value="">不分组</option><option value="date">分组：生成日期</option><option value="checkpoint">分组：底模</option><option value="dir">分组：所在文件夹</option></select>
+            <!-- 标注备份：只搬「你人工做过的收藏与标签」，机器解析出来的提示词/参数一律不在档案里
+                 （那些跟着文件本身走，换机重扫就有）。导入先试算给你看六个计数，确认后才写。 -->
+            <button class="btn" type="button" id="libExportAnn" data-tip="把资源库里的收藏与标签导出成一个 JSON 文件（只含人工做过的标注，不含机器解析的元数据）。换机、重装或误删后用「导入标注」导回来。没有任何收藏与标签时不会下载空文件。"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-download"/></svg>导出标注</button>
+            <button class="btn" type="button" id="libImportAnn" data-tip="选择之前导出的标注 JSON：先按当前库试算一次，把「匹配到 / 要收藏 / 标签关联 / 新建标签 / 认不出 / 有歧义」六个数摆给你看，你点「确认导入」才写入。导入只新增收藏与标签，不会取消或删除你已有的任何标注。"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-upload"/></svg>导入标注</button>
+            <!-- 真正的选文件入口：按钮只负责转点它。accept 限 .json，选了之后先 FileReader 读文本再走
+                 lib_import_annotations(text, true) 试算；不写后端文件通路，也不参与布局。 -->
+            <input type="file" id="libImportFile" class="lib-file-input" accept=".json,application/json" aria-label="选择要导入的资源库标注档案（JSON 文件）" hidden/>
             <span class="mm-spacer"></span>
           </div>
           <div class="mm-row mm-row3">
@@ -349,10 +356,48 @@
             <select class="input" id="libDirF" aria-label="筛选文件夹" data-tip="按扫描根目录下的相对文件夹筛选；空值表示全部。"><option value="">全部文件夹</option></select>
             <label class="lib-check"><input type="checkbox" id="libStarOnly" aria-label="只看收藏的资源" data-tip="只显示已收藏的资源；收藏只改库里的标记，不动文件"/><span>只看收藏</span></label>
             <label class="lib-check"><input type="checkbox" id="libNoMeta" aria-label="只看无内嵌元数据的资源" data-tip="排查用：只显示读不到提示词的文件，也就是卡片右上角带问号的资源"/><span>无元数据</span></label>
+            <label class="lib-check lib-check-select"><input type="checkbox" id="libSelectMode" aria-label="开启多选模式，对资源做批量操作" data-tip="打开后每张卡片左上角出现勾选框，单击卡片＝切换选中（不再打开详情）；关掉立刻回到单击看详情。已选集合跨分页、跨筛选保留，直到你点「清除选择」或批量删除；筛选变化不会替你清空。"/><span>多选</span></label>
+            <span class="lib-dur" role="group" aria-label="按生成时长筛选，单位秒">
+              <span class="lib-dur-label">时长</span>
+              <input class="input lib-dur-in" id="libDurMin" type="number" min="0" step="0.1" placeholder="不限" aria-label="时长下限，单位秒，留空表示不限" data-tip="只保留生成时长不小于这个秒数的条目（单位秒，留空＝不限）。时长来自视频轨元数据，图片没有这个字段，所以填了区间通常就只剩视频。"/>
+              <span class="lib-dur-sep" aria-hidden="true">–</span>
+              <input class="input lib-dur-in" id="libDurMax" type="number" min="0" step="0.1" placeholder="不限" aria-label="时长上限，单位秒，留空表示不限" data-tip="只保留生成时长不超过这个秒数的条目（单位秒，留空＝不限）。下限不能大于上限，填错当场提示、不发查询。"/>
+              <span class="lib-dur-unit">秒</span>
+              <!-- 后端是 duration >= ? / <= ? 的比较：SQLite 里图片那行 duration 为 NULL，比较结果永远不成立，
+                   所以一旦填了区间，图片会被整维滤掉。这是既定语义，界面上必须写明白，不能只藏在 tooltip 里。 -->
+              <span class="lib-dur-note" role="note">只匹配视频（图片没有时长字段）</span>
+            </span>
             <span class="folders-wrap" id="libFoldersWrap">
               <button class="btn" id="libFoldersBtn" aria-controls="libFoldersPanel" aria-expanded="false" data-tip="展开目录树，勾选或排除要查看的文件夹（含子目录）"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-folder"/></svg>文件夹</button>
               <div class="folders-panel" id="libFoldersPanel" role="dialog" aria-label="资源库文件夹筛选" hidden></div>
             </span>
+            <span class="mm-spacer"></span>
+          </div>
+          <div class="mm-row lib-facets-row">
+            <div class="lib-facet-group" id="libSamplerFacet" role="group" aria-label="按采样器筛选资源" data-tip="采样器分面：来自生成元数据的 sampler 字段，按数量降序，最多 300 项。同维度多选是「或」，与类型／底模／标签等其它维度是「且」；点已选中的项即取消。后端未回填这一列时显示「暂无数据」，版位不塌陷。">
+              <span class="lib-facet-title">采样器</span>
+              <div class="lib-facet-opts lib-chips" data-lib-slot="facet-opts"></div>
+            </div>
+            <div class="lib-facet-group" id="libSchedulerFacet" role="group" aria-label="按调度器筛选资源" data-tip="调度器分面：来自生成元数据的 scheduler 字段，形状与采样器一致（多选＝或、跨维度＝且）。">
+              <span class="lib-facet-title">调度器</span>
+              <div class="lib-facet-opts lib-chips" data-lib-slot="facet-opts"></div>
+            </div>
+            <div class="lib-facet-group" id="libSizeFacet" role="group" aria-label="按尺寸筛选资源" data-tip="尺寸分面：按「宽x高」归组（如 768x1280），来自文件的实际宽高，多选＝或、跨维度＝且。">
+              <span class="lib-facet-title">尺寸</span>
+              <div class="lib-facet-opts lib-chips" data-lib-slot="facet-opts"></div>
+            </div>
+            <span class="mm-spacer"></span>
+          </div>
+          <!-- 多选工具行：只在 #libSelectMode 打开时出现（hidden 开关，与本页其它浮层同一约定）。
+               三个选择控件放在这里而不是底部操作条上，是因为操作条只在已选 >0 时浮出，
+               而「选中当页／选中筛选全部／清除」正是用来从 0 开始建立选择的。 -->
+          <div class="mm-row lib-sel-row" id="libSelRow" role="group" aria-label="资源库多选：选择范围" hidden>
+            <span class="lib-facet-title">选择</span>
+            <span class="status-pill lib-sel-state" id="libSelState" role="status" aria-live="polite">未选中任何项</span>
+            <button class="btn" id="libSelAllPage" type="button" data-lib-act="sel-all-page" data-tip="把当前列表里已经加载出来的条目全部并入已选（滚动加载更多后它们也算「当页」）。不会动你已经选好的其它项。">选中当页已加载</button>
+            <button class="btn" id="libSelAllFilter" type="button" data-lib-act="sel-all-filter" data-tip="按现在的筛选条件把库里匹配的全部条目并入已选：服务端是分页的，这里会以每批 500 条逐批只取 id，拉完为止（或到单次上限），过程在本行右侧显示进度。再点一次停止。">选中筛选结果全部</button>
+            <button class="btn" id="libSelClear" type="button" data-lib-act="sel-clear" data-tip="清空已选集合（只清选择，不改任何文件与库里的行）。">清除选择</button>
+            <span class="hint lib-sel-prog" id="libSelProg" role="status" aria-live="polite" hidden></span>
             <span class="mm-spacer"></span>
           </div>
         </div>
@@ -376,6 +421,25 @@
       <div class="lib-tagpop" id="libTagPop" role="dialog" aria-label="为资源打标签" hidden>
         <p class="hint">点一下添加或移除标签；新标签可在资源库筛选旁的标签管理里创建。</p>
         <div class="lib-chips" data-lib-slot="chips"></div>
+      </div>
+      <!-- 批量选择浮层：与 #libTagPop 同一套 .lib-tagpop 观感，但它是「先勾标签、再一次应用」，
+           所以额外带一个应用按钮；标签选项来自 lib_tags（lib.tags），没有标签时如实显示「还没有标签」。 -->
+      <div class="lib-tagpop" id="libSelTagPop" role="dialog" aria-label="选择要批量增删的标签" hidden>
+        <p class="hint" id="libSelTagHint">点一下选中要添加的标签，可多选。</p>
+        <div class="lib-chips" data-lib-slot="sel-chips"></div>
+        <div class="lib-sel-pop-actions"><button class="btn btn-primary" id="libSelTagApply" type="button" data-lib-act="sel-tag-apply">应用到选中项</button><span class="hint" id="libSelTagCount"></span></div>
+      </div>
+      <!-- 批量操作条：已选 >0 才浮出（fixed，但留在 #page-library 内，切页即随页面 display:none 消失）。
+           计数走 #libSelBarCount（role=status），批量进行中这里就地播报「已处理 x/y」。 -->
+      <div class="lib-selbar" id="libSelBar" role="toolbar" aria-label="资源库批量操作" hidden>
+        <span class="lib-selbar-count" id="libSelBarCount" role="status" aria-live="polite">已选 0 项</span>
+        <button class="btn" id="libSelStar" type="button" data-lib-act="sel-star" data-tip="批量收藏：只改库里的收藏标记，不动文件。"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-star"/></svg>收藏</button>
+        <button class="btn" id="libSelUnstar" type="button" data-lib-act="sel-unstar" data-tip="批量取消收藏：同样只改库里的标记。"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-star"/></svg>取消收藏</button>
+        <button class="btn" id="libSelTagAdd" type="button" data-lib-act="sel-tag-add" data-tip="给已选条目加标签：可多选标签，是并集，不会动它们原有的标签。">加标签</button>
+        <button class="btn" id="libSelTagRemove" type="button" data-lib-act="sel-tag-remove" data-tip="从已选条目摘掉指定标签：其它条目上的同名标签不受影响。">摘标签</button>
+        <button class="btn" id="libSelReverse" type="button" data-lib-act="sel-reverse" data-tip="把已选里的图片按文件哈希加入反向解析列表（沿用单条详情的既有口径：视频不送）。到反向解析页点「开始反查」才会联网查询。">送逆向解析</button>
+        <button class="btn" id="libSelWorkflow" type="button" data-lib-act="sel-workflow" data-tip="把已选里带内嵌元数据的文件送去工作流分析。分析页一次只展示一个结果，多个已选时分析第一个并说明。">送工作流分析</button>
+        <button class="btn btn-danger" id="libSelDelete" type="button" data-lib-act="sel-delete" data-tip="批量删除：文件移进系统回收站（可还原），同名 .json 工作流文件有意保留。一定会先弹确认。"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-trash"/></svg>删除</button>
       </div>
     </div>
   </section>

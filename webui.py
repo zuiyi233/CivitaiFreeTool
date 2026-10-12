@@ -5079,17 +5079,23 @@ class Api:
         lib = self._media_lib()
         data = lib.list_items(flt) or {}
         items = [self._lib_enrich(r) for r in (data.get("items") or [])]
-        facets = data.get("facets")
-        if facets is None:
-            try:
-                facets = lib.facets(root_ids=flt["root_ids"])
-            except Exception:
-                facets = {}
+        # 翻页续拉不必重算分面：真实库 2799 条 facets ~130ms，占整页 178ms 的大头；
+        # 前端只在首屏/筛选变化/写操作后带 with_facets，其余请求直接跳过
+        skip_facets = str(flt.get("with_facets", 1)).strip().lower() in ("0", "false", "no", "")
+        facets = None
+        if not skip_facets:
+            facets = data.get("facets")
+            if facets is None:
+                try:
+                    facets = lib.facets(root_ids=flt["root_ids"])
+                except Exception:
+                    facets = {}
         return json.dumps({"ok": True, "items": items,
                            "total": int(data.get("total") or 0),
                            "offset": int(data.get("offset", flt.get("offset", 0)) or 0),
                            "limit": int(data.get("limit", flt.get("limit", 0)) or 0),
-                           "facets": facets or {}}, ensure_ascii=False)
+                           "facets": facets or {},
+                           "facets_skipped": bool(skip_facets)}, ensure_ascii=False)
 
     def lib_detail(self, item_id):
         """详情，JSON 字符串；§7 详情边长 800 的预览在这里生成（图片走 _cover_thumb，视频读海报缓存）"""
