@@ -332,7 +332,7 @@
           <button class="btn btn-primary" id="libScanBtn" data-tip="扫描设置页配置的资源目录：只解析新文件或改动过的文件，已入库的不重复读元数据"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-scan"/></svg>扫描资源</button>
           <button class="btn" id="libStopScanBtn" disabled data-tip="停止本次扫描；已入库的内容保留，下次扫描从缺失处继续"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-x"/></svg>停止</button>
         </div>
-        <p class="hint" id="libRootHint">资源库只索引「设置 · 资源库目录」里列出的文件夹（默认自动探测 ComfyUI/output）。图片支持 png / jpg / jpeg / webp / gif，视频支持 mp4 / mov / webm / mkv，其中 webm 与 mkv 只入库、不解析元数据。扫描不移动也不删除任何原文件。</p>
+        <p class="hint" id="libRootHint">资源库只索引「设置 · 资源库目录」里列出的文件夹（默认自动探测 ComfyUI/output）。图片支持 png / jpg / jpeg / webp / gif，视频支持 mp4 / mov / webm / mkv，元数据全部本机解析（PNG 文本块、mp4 atom、webm/mkv 的 EBML），不依赖 ffmpeg。扫描不移动也不删除任何原文件。</p>
         <div class="lib-stats" id="libStatsBar" role="status" aria-live="polite"></div>
         <div class="mm-metro">
           <div class="mm-row mm-row1">

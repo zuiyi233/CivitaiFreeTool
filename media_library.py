@@ -135,6 +135,23 @@ _V2_REPARSE_ALL_SQL = "UPDATE items SET meta_mtime = 0"
 # 「图片且没元数据」的行（下载来的 jpg / gif）重解析也拿不到东西，跳过省时间。
 _EXTRACT_STALE_REPARSE_SQL = ("UPDATE items SET meta_mtime = 0 "
                               "WHERE NOT (kind = 'image' AND has_meta = 0)")
+# 版本 → 「这一版只改了这些扩展名的解析路径」。跨过的版本里只要有一个不在表里，就退回整库补解析；
+# 全是表内的定向版本时只补这些扩展名——真实库 0 个 webm/mkv，为它们让 2792 行白重扫 31 秒不值。
+_EXTRACT_SCOPED_REPARSE = {3: (".webm", ".mkv")}
+
+
+def _stale_reparse_stmt(current, version):
+    """返回 (SQL, 参数)。宁可多标不可漏标：定向口径只在「跨过的每个版本都声明了扩展名」时才用。"""
+    exts = []
+    for ver in range(int(current) + 1, int(version) + 1):
+        scoped = _EXTRACT_SCOPED_REPARSE.get(ver)
+        if scoped is None:
+            return _EXTRACT_STALE_REPARSE_SQL, ()
+        exts.extend(scoped)
+    if not exts:
+        return _EXTRACT_STALE_REPARSE_SQL, ()
+    return ("UPDATE items SET meta_mtime = 0 WHERE ext IN (%s)" % ",".join("?" * len(exts)),
+            tuple(sorted(set(exts))))
 # §17「搬家」候选：旧行所属根已不在本次扫描的根里，而某个在管的根里有 relpath/size/ext 全等的在场行
 _RELINK_CANDIDATES_SQL = """SELECT o.id AS old_id, o.path AS old_path, n.id AS new_id
 FROM items o
@@ -402,6 +419,7 @@ class MediaLibrary(object):
 
         必须走这条路：v1 索引迁移只是把 extra_json 里的旧值提到列上，而增量扫描按 mtime+size
         对账，文件没改就永远不会重新解析，参数回收和帧率这些新字段便永远补不上。
+        反向也要省：某一版只改了 webm/mkv 的解析时，整库重扫就是纯浪费（见 `_stale_reparse_stmt`）。
         """
         if version <= 0:
             return 0
@@ -413,7 +431,8 @@ class MediaLibrary(object):
                 got = 0
             if got >= version:
                 return 0
-            cur = conn.execute(_EXTRACT_STALE_REPARSE_SQL)
+            sql, params = _stale_reparse_stmt(got, version)
+            cur = conn.execute(sql, params)
             return int(cur.rowcount or 0)
 
     # ------------------------------------------------------------------ 扫描

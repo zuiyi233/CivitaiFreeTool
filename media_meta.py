@@ -1,9 +1,10 @@
 """资源库元数据提取：单个媒体文件 → 归一化 dict（纯函数，只读，绝不抛异常）。
 
-三条读取路径都是流式的：ComfyUI 产出的 PNG 常带几 MB 的 workflow/prompt 块，生成的视频
+各条读取路径都是流式的：ComfyUI 产出的 PNG 常带几 MB 的 workflow/prompt 块，生成的视频
 可达几百 MB，任何 `handle.read()` 整文件读法都不适用于资源库扫描线程。解析逻辑一律复用
 comfy_metadata / image_gallery 的既有实现，本模块只负责「载体读取 + 字段归一」。
 """
+import io
 import json
 import math
 import os
@@ -25,10 +26,16 @@ MAX_DEPTH = 8
 # stts 的 entry 数来自文件声明：几百 MB 的视频也只该有几十条，异常声明必须封顶，
 # 否则一个伪造的 4 字节计数会让解析循环把扫描线程吃掉。
 MAX_STTS_ENTRIES = 100000
+# EBML 的封顶思路与 MAX_STTS_ENTRIES 一样：元素数与「真正读进内存的字节数」都要有上限。
+# Cluster 按声明长度 seek 跳过（不读），所以扫描几百 MB 的视频也只消耗几万次 seek。
+MAX_EBML_ELEMENTS = 20000
+MAX_EBML_READ_BYTES = 8 * 1024 * 1024
+MAX_EBML_LEAF_BYTES = 4 * 1024 * 1024    # 单个叶子元素体上限：更大的（附件/字幕）跳过不读
 
 # 提取语义版本：这层一变，老行就必须重解析才能拿到新字段（media_library 据此决定要不要
 # 把 meta_mtime 清零重扫）。v2 = §15.1 的参数按字段名回收 + stts 帧率。
-EXTRACT_VERSION = 2
+# v3 = EBML（webm/mkv）：Info 时长 + 视频轨 DefaultDuration 帧率与宽高 + Tags 里的 comment JSON。
+EXTRACT_VERSION = 3
 
 IMAGE_EXTS = (".png", ".webp", ".jpg", ".jpeg", ".gif")
 
@@ -723,6 +730,479 @@ def read_mp4_meta(path, max_window_bytes=MAX_WINDOW_BYTES, info=None):
     return out
 
 
+# ----------------------------------------------------------------- EBML（webm/mkv）
+
+# EBML 元素 = 变长 ID + 变长数据长度 + 内容。两者共用一套「前导零个数 + 1 = 字节数」的编码，
+# 区别是 ID 把标记位算进值里（所以 0x83 是 1 字节、0x4489 是 2 字节、0x2AD7B1 是 3 字节、
+# 0x18538067 是 4 字节），而长度要去掉标记位；长度值全 1（0xFF、0x01FF…FF）表示未知长度。
+# 下面只登记本轮真正要读的元素与判断结构所需的兄弟 ID，其它未知 ID 一律按声明长度跳过。
+_EBML_ID_EBML = 0x1A45DFA3
+_EBML_ID_DOCTYPE = 0x4282
+_EBML_ID_SEGMENT = 0x18538067
+_EBML_ID_SEEKHEAD = 0x114D9B74
+_EBML_ID_INFO = 0x1549A966
+_EBML_ID_TIMECODE_SCALE = 0x2AD7B1
+_EBML_ID_DURATION = 0x4489
+_EBML_ID_TRACKS = 0x1654AE6B
+_EBML_ID_TRACK_ENTRY = 0xAE
+_EBML_ID_TRACK_NUMBER = 0xD7
+_EBML_ID_TRACK_TYPE = 0x83
+_EBML_ID_DEFAULT_DURATION = 0x23E383
+_EBML_ID_VIDEO = 0xE0
+_EBML_ID_PIXEL_WIDTH = 0xB0
+_EBML_ID_PIXEL_HEIGHT = 0xBA
+_EBML_ID_DISPLAY_WIDTH = 0xB5
+_EBML_ID_DISPLAY_HEIGHT = 0xB6
+_EBML_ID_TAGS = 0x1254C367
+_EBML_ID_TAG = 0x7373
+_EBML_ID_SIMPLE_TAG = 0x67C8
+_EBML_ID_TAG_NAME = 0x45A3
+_EBML_ID_TAG_STRING = 0x4487
+_EBML_ID_CLUSTER = 0x1F43B675
+_EBML_ID_BLOCK_GROUP = 0xA0
+_EBML_ID_SIMPLE_BLOCK = 0xA3
+_EBML_ID_BLOCK_TIMECODE = 0xE3
+_EBML_ID_CUES = 0x1C53BB6B
+_EBML_ID_CHAPTERS = 0x1043A770
+_EBML_ID_VOID = 0xEC
+_EBML_ID_CRC32 = 0xBF
+
+_EBML_NAMES = {
+    _EBML_ID_EBML: "EBML", _EBML_ID_DOCTYPE: "DocType", _EBML_ID_SEGMENT: "Segment",
+    _EBML_ID_SEEKHEAD: "SeekHead", _EBML_ID_INFO: "Info", _EBML_ID_TIMECODE_SCALE: "TimecodeScale",
+    _EBML_ID_DURATION: "Duration", _EBML_ID_TRACKS: "Tracks", _EBML_ID_TRACK_ENTRY: "TrackEntry",
+    _EBML_ID_TRACK_NUMBER: "TrackNumber", _EBML_ID_TRACK_TYPE: "TrackType",
+    _EBML_ID_DEFAULT_DURATION: "DefaultDuration", _EBML_ID_VIDEO: "Video",
+    _EBML_ID_PIXEL_WIDTH: "PixelWidth", _EBML_ID_PIXEL_HEIGHT: "PixelHeight",
+    _EBML_ID_DISPLAY_WIDTH: "DisplayWidth", _EBML_ID_DISPLAY_HEIGHT: "DisplayHeight",
+    _EBML_ID_TAGS: "Tags", _EBML_ID_TAG: "Tag", _EBML_ID_SIMPLE_TAG: "SimpleTag",
+    _EBML_ID_TAG_NAME: "TagName", _EBML_ID_TAG_STRING: "TagString", _EBML_ID_CLUSTER: "Cluster",
+    _EBML_ID_BLOCK_GROUP: "BlockGroup", _EBML_ID_SIMPLE_BLOCK: "SimpleBlock",
+    _EBML_ID_BLOCK_TIMECODE: "Timecode", _EBML_ID_CUES: "Cues", _EBML_ID_CHAPTERS: "Chapters",
+    _EBML_ID_VOID: "Void", _EBML_ID_CRC32: "CRC32",
+}
+
+# 取值叶子：(解码方式, 落到本层收集袋的键)。收集袋按容器划分，所以块数据里巧合出现的
+# Duration 字节不会污染 Info 的值（Video 例外：它把尺寸直接写进所属 TrackEntry 的袋子）。
+_EBML_VALUES = {
+    _EBML_ID_DOCTYPE: ("text", "doctype"),
+    _EBML_ID_TIMECODE_SCALE: ("uint", "timecode_scale"),
+    _EBML_ID_DURATION: ("float", "duration"),
+    _EBML_ID_TRACK_TYPE: ("uint", "track_type"),
+    _EBML_ID_DEFAULT_DURATION: ("uint", "default_duration"),
+    _EBML_ID_PIXEL_WIDTH: ("uint", "pixel_width"),
+    _EBML_ID_PIXEL_HEIGHT: ("uint", "pixel_height"),
+    _EBML_ID_DISPLAY_WIDTH: ("uint", "display_width"),
+    _EBML_ID_DISPLAY_HEIGHT: ("uint", "display_height"),
+    _EBML_ID_TAG_NAME: ("text", "tag_name"),
+    _EBML_ID_TAG_STRING: ("text", "tag_string"),
+}
+
+_EBML_CONTAINERS = ("EBML", "Segment", "Info", "Tracks", "TrackEntry", "Video", "Tags", "Tag",
+                    "SimpleTag")
+# 这些元素允许未知长度（直播式写入 / 尾部追加封装）；其余未知长度一律就地收摊。
+_EBML_UNKNOWN_SIZE = frozenset((_EBML_ID_SEGMENT, _EBML_ID_CLUSTER, _EBML_ID_TRACKS, _EBML_ID_TAGS))
+_EBML_SEGMENT_SIBLINGS = frozenset((_EBML_ID_EBML, _EBML_ID_SEGMENT, _EBML_ID_SEEKHEAD,
+                                    _EBML_ID_INFO, _EBML_ID_TRACKS, _EBML_ID_CHAPTERS,
+                                    _EBML_ID_CLUSTER, _EBML_ID_CUES, _EBML_ID_TAGS,
+                                    _EBML_ID_VOID, _EBML_ID_CRC32))
+# 未知长度容器靠「合法子元素 / 兄弟 ID」判断边界：别把子元素当顶层，也别把顶层当子元素。
+# Cluster 不在这张表里：它的内容由 _ebml_skip_cluster 整段按声明长度跳过（块数据里的巧合字节
+# 一律不解析），边界只看 Segment 级兄弟 ID。
+_EBML_CHILDREN = {
+    "top": _EBML_SEGMENT_SIBLINGS,
+    "Segment": _EBML_SEGMENT_SIBLINGS,
+    "Tracks": frozenset((_EBML_ID_TRACK_ENTRY,)),
+    "Tags": frozenset((_EBML_ID_TAG,)),
+}
+# Matroska 的 TimecodeScale 缺省是 1000000 纳秒 = 1 毫秒，规范允许文件里不写这个元素。
+_EBML_DEFAULT_TIMECODE_SCALE = 1000000
+# ffmpeg/VHS 写 `-metadata comment=...` 就落在 Tags 的 SimpleTag 里；title 是 comment 的回落，
+# prompt/workflow 是少数封装器直接写自由键的情况。大小写不敏感，取值顺序与 mp4 那条路一致。
+_EBML_TAG_KEYS = ("comment", "description", "title", "prompt", "workflow")
+
+
+def _ebml_state(stream, size, limit, acc, window):
+    """一趟扫描的可变状态：流、文件大小、本窗口允许走到的位置、元素/字节计数、待回头元素。"""
+    return {"f": stream, "size": size, "limit": limit, "acc": acc, "window": window,
+            "pos": 0, "read": 0, "elements": 0, "clusters": 0, "pending": None, "stopped": ""}
+
+
+def _ebml_stop(st, reason):
+    """第一个停止原因最接近根因，后面的只记账不覆盖。"""
+    if not st["stopped"]:
+        st["stopped"] = reason
+    st["acc"]["stopped"].add(reason)
+
+
+def _ebml_read(st, count):
+    """顺序读取，受字节上限约束：超限或 EOF 返回空，调用方按「读不满」处理。"""
+    if count <= 0:
+        return b""
+    if st["read"] + count > MAX_EBML_READ_BYTES:
+        _ebml_stop(st, "read_limit")
+        return b""
+    data = st["f"].read(count)
+    st["read"] += len(data)
+    st["pos"] += len(data)
+    return data
+
+
+def _ebml_seek_to(st, offset):
+    st["pos"] = offset
+    try:
+        st["f"].seek(offset)
+    except Exception:
+        _ebml_stop(st, "seek")
+        return False
+    return True
+
+
+def _ebml_skip(st, count):
+    """按声明长度跳过内容（不读）：Cluster 的块数据就是这么越过去的。"""
+    if count <= 0:
+        return True
+    if st["pos"] + count > st["size"]:
+        _ebml_stop(st, "declared_beyond_eof")
+        return False
+    return _ebml_seek_to(st, st["pos"] + count)
+
+
+def _ebml_vint(st, is_id):
+    """变长整数：is_id=True 保留前导标记位（ID 的值含标记位），False 时去掉。
+
+    返回 (值, 字节数)；长度值全 1 时值为 None（未知长度），起始字节不合法时返回 None。
+    """
+    first = _ebml_read(st, 1)
+    if not first:
+        return None
+    byte = first[0]
+    if byte == 0:
+        return None                                     # 0x00 不是合法的起始字节
+    mask, zeros = 0x80, 0
+    while mask and not byte & mask:
+        mask >>= 1
+        zeros += 1
+    length = zeros + 1
+    if length > (4 if is_id else 8):
+        return None                                     # 元素 ID 最长 4 字节
+    rest = _ebml_read(st, length - 1) if length > 1 else b""
+    if len(rest) != length - 1:
+        return None
+    raw = int.from_bytes(bytes([byte]) + rest, "big")
+    if is_id:
+        return raw, length
+    low = (1 << (7 * length)) - 1                        # 标记位之外剩下的 value 位
+    value = raw & low
+    return (None if value == low else value), length
+
+
+def _ebml_header(st):
+    """下一个元素的 (ID, 声明长度)；长度 None 表示未知长度。读不到返回 None。"""
+    ident = _ebml_vint(st, True)
+    if ident is None:
+        return None
+    size = _ebml_vint(st, False)
+    if size is None:
+        return None
+    return ident[0], size[0]
+
+
+def _ebml_next(st):
+    """取下一个元素头；上一层退回的元素先消化退回项（不重复读字节）。"""
+    if st["pending"] is not None:
+        item, st["pending"] = st["pending"], None
+        return item
+    return _ebml_header(st)
+
+
+def _ebml_uint(data):
+    """uINT：1-8 字节大端无符号。宽度 0 或超过 8 字节都是畸形声明，不猜。"""
+    if not data or len(data) > 8:
+        return None
+    return int.from_bytes(data, "big")
+
+
+def _ebml_float(data):
+    """FLOAT：规范只有 4/8 字节，但实测有 0/1/2 字节的畸形写法 —— 高位补零按 double 解。"""
+    if not data or len(data) > 8:
+        return None
+    try:
+        if len(data) == 8:
+            value = struct.unpack(">d", data)[0]
+        elif len(data) == 4:
+            value = struct.unpack(">f", data)[0]
+        else:
+            value = struct.unpack(">d", b"\x00" * (8 - len(data)) + data)[0]
+    except (struct.error, IndexError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _ebml_text(data):
+    """STRING/UTF-8：去掉尾部 NUL，坏字节按 replace 解，绝不抛。"""
+    if not data:
+        return ""
+    return data.rstrip(b"\x00").decode("utf-8", "replace")
+
+
+def _ebml_leaf(st, size):
+    """读叶子元素内容：过大就跳过（返回 None 当缺失），读不满就当截断。"""
+    if not size:
+        return None
+    if size > MAX_EBML_LEAF_BYTES:
+        _ebml_skip(st, size)
+        st["acc"]["big_leaves"] += 1
+        return None
+    data = _ebml_read(st, size)
+    return data if len(data) == size else None
+
+
+def _ebml_value(st, spec, data, ctx):
+    kind, key = spec
+    if kind == "uint":
+        value = _ebml_uint(data)
+    elif kind == "float":
+        value = _ebml_float(data)
+    else:
+        value = _ebml_text(data) or None
+    if value is None:
+        return
+    if key == "doctype":                          # 诊断字段，属于整趟扫描而不某一层
+        st["acc"]["doctype"] = value
+        return
+    ctx.setdefault(key, value)                    # 同层重复元素按规范顺序取第一个
+
+
+def _ebml_settle(st, name, ctx):
+    """容器退出时结算：时长走 Info，帧率/宽高走视频轨，键值走 SimpleTag。"""
+    acc = st["acc"]
+    if name == "Info":
+        raw = ctx.get("duration")
+        if acc["duration"] is None and raw is not None and raw > 0:
+            # TimecodeScale 可以缺席（缺省 1000000 纳秒 = 1 毫秒），用时如实区分是否真的读到过。
+            scale = ctx.get("timecode_scale")
+            seconds = round(float(scale or _EBML_DEFAULT_TIMECODE_SCALE) * float(raw) / 1e9, 6)
+            if 0 < seconds < 1e9:                 # 畸形宽度的 FLOAT 解出次正范数也会被这里挡掉
+                acc["duration"] = seconds
+                acc["used"].update(("Info", "Duration"))
+                if scale:
+                    acc["used"].add("TimecodeScale")
+        return
+    if name == "TrackEntry":
+        if ctx.get("track_type") != 1:            # 1 = 视频轨；声音/字幕轨不算帧率
+            return
+        acc["used"].add("TrackType")
+        default_duration = ctx.get("default_duration")
+        if acc["fps"] is None and default_duration:
+            # DefaultDuration 的单位是纳秒/帧（规范原文：帧率写作 1000000000/duration）。
+            # 实测 ffmpeg libvpx-vp9 与 libx264 都按 ns 写：r=8→125000000、24→41666666、
+            # 25→40000000、30→33333333、23.976→41708375，1e9/DD 正好还原帧率。
+            fps = 1000000000.0 / float(default_duration)
+            if 0.01 <= fps <= 10000:              # 越界的畸形声明不写进 fps
+                acc["fps"] = round(fps, 3)        # 与 mp4 同口径：3 位小数，拿不到留 None
+                acc["used"].add("DefaultDuration")
+        if acc["width"] is None:
+            size = (ctx.get("pixel_width"), ctx.get("pixel_height"))
+            if size[0] and size[1]:
+                acc["used"].update(("Video", "PixelWidth", "PixelHeight"))
+            else:
+                size = (ctx.get("display_width"), ctx.get("display_height"))
+                if size[0] and size[1]:
+                    acc["sizing"] = "display"     # 只有显示尺寸：宽高带比例，如实标出来
+                    acc["used"].update(("Video", "DisplayWidth", "DisplayHeight"))
+                else:
+                    return
+            acc["width"], acc["height"] = size
+        return
+    if name == "SimpleTag":
+        tag = _text(ctx.get("tag_name")).strip().lower()
+        value = ctx.get("tag_string")
+        if tag in _EBML_TAG_KEYS and value:
+            acc["tags"].setdefault(tag, value)
+            acc["tags_at"] = st["window"]
+            acc["used"].update(("Tags", "Tag", "SimpleTag", "TagName", "TagString"))
+
+
+def _ebml_walk(st, end, scope, ctx, depth):
+    """流式遍历一个容器的体。end 是体末尾；None 表示本层未知长度，靠读到兄弟 ID 收尾。"""
+    if depth > MAX_DEPTH:
+        _ebml_stop(st, "depth")
+        return
+    while st["elements"] < MAX_EBML_ELEMENTS and not st["stopped"]:
+        head = _ebml_next(st)
+        if head is None:
+            return
+        eid, size = head
+        body = st["pos"]
+        if body > st["limit"]:
+            _ebml_stop(st, "window")              # 超出首窗口的位置边界（尾部另有窗口兜底）
+            return
+        if end is not None and (body > end or (size is not None and body + size > end)):
+            st["pending"] = head                  # 这个元素不属于本层，退回给上一层
+            return
+        if end is None and scope != "top" and eid not in _EBML_CHILDREN.get(scope, ()):
+            st["pending"] = head                  # 未知长度容器的第一个「不是子元素」就是兄弟
+            return
+        if size is None and (eid not in _EBML_UNKNOWN_SIZE
+                             or eid not in _EBML_CHILDREN.get(scope, ())):
+            st["pending"] = head
+            _ebml_stop(st, "unknown_size")        # 没有长度又没有兄弟边界可依，就地收摊
+            return
+        name = _EBML_NAMES.get(eid)
+        st["elements"] += 1
+        if name == "Cluster":                     # 块数据里没有我们要的字段：整段跳过
+            st["clusters"] += 1
+            if size is None:
+                _ebml_skip_cluster(st, end, depth + 1)
+            elif not _ebml_skip(st, size):
+                return
+            continue
+        if name == "Segment":
+            st["acc"]["segment"] = True
+        spec = _EBML_VALUES.get(eid)
+        if spec is not None:
+            _ebml_value(st, spec, _ebml_leaf(st, size), ctx)
+            continue
+        if name in _EBML_CONTAINERS:
+            child_ctx = ctx if name == "Video" else {}
+            _ebml_walk(st, body + size if size is not None else None, name, child_ctx, depth + 1)
+            if name != "Video":
+                _ebml_settle(st, name, child_ctx)
+            continue
+        if size is None:
+            _ebml_stop(st, "unknown_leaf")
+            return
+        if not _ebml_skip(st, size):              # 未知 ID / 不关心的叶子：按声明长度跳过
+            return
+
+
+def _ebml_skip_cluster(st, end, depth):
+    """未知长度的 Cluster：只读元素头、按声明长度跳过内容，读到下一个 Segment 级兄弟 ID 就停。
+
+    这里绝不把子元素当取值元素解析（块数据里巧合出现的 0xB0 会被读成 PixelWidth），也不允许
+    无限下钻：子元素再是未知长度就收摊，元素数与字节数另有封顶。
+    """
+    if depth > MAX_DEPTH:
+        _ebml_stop(st, "depth")
+        return
+    while st["elements"] < MAX_EBML_ELEMENTS and not st["stopped"]:
+        head = _ebml_next(st)
+        if head is None:
+            return
+        eid, size = head
+        body = st["pos"]
+        if body > st["limit"]:
+            _ebml_stop(st, "window")
+            return
+        if eid in _EBML_SEGMENT_SIBLINGS or (end is not None and size is not None
+                                            and body + size > end):
+            st["pending"] = head                  # 已经是下一个兄弟（或另一个 Cluster）
+            return
+        if size is None:
+            st["pending"] = head
+            _ebml_stop(st, "unknown_block")       # 块必须有长度，没有就无法定位下一个
+            return
+        st["elements"] += 1
+        if not _ebml_skip(st, size):
+            return
+
+
+def _ebml_acc():
+    return {"segment": False, "duration": None, "fps": None,
+            "width": None, "height": None, "sizing": None, "tags": {}, "tags_at": None,
+            "doctype": None, "used": set(), "stopped": set(), "big_leaves": 0}
+
+
+def _ebml_scan_tail(buf, acc):
+    """尾窗口反推 Tags 起点：'Tags' 的四字节 ID 在块数据里也可能巧合出现，靠首个子元素是
+    Tag 来校验（与 mp4 的 _moov_spans 同一个思路）。找到就解析，找不到就什么也不做。"""
+    st = _ebml_state(io.BytesIO(buf), len(buf), len(buf), acc, "tail")
+    needle = _EBML_ID_TAGS.to_bytes(4, "big")
+    start = 0
+    while start < len(buf) and st["elements"] < MAX_EBML_ELEMENTS:
+        index = buf.find(needle, start)
+        if index < 0:
+            break
+        start = index + 4
+        st["stopped"] = ""                        # 一个候选的失败不该挡住后面的候选
+        if not _ebml_seek_to(st, index):
+            break
+        head = _ebml_header(st)
+        if head is None or head[0] != _EBML_ID_TAGS:
+            continue
+        size = head[1]
+        body = st["pos"]
+        if size is None or size < 8 or body + size > len(buf) or size > MAX_EBML_LEAF_BYTES:
+            continue
+        child = _ebml_header(st)                  # 结构校验：Tags 的第一个子元素必须是 Tag
+        if child is None or child[0] != _EBML_ID_TAG:
+            continue
+        st["pending"] = child
+        st["elements"] += 1
+        _ebml_walk(st, body + size, "Tags", {}, 1)
+    return st["elements"]
+
+
+def read_ebml_meta(path, max_window_bytes=MAX_WINDOW_BYTES, info=None):
+    """返回 {"comment","description","prompt","workflow","duration","width","height","fps"}，
+    形状与 read_mp4_meta 一致，所以四个标签位走同一个后处理入口（_absorb）。
+
+    不依赖 SeekHead/Cues：从头顺扫，Cluster 按声明长度跳过；文件超过窗口大小时再加一段尾部
+    窗口兜底（有的封装器把 Tags 写在最后一个 Cluster 之后）。任何畸形输入只降级不抛异常。
+    info 是可选诊断袋（记录实际用到的元素名），不参与契约返回值形状。
+    """
+    out = {"comment": None, "description": None, "prompt": None, "workflow": None,
+           "duration": None, "width": None, "height": None, "fps": None}
+    if info is None:
+        info = {}
+    size = os.path.getsize(path)
+    acc = _ebml_acc()
+    elements = 0
+    clusters = 0
+    read_bytes = 0
+    window = "whole" if size <= max_window_bytes else "head+tail"
+    with open(path, "rb") as f:
+        limit = size if size <= max_window_bytes else max_window_bytes
+        st = _ebml_state(f, size, limit, acc, window if window == "whole" else "head")
+        _ebml_walk(st, None, "top", {}, 0)
+        elements += st["elements"]
+        clusters += st["clusters"]
+        read_bytes += st["read"]
+        if size > max_window_bytes:
+            # 为什么还要读尾部：有的封装器把 Tags 写在最后一个 Cluster 之后，只扫文件头取不到。
+            f.seek(size - max_window_bytes)
+            tail = f.read(max_window_bytes)
+            read_bytes += len(tail)
+            elements += _ebml_scan_tail(tail, acc)
+    tags = acc["tags"]
+    out["comment"] = tags.get("comment") or tags.get("title")   # comment 优先，title 回落
+    out["description"] = tags.get("description")
+    out["prompt"] = tags.get("prompt")
+    out["workflow"] = tags.get("workflow")
+    out["duration"] = acc["duration"]
+    out["width"] = acc["width"]
+    out["height"] = acc["height"]
+    out["fps"] = acc["fps"]
+    info["segment_found"] = acc["segment"]
+    info["window"] = window
+    info["elements"] = elements
+    info["clusters"] = clusters
+    info["read_bytes"] = read_bytes
+    info["used"] = sorted(acc["used"])
+    info["tags"] = sorted(tags)
+    info["tags_at"] = acc["tags_at"]
+    if acc["doctype"]:
+        info["doctype"] = acc["doctype"]
+    if acc["sizing"]:
+        info["sizing"] = acc["sizing"]
+    if acc["big_leaves"]:
+        info["big_leaves"] = acc["big_leaves"]
+    if acc["stopped"]:
+        info["stopped"] = sorted(acc["stopped"])
+    return out
+
+
 # --------------------------------------------------------------------- 归一化拼装
 
 def _classify(value, origin, sink, notes, depth=0):
@@ -951,6 +1431,24 @@ def _norm_ext(ext, path):
     return text if text.startswith(".") else "." + text
 
 
+def _container_payload(meta):
+    """容器里读出的四个标签位喂统一后处理入口：mp4 的 udta 与 EBML 的 Tags 走同一个 _absorb。"""
+    return {k: v for k, v in meta.items()
+            if k in ("comment", "description", "prompt", "workflow") and v}
+
+
+def _merge_stream_fields(out, meta):
+    """时长/宽高/帧率属于容器，即使没有元数据也要回填。"""
+    if out["width"] is None:
+        out["width"] = meta["width"]
+    if out["height"] is None:
+        out["height"] = meta["height"]
+    if meta.get("duration") is not None:
+        out["duration"] = meta["duration"]
+    if meta.get("fps") is not None:
+        out["fps"] = meta["fps"]
+
+
 def extract(path, ext=None, max_chunk_bytes=MAX_CHUNK_BYTES, max_window_bytes=MAX_WINDOW_BYTES):
     """返回归一化 dict；任何异常一律吞掉并在 note 里说明，绝不抛给扫描线程。"""
     out = blank_result()
@@ -1008,23 +1506,23 @@ def _fill(out, path, ext, max_chunk_bytes, max_window_bytes, notes, extra):
         mp4_info = {}
         meta = read_mp4_meta(target, max_window_bytes, mp4_info)
         extra["mp4"] = mp4_info
-        payloads = {k: v for k, v in meta.items()
-                    if k in ("comment", "description", "prompt", "workflow") and v}
+        payloads = _container_payload(meta)
         if payloads:
             source = "mp4_udta"
         if not mp4_info.get("moov_found"):
             notes.append("未找到 moov（可能超出首尾各 16MB 窗口）。")
-        # 时长/宽高/帧率属于容器，即使没有元数据也要回填。
-        if out["width"] is None:
-            out["width"] = meta["width"]
-        if out["height"] is None:
-            out["height"] = meta["height"]
-        if meta.get("duration") is not None:
-            out["duration"] = meta["duration"]
-        if meta.get("fps") is not None:
-            out["fps"] = meta["fps"]
+        _merge_stream_fields(out, meta)
     elif ext in (".webm", ".mkv"):
-        extra["ebml"] = "v1 不解析 EBML"
+        ebml_info = {}
+        meta = read_ebml_meta(target, max_window_bytes, ebml_info)
+        extra["ebml"] = ebml_info
+        payloads = _container_payload(meta)
+        if payloads:
+            # 值来自 Segment → Tags → Tag → SimpleTag → TagString，与 mp4 的 udta 平级但来源分开
+            source = "ebml_tag"
+        if not ebml_info.get("segment_found"):
+            notes.append("未找到 Matroska Segment（文件不是 EBML，或结构超出首尾各 16MB 窗口）。")
+        _merge_stream_fields(out, meta)
 
     found = _absorb(out, payloads, source, notes, extra) if payloads else False
     if not found:

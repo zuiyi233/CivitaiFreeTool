@@ -5472,6 +5472,9 @@ const lib = {
   thumbBusy: false, scanRunning: false, noRoots: false, rootsState: [],
   posterTried: new Set(), posterTimers: [], vObs: null,      // vObs：全页共用的一个视频挂载观察器
   popKind: "", popAnchor: null, foldersOpen: false,
+  // 详情长文本（提示词/负面提示词）的展开态：按 String(id) 存，换条目天然回折叠态。
+  // descOpenId 记下这份状态属于哪一条：对不上就整份清空（既是重置也防止越翻越多）。
+  descOpen: {}, descOpenId: "",
   _dirsFromPanel: [], _durError: "",
 };
 
@@ -6880,10 +6883,30 @@ async function libShowDetail(id) {
   libTeardownVideos(panel);
   panel.innerHTML = libDetailHtml(d);
   mask.style.display = "flex";
+  // 长文本要不要挂「展开全文」得等 DOM 落地后量真实溢出，所以渲染完立刻测一次（同 libFillChipFacets 的纪律）。
+  // 必须在 mask 显示之后测：详情浮层是 display:none 的，隐藏状态下 scrollHeight/clientHeight 都是 0，会误判成「没溢出」。
+  libFillDescMore();
+  // 正文用的是内嵌字体（@font-face），字体替换前后行高会变，临界长度的条目可能「该挂没挂」。
+  // 字体就绪后按同一套判定重测一次；令牌变了说明用户已经翻页/关掉详情，就不动现在的 DOM。
+  const descReq = lib.detailRequest;
+  if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+    document.fonts.ready.then(() => {
+      if (descReq === lib.detailRequest && lib.detail && libPageActive()) libFillDescMore();
+    }).catch(() => { });
+  }
 }
 function libDetailRow(k, v, mono) {
   if (v === "" || v == null) return "";
   return '<div class="dt-mr"><span class="k">' + esc(k) + '</span><span class="v' + (mono ? " dt-mono" : "") + '" data-tip="' + esc(String(v)) + '">' + esc(String(v)) + "</span></div>";
+}
+// 详情里的长文本正文块（正面/负面提示词走同一个 helper）。
+// .detail-desc 是模型库详情也在用的共享类（固定 180px 滚动框），不能动它的全局行为，
+// 所以这里只加资源库自己的 lib-desc：折叠态约 3 行、溢出判定与控件都由 libFillDescMore 负责。
+// text 来自文件内嵌元数据（外部可控），一律过 esc；emptyHtml 是本函数里写死的占位文案。
+function libDetailDescHtml(field, text, emptyHtml) {
+  const t = String(text == null ? "" : text);
+  return '<div class="detail-desc lib-desc" data-lib-desc="' + esc(field) + '">' +
+    (t ? esc(t) : (emptyHtml || "")) + "</div>";
 }
 function libDetailHtml(d) {
   const isVid = d.kind === "video";
@@ -6930,10 +6953,10 @@ function libDetailHtml(d) {
     (d.note ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("info") + '解析备注</div><div class="detail-desc">' + esc(d.note) + "</div></div>" : "") +
     '<div class="dt-sec"><div class="dt-sec-h">' + _icon("file") + '正面提示词' + srcHint +
       (d.prompt ? '<button class="btn dt-copy" data-lib-act="copy-prompt" type="button">' + _icon("copy") + "复制</button>" : "") +
-      '</div><div class="detail-desc">' + (d.prompt ? esc(d.prompt) : '<span class="dt-dim">无提示词（文件未内嵌元数据，或同名 .json 侧车也没有）</span>') + "</div></div>" +
+      '</div>' + libDetailDescHtml("prompt", d.prompt, '<span class="dt-dim">无提示词（文件未内嵌元数据，或同名 .json 侧车也没有）</span>') + "</div></div>" +
     (d.negative ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("file") + '负面提示词' +
       '<button class="btn dt-copy" data-lib-act="copy-negative" type="button">' + _icon("copy") + "复制</button>" +
-      '</div><div class="detail-desc">' + esc(d.negative) + "</div></div>" : "") +
+      '</div>' + libDetailDescHtml("negative", d.negative, "") + "</div></div>" : "") +
     (refs.length ? '<div class="dt-sec"><div class="dt-sec-h">' + _icon("layers") + '模型引用<span class="dt-sec-hint">点击跳模型库</span></div><div class="lib-chips">' +
       refs.map((m) => '<span class="lib-chip" data-lib-model="' + esc(m) + '" title="在本地模型库里定位">' + esc(m) + "</span>").join("") + "</div></div>" : "") +
     (extra ? '<div class="dt-sec"><details><summary class="dt-sec-h">' + _icon("settings") + "原始解析摘要</summary><pre class=\"detail-desc\">" + esc(extra) + "</pre></details></div>" : "") +
@@ -6955,12 +6978,70 @@ function libDetailHtml(d) {
       "</div></div>" +
     "</div></div></div>";
 }
+function libDescMoreEl(field, count, open) {
+  const el = document.createElement("span");
+  el.className = "lib-chip lib-desc-more";
+  el.setAttribute("role", "button");
+  el.tabIndex = 0;
+  el.dataset.libDescmore = field;
+  el.setAttribute("aria-pressed", open ? "true" : "false");
+  el.textContent = open ? "收起" : "展开全文（共 " + count + " 字）";
+  // 展开态有高度上限（CSS 里 min(60vh, 560px)），不保证一次全露出，title 就如实说「没看全就滚动」，
+  // 不能写成「展开即全文」这种做不到的承诺。
+  el.title = open ? "已展开：高度按窗口给上限，没看全就在这个块里往下滚动；点一下收回三行"
+    : "共 " + count + " 字，现在只显示开头几行；展开后高度按窗口给上限，没看全就在这个块里滚动";
+  return el;
+}
+// 量一次真实溢出再决定挂不挂控件（照 libFillChipFacets 的纪律：折行以下看不见的东西，
+// 不给出「能看全」的入口就等于没数据）。控件挂在正文块的兄弟位置而不是正文块内部：
+// 塞在滚动框里它自己就落在折叠线以下，等于看不见。
+function libFillDescMore() {
+  const panel = libEl("detailPanel"), d = lib.detail;
+  if (!panel || !d) return;
+  const key = String(d.id);
+  // 换条目（←/→ 翻页、重开另一条）先把展开态清掉：展开只属于当前这一条，不许跟着串下去
+  if (lib.descOpenId !== key) { lib.descOpen = {}; lib.descOpenId = key; }
+  const openMap = lib.descOpen;
+  const act = document.activeElement;
+  // 重画会整个替换控件元素，键盘用户按一次「展开」就会从头 Tab；记下焦点在哪个字段上，画完接回去
+  const focusKey = (act && panel.contains(act) && act.dataset && act.dataset.libDescmore) ? act.dataset.libDescmore : "";
+  panel.querySelectorAll("[data-lib-desc]").forEach((el) => {
+    const field = el.dataset.libDesc;
+    const host = el.parentElement || el;
+    const old = host.querySelector(":scope > [data-lib-descmore]");
+    if (old) old.remove();
+    const text = String(d[field] == null ? "" : d[field]);
+    const open = !!openMap[field];
+    el.classList.toggle("is-expanded", open);
+    if (!text) return;                                        // 空正文（只有占位文案）不挂控件
+    if (open || el.scrollHeight > el.clientHeight + 2) {
+      host.appendChild(libDescMoreEl(field, text.length, open));
+    }
+  });
+  if (focusKey) {
+    const m = panel.querySelector('[data-lib-descmore="' + CSS.escape(focusKey) + '"]');
+    if (m) m.focus();
+  }
+}
+function libToggleDescMore(field) {
+  const d = lib.detail; const panel = libEl("detailPanel");
+  if (!d || !panel || !field) return;
+  if (lib.descOpenId !== String(d.id)) { lib.descOpen = {}; lib.descOpenId = String(d.id); }
+  const el = panel.querySelector('[data-lib-desc="' + CSS.escape(field) + '"]');
+  if (!el) return;
+  const on = !lib.descOpen[field];
+  lib.descOpen[field] = on;
+  if (on) el.scrollTop = 0;                                    // 展开是从头读，不该留着折叠态的滚动位置
+  libFillDescMore();
+}
 function libCloseDetail() {
   const panel = libEl("detailPanel"), mask = libEl("detailMask");
   libTeardownVideos(panel);
   if (mask) mask.style.display = "none";
   if (panel) panel.innerHTML = "";
   lib.detail = null;
+  // 关掉再重开同一条也要回到折叠态（展开是「这一次看」的临时视图，不是条目属性）
+  lib.descOpen = {}; lib.descOpenId = "";
   // 详情关掉后「当前卡」的高亮也就没意义了；批量已选的 .checked 不受影响（它跨页保留）
   lib.current = null;
   const grid = libEl("libGrid");
@@ -7154,6 +7235,9 @@ document.addEventListener("click", (e) => {
   const dirItem = t.closest('[data-lib-dir]');
   if (dirItem) { libToggleDir(dirItem.dataset.libDir); return; }
   if (t.closest('[data-lib-act="dirs-none"]')) { lib.filters.dirs = []; lib._dirsFromPanel = []; const s = libEl("libDirF"); if (s) s.value = ""; libRenderFolders(); libOnFilterChange(); return; }
+  // 提示词「展开全文 / 收起」：属性名与分面那套 data-lib-facetmore 分开写，两条 closest 互不误伤
+  const descMore = t.closest("[data-lib-descmore]");
+  if (descMore) { libToggleDescMore(descMore.dataset.libDescmore); return; }
   // 分面 chip：× 必须先判（它自己也带 data-lib-facetval，落到下一条就会「取消又选中」＝点了没反应）
   const facetMore = t.closest("[data-lib-facetmore]");
   if (facetMore) { libToggleFacetMore(facetMore.dataset.libFacetmore); return; }
@@ -7287,6 +7371,10 @@ document.addEventListener("keydown", (e) => {
   if (fchip) { if (e.target.closest("button")) return; e.preventDefault(); fchip.click(); return; }
   const fmore = e.target.closest("[data-lib-facetmore]");
   if (fmore) { e.preventDefault(); fmore.click(); return; }        // 展开/收起也是 role=button 的 span
+  // 提示词的「展开全文 / 收起」同样是 role=button 的 span：Enter / Space 与鼠标同权。
+  // 判定放在 chip 之后、且用独立属性名，不会和上面两条互相吃命中。
+  const dmore = e.target.closest("[data-lib-descmore]");
+  if (dmore) { e.preventDefault(); dmore.click(); return; }
   const chip = e.target.closest("#libTagPop [data-lib-tag]");
   if (chip) { e.preventDefault(); chip.click(); return; }      // chip 是 role=button 的 span，键盘要能按
   const selChip = e.target.closest("#libSelTagPop [data-lib-sel-tag]");

@@ -1632,6 +1632,32 @@ class ExtractVersionTests(LibraryCase):
         self.assertEqual(again["reparse"], 8)
         self.assertEqual(self._version(), self.NEW_VER)
 
+    def test_extension_only_version_reparses_only_those_files(self):
+        """只改了 webm/mkv 解析的那一版不许拖着整库重扫：真实库 2792 行、这类文件 0 个，白扫 31 秒。"""
+        self.make("a.png")
+        self.make("b.mp4")
+        self.make("c.webm")
+        self.make("d.mkv")
+        self.scan()
+        self.calls.clear()
+        self._force_old_version(int(self.NEW_VER) - 1)              # 只跨过「定向」那一版
+        result = self.scan()
+        self.assertEqual(result["reparse"], 2)
+        self.assertEqual(sorted(os.path.basename(p) for p in self.calls), ["c.webm", "d.mkv"])
+        self.assertEqual(self._version(), self.NEW_VER)
+
+    def test_stale_stmt_falls_back_to_whole_library_across_unscoped_version(self):
+        """跨过整库级版本（哪怕同时跨过定向版本）必须回到整库口径：宁可多标不可漏标。"""
+        whole, scoped = media_library._EXTRACT_STALE_REPARSE_SQL, media_library._EXTRACT_SCOPED_REPARSE
+        self.assertTrue(scoped, "定向表被清空后这条用例就失去意义了")
+        only = min(scoped)
+        sql, params = media_library._stale_reparse_stmt(only - 1, only)
+        self.assertIn("ext IN", sql)
+        self.assertEqual(params, tuple(sorted(scoped[only])))
+        for past in range(1, only - 1):                             # 从更早的整库级版本跨过来
+            self.assertEqual(media_library._stale_reparse_stmt(past, only), (whole, ()))
+        self.assertEqual(media_library._stale_reparse_stmt(only, only), (whole, ()))   # 无需补解析
+
 
 class BatchOperationsTests(LibraryCase):
     """§16 批量层：未知 id 一律忽略、加标签是并集、摘标签只摘指定的那几个。"""

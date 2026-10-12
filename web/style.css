@@ -1682,6 +1682,19 @@ html[data-theme^="dark"] { color-scheme: dark; }
 .lib-facet-more { flex: none; white-space: nowrap; color: var(--text-dim); cursor: pointer; }
 .lib-facet-more:hover, .lib-facet-more:focus-visible { color: var(--primary); border-color: var(--primary); }
 
+/* ===== 资源库详情：长提示词的折叠 / 展开 =====
+   上面的 .detail-desc（180px 固定高滚动框）是模型库详情也在用的共享类，全局行为一律不动；
+   这里只加资源库自己的 lib-desc：折叠态收成约 3 行（13px × 1.8 行高 × 3，与 .detail-desc 自身口径一致），
+   看不看得到「还有更多」由 libFillDescMore 量真实溢出后再决定挂不挂控件。
+   选择器带 #detailPanel 是为了压过 metro.css 里同权重的 [data-theme="metro"] .detail-desc（它后加载）。 */
+#detailPanel .detail-desc.lib-desc { max-height: calc(13px * 1.8 * 3 * var(--type-scale, 1)); overflow: hidden; }
+/* 展开态：上限跟着窗口给（与分面展开同一口径 60vh / 560px 封顶），超出仍然在块内滚动，
+   所以控件 title 如实写「没看全就滚动」，不假装展开就一定全露出。 */
+#detailPanel .detail-desc.lib-desc.is-expanded { max-height: min(60vh, 560px); overflow-y: auto; }
+/* 控件排在正文块之后（正文块的兄弟），flex 版 .dt-sec 里不拉伸、也不跟正文挤同一行 */
+.lib-desc-more { flex: none; align-self: flex-start; white-space: nowrap; color: var(--text-dim); cursor: pointer; margin-top: 6px; }
+.lib-desc-more:hover, .lib-desc-more:focus-visible { color: var(--primary); border-color: var(--primary); }
+
 /* 时长上下限（秒）：两个 number 贴成一组，留空即不限。宽度随字号缩放，不写死控件尺寸。 */
 .lib-dur { display: inline-flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; font-size: calc(12px * var(--type-scale, 1)); color: var(--text-dim); }
 .lib-dur-label, .lib-dur-unit, .lib-dur-sep { flex: none; color: var(--text-dim); }

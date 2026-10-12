@@ -142,6 +142,166 @@ def mp4_bytes(*boxes):
     return b"".join(boxes)
 
 
+# --------------------------------------------------------------------- EBML 构造器
+# 极小的 EBML 编码器：元素 ID 与数据长度共用「前导零个数 + 1 = 字节数」的变长整数，
+# 区别是 ID 把标记位算进值里。手写十六进制猜长度只会造出解析器读不懂的样本，一律走这里。
+
+E_EBML = 0x1A45DFA3
+E_VERSION = 0x42F2
+E_DOCTYPE = 0x4282
+E_SEGMENT = 0x18538067
+E_SEEKHEAD = 0x114D9B74
+E_INFO = 0x1549A966
+E_TIMECODE_SCALE = 0x2AD7B1
+E_DURATION = 0x4489
+E_TRACKS = 0x1654AE6B
+E_TRACK_ENTRY = 0xAE
+E_TRACK_NUMBER = 0xD7
+E_TRACK_TYPE = 0x83
+E_DEFAULT_DURATION = 0x23E383
+E_VIDEO = 0xE0
+E_PIXEL_WIDTH = 0xB0
+E_PIXEL_HEIGHT = 0xBA
+E_DISPLAY_WIDTH = 0xB5
+E_DISPLAY_HEIGHT = 0xB6
+E_TAGS = 0x1254C367
+E_TAG = 0x7373
+E_SIMPLE_TAG = 0x67C8
+E_TAG_NAME = 0x45A3
+E_TAG_STRING = 0x4487
+E_CLUSTER = 0x1F43B675
+E_TIMECODE = 0xE3
+E_SIMPLE_BLOCK = 0xA3
+E_CUES = 0x1C53BB6B
+E_VOID = 0xEC
+
+
+def ebml_id(ident):
+    """元素 ID 的字节形式：值需要几个字节放，标记位就落在第几个字节上（1-4 字节）。"""
+    for width in (4, 3, 2, 1):
+        if ident >= 1 << (8 * (width - 1)):
+            break
+    raw = ident.to_bytes(width, "big")
+    first = raw[0]
+    length = 1 if first & 0x80 else 2 if first & 0x40 else 3 if first & 0x20 else 4
+    assert length == width, (hex(ident), raw)       # 造出非法 ID 说明上面写错了
+    return raw
+
+
+def ebml_size(value):
+    """数据长度 vint：值必须严格小于同宽度的全 1（全 1 是「未知长度」专用记号）。"""
+    width = 1
+    while value >= (1 << (7 * width)) - 1:
+        width += 1
+    assert width <= 8
+    marker = 0x80 >> (width - 1)
+    head = value >> (8 * (width - 1))
+    assert not head & marker, value
+    return bytes([head | marker]) + (value & ((1 << (8 * (width - 1))) - 1)).to_bytes(width - 1,
+                                                                                      "big")
+
+
+def el(ident, body=b"", size=None):
+    """元素：ID + 声明长度 + 内容。size 传整数即可造「声明与实际不符」的畸形样本。"""
+    return ebml_id(ident) + ebml_size(len(body) if size is None else size) + body
+
+
+def el_open(ident, body=b"", wide=False):
+    """未知长度元素：0xFF（1 字节写法）与 01 FF*7（8 字节写法）都要撑住。"""
+    return ebml_id(ident) + (b"\x01" + b"\xff" * 7 if wide else b"\xff") + body
+
+
+def u(value, width=None):
+    """uINT：默认按最小宽度编码（真实封装就是这么写的）。""" 
+    return value.to_bytes(width or max(1, (value.bit_length() + 7) // 8), "big")
+
+
+def f(value, width=8):
+    return struct.pack(">d" if width == 8 else ">f", value)
+
+
+def s(text):
+    return text.encode("utf-8")
+
+
+def ebml_header(doctype="webm"):
+    return el(E_EBML, el(E_VERSION, u(1)) + el(E_DOCTYPE, s(doctype)))
+
+
+def ebml_info(duration=96000.0, float_width=8, timecode_scale=None):
+    """Info：TimecodeScale 可以缺席（规范缺省 1000000 纳秒），Duration 宽度 4/8/畸形都要撑。"""
+    body = b""
+    if timecode_scale is not None:
+        body += el(E_TIMECODE_SCALE, u(timecode_scale, 4))
+    if duration is not None:
+        body += el(E_DURATION, f(duration, float_width))
+    return el(E_INFO, body)
+
+
+def ebml_video(width=1024, height=576, display=None):
+    body = el(E_PIXEL_WIDTH, u(width, 2)) + el(E_PIXEL_HEIGHT, u(height, 2))
+    if display:
+        body += el(E_DISPLAY_WIDTH, u(display[0], 2)) + el(E_DISPLAY_HEIGHT, u(display[1], 2))
+    return el(E_VIDEO, body)
+
+
+def ebml_display_video(display):
+    return el(E_VIDEO, el(E_DISPLAY_WIDTH, u(display[0], 2)) + el(E_DISPLAY_HEIGHT, u(display[1], 2)))
+
+
+def ebml_track(track_type=1, default_duration=41708333, video=None):
+    body = el(E_TRACK_NUMBER, u(1)) + el(E_TRACK_TYPE, u(track_type))
+    if default_duration:
+        body += el(E_DEFAULT_DURATION, u(default_duration))
+    if video is not None:
+        body += video
+    return el(E_TRACK_ENTRY, body)
+
+
+def ebml_tracks(*entries):
+    return el(E_TRACKS, b"".join(entries))
+
+
+def ebml_tag(name, value):
+    return el(E_TAG, el(E_SIMPLE_TAG, el(E_TAG_NAME, s(name)) + el(E_TAG_STRING, s(value))))
+
+
+def ebml_tags(pairs):
+    return el(E_TAGS, b"".join(ebml_tag(name, value) for name, value in pairs))
+
+
+def ebml_cluster(blocks=2, payload=b"\x00" * 200, open_size=False, wide=False):
+    """Cluster：默认已知长度；open_size 用未知长度写法（直播式封装）。"""
+    body = el(E_TIMECODE, u(0, 2))
+    for index in range(blocks):
+        body += el(E_SIMPLE_BLOCK, bytes([index]) + payload)
+    return el_open(E_CLUSTER, body, wide) if open_size else el(E_CLUSTER, body)
+
+
+def ebml_segment(children, open_size=False):
+    return el_open(E_SEGMENT, b"".join(children)) if open_size else el(E_SEGMENT, b"".join(children))
+
+
+def webm_bytes(*elements):
+    return b"".join(elements)
+
+
+def webm_fixture(comment=None, pairs=None, duration=96000.0, float_width=8, timecode_scale=None,
+                 track_type=1, default_duration=41708333, video=None, clusters=1,
+                 open_cluster=False):
+    """常见形状：EBML 头 + Segment(Info, Tracks, Cluster*, Tags?)。"""
+    if video is None and track_type == 1:
+        video = ebml_video()
+    kids = [ebml_info(duration, float_width, timecode_scale),
+            ebml_tracks(ebml_track(track_type, default_duration, video)),
+            b"".join(ebml_cluster(open_size=open_cluster) for _ in range(clusters))]
+    if pairs is None and comment is not None:
+        pairs = [("comment", comment)]
+    if pairs:
+        kids.append(ebml_tags(pairs))
+    return webm_bytes(ebml_header(), ebml_segment(kids))
+
+
 # ------------------------------------------------------------------- 图 fixture
 
 def api_graph(prompt_text="1girl, solo", negative="lowres, bad", seed=1234, ckpt="SD/animagineXL.safetensors",
@@ -710,12 +870,412 @@ class ExtractVideoTests(MediaMetaTestCase):
         r = media_meta.extract(self.write("huge.mp4", ftyp() + mdat(64) + fake + mvhd()))
         self.assert_shape(r)
 
-    def test_webm_is_indexed_only(self):
+    def test_webm_without_segment_is_indexed_only(self):
+        """不是 EBML 的 .webm：照旧入库，只是什么都不解析出来。"""
         path = self.write("clip.webm", b"\x1a\x45\xdf\xa3" + os.urandom(300))
         r = media_meta.extract(path)
         self.assert_shape(r)
         self.assertFalse(r["has_meta"])
-        self.assertEqual(r["extra"]["ebml"], "v1 不解析 EBML")
+        self.assertEqual(r["source"], "none")
+        self.assertIsNone(r["duration"])
+        self.assertFalse(r["extra"]["ebml"]["segment_found"])
+        self.assertIn("未找到 Matroska Segment", r["note"])
+
+
+class ReadEbmlMetaTests(MediaMetaTestCase):
+    """容器层：Info 时长、视频轨 DefaultDuration 帧率与宽高、Tags 里的四个标签位。"""
+
+    def meta(self, name, *elements):
+        return media_meta.read_ebml_meta(self.write(name, webm_bytes(*elements)))
+
+    def test_return_shape_is_identical_to_mp4_reader(self):
+        meta = self.meta("shape.webm", ebml_header(), ebml_segment([ebml_info()]))
+        self.assertEqual(sorted(meta), sorted(("comment", "description", "prompt", "workflow",
+                                               "duration", "width", "height", "fps")))
+        self.assertEqual(meta["duration"], 96.0)
+        self.assertIsNone(meta["comment"])
+
+    def test_duration_float_8_bytes_with_default_timecode_scale(self):
+        """TimecodeScale 缺席时按规范的 1000000 纳秒（1 毫秒）算：96000 × 1ms = 96 秒。"""
+        info = {}
+        meta = media_meta.read_ebml_meta(self.write("d8.webm", webm_bytes(
+            ebml_header(), ebml_segment([ebml_info(96000.0, float_width=8)]))), info=info)
+        self.assertEqual(meta["duration"], 96.0)
+        self.assertNotIn("TimecodeScale", info["used"])          # 没读到的元素不许冒领
+
+    def test_duration_float_4_bytes(self):
+        """Matroska 允许 4 字节单精度：VHS/ffmpeg 的写法两种都要撑住。"""
+        meta = self.meta("d4.webm", ebml_header(),
+                         ebml_segment([ebml_info(96000.0, float_width=4)]))
+        self.assertEqual(meta["duration"], 96.0)
+
+    def test_explicit_timecode_scale(self):
+        """TimecodeScale=10ms 时 Duration 的单位跟着变：9600 × 10ms = 96 秒。"""
+        info = {}
+        data = webm_bytes(ebml_header(), ebml_segment([ebml_info(9600.0, timecode_scale=10000000)]))
+        meta = media_meta.read_ebml_meta(self.write("tcs.mkv", data), info=info)
+        self.assertEqual(meta["duration"], 96.0)
+        self.assertIn("TimecodeScale", info["used"])            # 用到的元素要如实上报
+
+    def test_odd_float_widths_degrade_to_none(self):
+        """0/1/2/3/5/6/7 字节都是畸形 FLOAT（规范只允许 4/8）：高位补零解，解不出合理值就留 None。"""
+        for index, width in enumerate((0, 1, 2, 3, 5, 6, 7)):
+            body = f(96000.0, 8)[:width] if width else b""
+            data = webm_bytes(ebml_header(), ebml_segment([el(E_INFO, el(E_DURATION, body))]))
+            meta = media_meta.read_ebml_meta(self.write("odd%d.webm" % index, data))
+            self.assertIsNone(meta["duration"], width)
+
+    def test_deeply_nested_containers_hit_depth_cap(self):
+        deep = ebml_tag("comment", "藏太深")
+        for _ in range(20):
+            deep = el(E_TAG, deep)
+        path = self.write("deep.webm", webm_bytes(ebml_header(), ebml_segment([el(E_TAGS, deep)])))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertFalse(r["has_meta"])
+        self.assertIn("depth", r["extra"]["ebml"]["stopped"])
+
+    def test_unknown_size_block_inside_cluster_stops(self):
+        """未知长度的块无法定位下一个元素：整趟收摊，但已经读到的时长必须保住。"""
+        kids = [ebml_info(), el_open(E_CLUSTER, el_open(E_SIMPLE_BLOCK, b"\x00" * 32)),
+                ebml_tags([("comment", "拿不到了")])]
+        path = self.write("badblock.webm", webm_bytes(ebml_header(), ebml_segment(kids)))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertEqual(r["duration"], 96.0)
+        self.assertFalse(r["has_meta"])
+        self.assertIn("unknown_block", r["extra"]["ebml"]["stopped"])
+
+    def test_default_duration_is_fps_with_three_decimals(self):
+        """DefaultDuration 单位是 ns/帧（实测 ffmpeg：r=25→40000000）：1e9/DD 与 mp4 同口径 3 位小数。"""
+        for name, ticks, expected in (("f23976", 41708333, 23.976), ("f25", 40000000, 25.0),
+                                      ("f2997", 33367000, 29.97), ("f59999", 16667000, 59.999),
+                                      ("f8", 125000000, 8.0)):
+            meta = self.meta(name + ".webm", ebml_header(),
+                             ebml_segment([ebml_tracks(ebml_track(default_duration=ticks))]))
+            self.assertEqual(meta["fps"], expected, ticks)
+
+    def test_absurd_default_duration_is_dropped(self):
+        """声明得离谱的 DefaultDuration（帧率落在 0.01..10000 之外）不写进 fps。"""
+        for name, ticks in (("tiny", 1), ("huge", 10 ** 14)):
+            meta = self.meta(name + ".webm", ebml_header(),
+                             ebml_segment([ebml_tracks(ebml_track(default_duration=ticks))]))
+            self.assertIsNone(meta["fps"], ticks)
+            self.assertIsNone(media_meta.extract(self.write(name + "2.webm", webm_bytes(
+                ebml_header(), ebml_segment([ebml_tracks(ebml_track(default_duration=ticks))]))))["fps"])
+
+    def test_missing_default_duration_is_none_not_thirty(self):
+        meta = self.meta("nodd.webm", ebml_header(),
+                         ebml_segment([ebml_tracks(ebml_track(default_duration=0))]))
+        self.assertIsNone(meta["fps"])
+        self.assertIsNone(media_meta.extract(self.write("nodd2.mkv", webm_fixture(
+            default_duration=0)))["fps"])
+
+    def test_audio_only_track_has_no_fps_or_size(self):
+        """只有声音轨（TrackType=2）：不算帧率也不认宽高，哪怕它带了 DefaultDuration。"""
+        meta = self.meta("audio.webm", ebml_header(),
+                         ebml_segment([ebml_tracks(ebml_track(track_type=2, default_duration=23220000,
+                                                              video=ebml_video(1024, 576)))]))
+        self.assertIsNone(meta["fps"])
+        self.assertIsNone(meta["width"])
+        self.assertIsNone(meta["height"])
+
+    def test_first_video_track_wins(self):
+        """帧率取第一条视频轨，尺寸取第一条声明了宽高的视频轨（与 mp4 的首个有值者一致）。"""
+        meta = self.meta("two.webm", ebml_header(), ebml_segment([
+            ebml_tracks(ebml_track(track_type=2, default_duration=23220000),
+                        ebml_track(default_duration=40000000),
+                        ebml_track(default_duration=41708333, video=ebml_video(640, 480)))]))
+        self.assertEqual(meta["fps"], 25.0)
+        self.assertEqual((meta["width"], meta["height"]), (640, 480))
+
+    def test_pixel_width_and_height(self):
+        meta = self.meta("px.webm", ebml_header(),
+                         ebml_segment([ebml_tracks(ebml_track(video=ebml_video(832, 1248)))]))
+        self.assertEqual((meta["width"], meta["height"]), (832, 1248))
+
+    def test_display_only_size_is_flagged(self):
+        """只有 DisplayWidth/Height：接受但要在诊断里标出来（它是带比例的显示尺寸）。"""
+        data = webm_bytes(ebml_header(), ebml_segment([
+            ebml_tracks(ebml_track(video=ebml_display_video((16, 9))))]))
+        info = {}
+        meta = media_meta.read_ebml_meta(self.write("disp.webm", data), info=info)
+        self.assertEqual((meta["width"], meta["height"]), (16, 9))
+        self.assertEqual(info["sizing"], "display")
+        self.assertIn("DisplayWidth", info["used"])
+        self.assertNotIn("PixelWidth", info["used"])
+
+    def test_tags_comment_and_description(self):
+        pairs = [("comment", '{"prompt": "tag prompt"}'), ("description", "plain prose")]
+        meta = self.meta("tags.webm", ebml_header(), ebml_segment([ebml_tags(pairs)]))
+        self.assertEqual(meta["comment"], '{"prompt": "tag prompt"}')
+        self.assertEqual(meta["description"], "plain prose")
+
+    def test_tag_name_is_case_insensitive_and_title_falls_back(self):
+        """ffmpeg 的 `-metadata comment=` 大小写不固定；只有 title 时也当 comment 用。"""
+        meta = self.meta("case.webm", ebml_header(), ebml_segment([
+            ebml_tags([("Comment", "大写写法"), ("TITLE", "另一个值")])]))
+        self.assertEqual(meta["comment"], "大写写法")          # comment 优先于 title 回落
+        meta = self.meta("title.webm", ebml_header(), ebml_segment([ebml_tags([("title", "只有标题")])]))
+        self.assertEqual(meta["comment"], "只有标题")
+
+    def test_free_form_prompt_and_workflow_tags(self):
+        graph = {"1": {"class_type": "KSampler", "inputs": {"seed": 9}}}
+        meta = self.meta("pw.webm", ebml_header(), ebml_segment([
+            ebml_tags([("prompt", json.dumps(graph)), ("Workflow", json.dumps(ui_graph("wf")))])]))
+        self.assertIn("KSampler", meta["prompt"])
+        self.assertIn("CheckpointLoaderSimple", meta["workflow"])
+
+    def test_unknown_tag_names_are_ignored(self):
+        meta = self.meta("other.webm", ebml_header(), ebml_segment([
+            ebml_tags([("encoder", "VHS"), ("COMMENTx", "近似名不算")])]))
+        self.assertIsNone(meta["comment"])
+        self.assertIsNone(meta["description"])
+
+    def test_clusters_are_skipped_by_seek_not_read(self):
+        """Cluster 只按声明长度 seek 跳过：1MB 的块数据不该进读取量；SeekHead/Cues 也不是依赖。"""
+        payload = b"\x00" * 200_000
+        kids = [ebml_info(), ebml_tracks(ebml_track()),
+                b"".join(ebml_cluster(payload=payload, blocks=2) for _ in range(4)),
+                ebml_tags([("comment", "尾")])]
+        path = self.write("clusters.webm", webm_bytes(ebml_header(), ebml_segment(kids)))
+        self.assertGreater(os.path.getsize(path), 1_500_000)
+        info = {}
+        meta = media_meta.read_ebml_meta(path, info=info)
+        self.assertEqual(meta["duration"], 96.0)
+        self.assertEqual(meta["comment"], "尾")
+        self.assertEqual(info["clusters"], 4)
+        self.assertLess(info["read_bytes"], 2000, "块数据不该被读进内存")
+
+    def test_unknown_size_cluster_and_segment(self):
+        """未知长度的 Cluster（1 字节与 8 字节两种写法）与未知长度的 Segment。"""
+        for wide in (False, True):
+            data = webm_bytes(ebml_header(), ebml_segment([
+                ebml_info(), ebml_tracks(ebml_track()),
+                ebml_cluster(open_size=True, wide=wide),
+                ebml_cluster(payload=b"\x00" * 5000, blocks=3, open_size=True, wide=wide),
+                ebml_tags([("comment", "直播封装的提示词")])], open_size=True))
+            meta = media_meta.read_ebml_meta(self.write("open%d.webm" % wide, data))
+            self.assertEqual(meta["duration"], 96.0, wide)
+            self.assertEqual(meta["fps"], 23.976, wide)
+            self.assertEqual(meta["comment"], "直播封装的提示词", wide)
+
+    def test_unknown_size_tags_and_tracks(self):
+        data = webm_bytes(ebml_header(), ebml_segment([
+            ebml_info(), el_open(E_TRACKS, ebml_track()), el_open(E_TAGS, ebml_tag("comment", "值"))]))
+        meta = media_meta.read_ebml_meta(self.write("opentags.webm", data))
+        self.assertEqual(meta["comment"], "值")
+        self.assertEqual(meta["fps"], 23.976)
+
+    def test_seekhead_and_cues_do_not_matter(self):
+        """不依赖 SeekHead/Cues：这两个元素整段跳过，照样算出时长与帧率。"""
+        data = webm_bytes(ebml_header(), ebml_segment([
+            el(E_SEEKHEAD, el(E_VOID, b"\x00" * 32)), ebml_info(), ebml_tracks(ebml_track()),
+            el(E_CUES, b"\x00" * 64), el(E_VOID, b"\x00" * 16)]))
+        meta = media_meta.read_ebml_meta(self.write("cues.webm", data))
+        self.assertEqual((meta["duration"], meta["fps"]), (96.0, 23.976))
+
+    def test_info_after_tracks_is_still_read(self):
+        data = webm_bytes(ebml_header(), ebml_segment([ebml_tracks(ebml_track()), ebml_info()]))
+        meta = media_meta.read_ebml_meta(self.write("order.webm", data))
+        self.assertEqual((meta["duration"], meta["fps"]), (96.0, 23.976))
+
+
+class ExtractWebmTests(MediaMetaTestCase):
+    """端到端：webm/mkv 的 Tags 走与 mp4 同一个后处理入口，meta_source 与 extra 口径一致。"""
+
+    def test_comment_json_matches_mp4_result_field_by_field(self):
+        """同一个 {"prompt":…,"workflow":…} 载荷：webm 与 mp4 的产出必须同构，只有来源不同。"""
+        text = comment_json(prompt=api_graph("iso prompt", seed=777), workflow=ui_graph("iso wf"))
+        mp4 = media_meta.extract(self.write("iso.mp4", mp4_bytes(
+            ftyp(), mdat(600), moov([video_trak()], udta=udta_ilst(text)))))
+        webm = media_meta.extract(self.write("iso.webm", webm_fixture(comment=text)))
+        self.assert_shape(webm)
+        self.assertEqual(mp4["source"], "mp4_udta")
+        self.assertEqual(webm["source"], "ebml_tag")
+        for key in ("has_meta", "prompt", "negative", "checkpoint", "loras", "models", "sampler",
+                    "scheduler", "seed", "steps", "cfg", "width", "height", "duration", "fps", "note"):
+            self.assertEqual(webm[key], mp4[key], key)
+        for key in ("graph", "graph_nodes", "ui_nodes", "prompt_source", "classification_source",
+                    "params_source"):
+            self.assertEqual(webm["extra"].get(key), mp4["extra"].get(key), key)
+        self.assertEqual(webm["extra"]["graph"], "api")
+        self.assertEqual(webm["extra"]["prompt_source"], "chain")
+        self.assertEqual(webm["prompt"], "iso prompt")
+        self.assertEqual(webm["duration"], 96.0)
+        self.assertEqual(webm["fps"], 23.976)
+
+    def test_extra_ebml_names_the_elements_actually_used(self):
+        path = self.write("used.mkv", webm_fixture(comment=comment_json(prompt=api_graph("mkv")),
+                                                   video=ebml_video(768, 512)))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        used = r["extra"]["ebml"]["used"]
+        self.assertEqual(sorted(used), sorted(("DefaultDuration", "Duration", "Info", "PixelHeight",
+                                              "PixelWidth", "SimpleTag", "Tag", "TagName",
+                                              "TagString", "Tags", "TrackType", "Video")))
+        self.assertNotIn("v1 不解析 EBML", json.dumps(r["extra"], ensure_ascii=False))
+        self.assertEqual(r["extra"]["ebml"]["window"], "whole")
+        self.assertEqual(r["extra"]["ebml"]["tags"], ["comment"])
+        self.assertEqual(r["extra"]["ebml"]["tags_at"], "whole")
+        self.assertEqual(r["extra"]["ebml"]["doctype"], "webm")
+        self.assertTrue(r["extra"]["ebml"]["segment_found"])
+
+    def test_tags_in_tail_window(self):
+        """Tags 写在最后一个 Cluster 之后：尾部窗口兜底，与 mp4 的 moov 在尾同一处理。"""
+        tags = ebml_tags([("comment", comment_json(prompt=api_graph("tail webm prompt")))])
+        body = ebml_segment([ebml_info(), ebml_tracks(ebml_track()),
+                             ebml_cluster(payload=b"\x00" * 3000, blocks=2),
+                             ebml_cluster(payload=b"\x00" * 3000, blocks=2), tags])
+        data = webm_bytes(ebml_header(), body)
+        window = len(tags) + 120
+        self.assertLess(window, len(data), "fixture 需要真的走到首尾窗口分支")
+        path = self.write("tailfmt.webm", data)
+        r = media_meta.extract(path, max_window_bytes=window)
+        self.assert_shape(r)
+        self.assertTrue(r["has_meta"])
+        self.assertEqual(r["source"], "ebml_tag")
+        self.assertEqual(r["prompt"], "tail webm prompt")
+        self.assertEqual(r["duration"], 96.0)                    # Info 在头部窗口就取到了
+        self.assertEqual(r["fps"], 23.976)
+        self.assertEqual(r["extra"]["ebml"]["window"], "head+tail")
+        self.assertEqual(r["extra"]["ebml"]["tags_at"], "tail")
+
+    def test_non_json_comment_is_notified_not_used(self):
+        path = self.write("prose.webm", webm_fixture(comment="just prose"))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertFalse(r["has_meta"])
+        self.assertEqual(r["source"], "none")
+        self.assertIn("不是 JSON", r["note"])
+        self.assertEqual((r["duration"], r["fps"]), (96.0, 23.976))   # 容器字段照旧回填
+
+    def test_video_without_tags_still_has_container_fields(self):
+        path = self.write("bare.webm", webm_fixture())
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertFalse(r["has_meta"])
+        self.assertEqual(r["source"], "none")
+        self.assertEqual((r["duration"], r["fps"], r["width"], r["height"]), (96.0, 23.976, 1024, 576))
+        self.assertEqual(r["extra"]["ebml"]["tags"], [])
+        self.assertIsNone(r["extra"]["ebml"]["tags_at"])
+
+    def test_webm_sidecar_still_applies(self):
+        """容器里没有 Tags 时，同名 .json 的回落链路不变。"""
+        path = self.write("sc.webm", webm_fixture())
+        (self.root / "sc.json").write_text(json.dumps({"prompt": api_graph("from sidecar")}),
+                                           encoding="utf-8")
+        r = media_meta.extract(path)
+        self.assertEqual(r["source"], "sidecar")
+        self.assertEqual(r["prompt"], "from sidecar")
+        self.assertEqual(r["duration"], 96.0)
+
+    def test_oversized_leaf_is_skipped_and_counted(self):
+        big = el(E_TAG_STRING, b"\x00" * 200)
+        path = self.write("big.webm", webm_bytes(ebml_header(), ebml_segment([
+            ebml_info(), el(E_TAGS, el(E_TAG, el(E_SIMPLE_TAG, el(E_TAG_NAME, s("comment")) + big)))])))
+        with patch.object(media_meta, "MAX_EBML_LEAF_BYTES", 64):
+            r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertFalse(r["has_meta"])
+        self.assertEqual(r["extra"]["ebml"]["big_leaves"], 1)
+        self.assertEqual(r["duration"], 96.0)
+
+    def test_declared_size_beyond_eof_stops_window(self):
+        """声明长度超界：不能把扫描线程吃掉，也不能凭空造出元数据。"""
+        bogus = ebml_id(E_DURATION) + ebml_size(10 ** 12) + f(96000.0, 8)
+        path = self.write("huge.webm", webm_bytes(ebml_header(), ebml_segment([el(E_INFO, bogus)])))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertFalse(r["has_meta"])
+        self.assertIsNone(r["duration"])
+        self.assertIn("declared_beyond_eof", r["extra"]["ebml"]["stopped"])
+
+    def test_huge_cluster_declaration_does_not_read_file(self):
+        bogus = ebml_id(E_CLUSTER) + ebml_size(10 ** 15) + b"\x00" * 64
+        path = self.write("hugecluster.webm", webm_bytes(ebml_header(), ebml_segment([
+            ebml_info(), bogus])))
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertEqual(r["duration"], 96.0)                   # 越界之前读到的字段保留
+        self.assertIn("declared_beyond_eof", r["extra"]["ebml"]["stopped"])
+
+    def test_element_cap_stops_the_walk(self):
+        many = el(E_SEGMENT, ebml_info() + b"".join(el(E_VOID, b"\x00" * 8) for _ in range(400))
+                   + ebml_tags([("comment", "越过上限了")]))
+        path = self.write("cap.webm", webm_bytes(ebml_header(), many))
+        with patch.object(media_meta, "MAX_EBML_ELEMENTS", 6):
+            r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertLessEqual(r["extra"]["ebml"]["elements"], 7)
+        self.assertFalse(r["has_meta"])
+
+    def test_truncated_files_never_raise(self):
+        full = webm_fixture(comment=comment_json(prompt=api_graph("cut prompt")))
+        for keep in (3, 7, 12, 40, len(full) // 2, len(full) - 5):
+            path = self.write("cut%d.webm" % keep, full[:keep])
+            r = media_meta.extract(path)
+            self.assert_shape(r)
+            self.assertTrue(r["extra"]["ebml"]["segment_found"] or not r["has_meta"], keep)
+
+    def test_zero_and_random_files(self):
+        for name, data in (("zero.webm", b"\x00" * 4096), ("rand.mkv", os.urandom(4096)),
+                           ("ff.webm", b"\xff" * 2048), ("empty.webm", b"")):
+            r = media_meta.extract(self.write(name, data))
+            self.assert_shape(r)
+            self.assertFalse(r["has_meta"], name)
+            self.assertIsNone(r["duration"], name)
+            self.assertIsNone(r["fps"], name)
+
+    def test_embedded_tags_beat_sidecar(self):
+        path = self.write("both.webm", webm_fixture(comment=comment_json(prompt=api_graph("embedded webm"))))
+        (self.root / "both.json").write_text(json.dumps({"prompt": api_graph("from sidecar")}),
+                                             encoding="utf-8")
+        r = media_meta.extract(path)
+        self.assertEqual(r["prompt"], "embedded webm")
+        self.assertEqual(r["source"], "ebml_tag")
+        self.assertNotIn("sidecar", r["extra"])
+
+    def test_streamed_shape_matches_real_muxer_output(self):
+        """照 ffmpeg 无 seek（管道）输出的真实形状造样本：未知长度 Segment/Tracks/Cluster、
+        Info 不写 Duration、DefaultDuration 用纳秒、TagName 是大写 COMMENT 且在最后一个 Cluster 后。"""
+        blocks = el(E_TIMECODE, u(0, 2)) + el(E_SIMPLE_BLOCK, b"\x00" * 400)
+        kids = [el(E_INFO, el(E_TIMECODE_SCALE, u(1000000, 3))),
+                el_open(E_TRACKS, el(E_TRACK_ENTRY, el(E_TRACK_TYPE, u(1)) +
+                                     el(E_DEFAULT_DURATION, u(41666666)) +
+                                     el(E_VIDEO, el(E_PIXEL_WIDTH, u(64)) +
+                                                el(E_PIXEL_HEIGHT, u(64))))),
+                el_open(E_CLUSTER, blocks), el_open(E_CLUSTER, blocks),
+                ebml_tags([("COMMENT", comment_json(prompt=api_graph("streamed webm")))])]
+        path = self.write("streamed.webm", webm_bytes(ebml_header(), ebml_segment(kids, open_size=True)))
+        meta = media_meta.read_ebml_meta(path)
+        self.assertEqual((meta["width"], meta["height"]), (64, 64))    # 容器里的 PixelWidth/Height
+        self.assertEqual(meta["fps"], 24.0)                            # 1e9 / 41666666ns
+        self.assertIsNone(meta["duration"])                            # 流式封装没写 Duration，不猜
+        r = media_meta.extract(path)
+        self.assert_shape(r)
+        self.assertEqual(r["source"], "ebml_tag")
+        self.assertEqual(r["prompt"], "streamed webm")
+        self.assertEqual(r["fps"], 24.0)
+        self.assertEqual((r["width"], r["height"]), (1024, 576))       # 工作流尺寸优先（与 mp4 同语义）
+        self.assertIsNone(r["duration"])
+        self.assertEqual(r["extra"]["ebml"]["clusters"], 2)
+        self.assertEqual(r["extra"]["ebml"]["tags_at"], "whole")
+        self.assertTrue(r["extra"]["ebml"]["segment_found"])
+
+    def test_result_keys_are_always_present(self):
+        for data in (webm_fixture(comment=comment_json(prompt=api_graph())), b"\x00" * 64,
+                     webm_bytes(ebml_header(), ebml_segment([ebml_info(float_width=1)]))):
+            r = media_meta.extract(self.write("keys.webm", data))
+            self.assertEqual(sorted(r), sorted(media_meta.RESULT_KEYS))
+            self.assertIsInstance(r["extra"], dict)
+            json.dumps(r, allow_nan=False)
+
+    def test_ebml_constants_are_bounded(self):
+        self.assertEqual(media_meta.MAX_EBML_ELEMENTS, 20000)
+        self.assertEqual(media_meta.MAX_EBML_READ_BYTES, 8 * 1024 * 1024)
+        self.assertLessEqual(media_meta.MAX_EBML_LEAF_BYTES, media_meta.MAX_WINDOW_BYTES)
+        self.assertGreater(media_meta.EXTRACT_VERSION, 2)
 
 
 class FieldFallbackTests(MediaMetaTestCase):
