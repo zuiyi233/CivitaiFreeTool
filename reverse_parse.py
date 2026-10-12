@@ -150,15 +150,38 @@ def build_info(model, version, site_base="https://civitai.red"):
         info["files"] = files
         images = []
         if version.get("images"):
-            for img in version["images"][:5]:
-                images.append({
+            for img in version["images"][:20]:
+                entry = {
                     "url": img.get("url"),
+                    "type": img.get("type"),  # 'image'/'video'；缺省由消费方按非 video 兜底为 image
                     "width": img.get("width"),
                     "height": img.get("height"),
                     "nsfw": img.get("nsfw"),
-                })
+                }
+                # imageUrl 仅 video 项携带（mp4 首帧预览图），其余项不造默认
+                if "imageUrl" in img:
+                    entry["imageUrl"] = img.get("imageUrl")
+                images.append(entry)
         info["images"] = images
     return info
+
+
+def pick_cover_url(imgs):
+    """选封面 URL：优先第一个 type!='video' 项的 url；若只有 video 项则用其 imageUrl（mp4 首帧）；都无返回 ''。
+    旧数据无 type 字段按非 video 处理，行为与历史一致。供 gui/webui 的封面下载与缩略图链路共用，
+    确保视频 mp4 直链绝不进入图片下载/解析管线。"""
+    video_poster = ""
+    for img in (imgs or []):
+        if not isinstance(img, dict):
+            continue
+        if str(img.get("type") or "").lower() == "video":
+            if not video_poster:
+                video_poster = (img.get("imageUrl") or "").strip()
+            continue
+        u = (img.get("url") or "").strip()
+        if u:
+            return u
+    return video_poster
 
 
 def build_sd_metadata(model, version, site_base="https://civitai.red"):

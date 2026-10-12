@@ -56,6 +56,118 @@ def _json_safe(value):
     return value
 
 
+def _pick_cover_url(imgs):
+    """选封面 URL（统一走 reverse_parse.pick_cover_url，gui/webui 共用同一逻辑）"""
+    return reverse_parse.pick_cover_url(imgs)
+
+
+_VIDEO_LIMIT_PER_MODEL = 3  # 每模型自动/批量落盘的视频数上限（防止单模型拉爆带宽）
+
+
+def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=512 * 1024 * 1024):
+    """流式下载视频到本地（.tmp + 原子替换；过大/过小/失败返回 False）。与 _download_image（PIL 校验版）不同，
+    视频无法用图片 magic bytes 校验，以体积下限兜底。"""
+    import urllib.request
+    tmp = dest + ".tmp"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
+            "Referer": "https://civitai.com/",
+        })
+        opener = civitai_api.build_opener(proxy, verify)
+        got = 0
+        with opener.open(req, timeout=timeout) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > max_bytes:
+                    raise ValueError("video too large")
+                f.write(chunk)
+        if got < 1024:
+            os.unlink(tmp)
+            return False
+        os.replace(tmp, dest)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _local_video_file(base, idx):
+    """第 idx 个视频项的本地落盘路径（<base>.images/video_XX.mp4，与 image_XX 首帧同索引）"""
+    return os.path.join(base + ".images", "video_%02d.mp4" % idx)
+
+
+def _ensure_local_videos(base, images, proxy=None, verify=True, limit=_VIDEO_LIMIT_PER_MODEL):
+    """把 images 中的 video 项下载落盘为 <base>.images/video_XX.mp4（跳过已存在；返回新增数量）。
+    供下载完成自动流程/下载示例图/批量下载封面共用。"""
+    out_dir = base + ".images"
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        return 0
+    added = 0
+    for i, im in enumerate(images or []):
+        if added >= limit:
+            break
+        if not isinstance(im, dict) or str(im.get("type") or "").lower() != "video":
+            continue
+        u = (im.get("url") or "").strip()
+        if not u:
+            continue
+        dest = _local_video_file(base, i + 1)
+        if os.path.exists(dest) and os.path.getsize(dest) > 1024:
+            continue
+        if _download_video(u, dest, proxy=proxy, verify=verify):
+            added += 1
+    return added
+
+
+def _local_video_uri(base, idx):
+    """本地视频的 file:/// URI（不存在返回 ''）。页面经 file:// 加载时同源可播；
+    浏览器兜底模式（http origin）下由前端降级远程 URL。"""
+    fp = _local_video_file(base, idx)
+    if os.path.exists(fp) and os.path.getsize(fp) > 1024:
+        try:
+            import pathlib
+            return pathlib.Path(fp).as_uri()
+        except Exception:
+            pass
+    return ""
+
+
+def _civitai_thumb_url(u, width=460):
+    """C 站图片 URL 改写为缩略图版本；非 image.civitai.com 原样返回。
+
+    真实 URL 为四段式 https://image.civitai.com/{auth}/{contentHash}/{params}/{file}，
+    params 段常见 original=true（原图，几 MB）。缩略 = 把 params 段里的 original=true
+    替换为 width=N（C 站官方转码用法）。**禁止**盲插新段——会产出无效 URL（404 空帧）。"""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        s = urlsplit(u or "")
+        if s.scheme != "https" or s.hostname != "image.civitai.com":
+            return u
+        parts = [seg for seg in s.path.split("/") if seg]
+        for i, seg in enumerate(parts):
+            if "=" in seg:
+                kv = dict(item.split("=", 1) for item in seg.split(",") if "=" in item)
+                if "original" in kv:
+                    kv["original"] = None  # 原图标记与缩略互斥，去掉
+                kv["width"] = str(int(width))
+                parts[i] = ",".join(f"{k}={v}" for k, v in kv.items() if v is not None)
+                return urlunsplit((s.scheme, s.netloc, "/" + "/".join(parts), "", ""))
+        # 无 params 段（罕见）：原样返回，宁可不缩略也不产出无效 URL
+    except Exception:
+        pass
+    return u
+
+
 def _todo_label(url):
     """从模型链接里取个可读名字（没存 label 的老条目用）：优先 slug，退化为「模型 ID」"""
     m = re.search(r"/models/(\d+)(?:/([^/?#]+))?", url or "")
@@ -170,15 +282,24 @@ class Api:
                 except Exception:
                     pass
             # 2) 封面下载（后台，已存在则跳过；走代理，直连 C 站图片 CDN 会被墙）
+            #    + 视频项 mp4 落盘（后台 daemon 线程，不阻塞完成回调；跳过已存在）
             if self.cfg.get("download_cover", True):
                 imgs = (meta.get("info") or {}).get("images") or []
-                if imgs and imgs[0].get("url"):
+                cover_url = _pick_cover_url(imgs)
+                proxy_cfg = self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None
+                verify_cfg = self.cfg.get("ssl_verify", True)
+                if cover_url:
                     try:
-                        _download_image(imgs[0]["url"], base + ".preview.png",
-                                        proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
-                                        verify=self.cfg.get("ssl_verify", True))
+                        _download_image(cover_url, base + ".preview.png",
+                                        proxy=proxy_cfg, verify=verify_cfg)
                     except Exception:
                         pass
+                has_video = any(isinstance(im, dict) and str(im.get("type") or "").lower() == "video"
+                                and (im.get("url") or "").strip() for im in imgs)
+                if has_video:
+                    threading.Thread(target=_ensure_local_videos,
+                                     args=(base, imgs), kwargs={"proxy": proxy_cfg, "verify": verify_cfg},
+                                     daemon=True).start()
             # Completed files stay where the user classified them. Global target only affects
             # future downloads; relocation is exclusively an explicit move action.
             # 4) 「更新下载」完成：按设置处理旧版本（默认保留；删除走回收站，可还原）
@@ -817,7 +938,7 @@ class Api:
         """Fetch thumbnail before enqueuing model data. Never write into model folders."""
         if not self.cfg.get("download_cover", True): return
         images = ((task.info or {}).get("meta", {}).get("info") or {}).get("images") or []
-        url = images[0].get("url") if images and isinstance(images[0], dict) else ""
+        url = _pick_cover_url(images)
         if not url: return
         try:
             import base64,tempfile
@@ -872,7 +993,7 @@ class Api:
                 with open(self._history_asset(task_id,".json"),encoding="utf-8") as f:info=json.load(f)
             except (OSError,ValueError):info={}
         images=info.get("images") or []
-        url=images[0].get("url") if images and isinstance(images[0],dict) else ""
+        url=_pick_cover_url(images)
         if url:
             cached=image_gallery.cache_load({"url":url},self.cfg,"original")
             if cached:
@@ -928,7 +1049,7 @@ class Api:
                     buf = io.BytesIO(); im.save(buf, "JPEG", quality=80)
                     thumb = base64.b64encode(buf.getvalue()).decode()
             elif info.get("images"):
-                thumb = self.get_cover_b64(info["images"][0].get("url", ""), 512)
+                thumb = self.get_cover_b64(_pick_cover_url(info["images"]), 512)
             if thumb:
                 with config._json_write_lock:
                     import tempfile
@@ -1300,6 +1421,8 @@ class Api:
                         _cre = _cre.get("username") or _cre.get("name") or ""
                     _cre = str(_cre or "").strip()
                     category, category_source = model_filters.model_category(meta.get("type") or (meta.get("model").get("type") if isinstance(meta.get("model"),dict) else ""), f["path"])
+                    # 行级封面标记：瀑布流「仅看有图/无图」筛选用；find_cover 命中具名封面，.images/ 回退字典序首图
+                    has_cover = bool(model_manager.find_cover(f["path"]) or self._images_dir_first(f["path"]))
                     rows.append({
                         "type_filter": category, "type_source": category_source,
                         "path": f["path"], "name": f["name"], "size": f["size"],
@@ -1313,6 +1436,7 @@ class Api:
                         "trainedWords": tw,
                         "civitai_name": meta.get("name", ""),
                         "author": _cre,
+                        "has_cover": has_cover,
                         "info": meta,
                     })
                 self.mm_scan_state["rows"] = rows
@@ -1348,6 +1472,7 @@ class Api:
                 "trainedWords": r.get("trainedWords", []),
                 "civitai_name": r.get("civitai_name", ""),
                 "author": r.get("author", ""),
+                "has_cover": bool(r.get("has_cover", False)),
                 "update": r.get("update", ""), "hash": r.get("hash", ""),
             })
         return json.dumps(rows, ensure_ascii=False)
@@ -1434,12 +1559,26 @@ class Api:
             except Exception:
                 pass
         # 追加 C 站 URL 图（跳过本地封面已占的序号 + url 去重）
-        for i, img in enumerate(images[:8]):
+        for i, img in enumerate(images[:20]):
             if i < url_start:
                 continue
             u = img.get("url")
-            if u and not any(c.get("url") == u for c in covers):
-                covers.append({"url": u,
+            if not u:
+                continue
+            is_video = str(img.get("type") or "").lower() == "video"
+            if any(c.get("url") == u for c in covers):
+                continue
+            if is_video:
+                # 视频项：url 优先本地落盘的 video_XX.mp4（file:/// 离线可播），否则远程 mp4 直链；
+                # 绝不进 PIL/缩略图管线；poster 为首帧 imageUrl
+                local_uri = _local_video_uri(base, i + 1)
+                covers.append({"type": "video", "url": local_uri or u, "local": bool(local_uri),
+                               "poster": img.get("imageUrl") or "",
+                               "prompt": (img.get("meta") or {}).get("prompt") or "",
+                               "negative": (img.get("meta") or {}).get("negativePrompt") or "",
+                               "orig_url": u})
+            else:
+                covers.append({"type": "image", "url": u,
                                "prompt": (img.get("meta") or {}).get("prompt") or "",
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
                                "orig_url": img.get("url") or ""})
@@ -1756,33 +1895,48 @@ class Api:
         total = len(images)
         self._img_dl_state = {"total": total, "done": 0}
         for i, im in enumerate(images):
-            u = im.get("url") or ""
+            if str(im.get("type") or "").lower() == "video":
+                # 视频项：首帧 imageUrl 落 image_XX.jpg（缩略/封面用）+ mp4 原片落 video_XX.mp4（播放用）
+                u = (im.get("imageUrl") or "").strip()
+                ext = ".jpg"
+            else:
+                u = (im.get("url") or "").strip()
+                if not u:
+                    self._img_dl_state["done"] = self._img_dl_state.get("done", 0) + 1
+                    continue
+                low = u.lower()
+                if ".webp" in low.split("?")[0]:
+                    ext = ".webp"
+                elif ".png" in low.split("?")[0]:
+                    ext = ".png"
+                else:
+                    ext = ".jpg"
             if not u:
                 self._img_dl_state["done"] = self._img_dl_state.get("done", 0) + 1
                 continue
-            low = u.lower()
-            if ".webp" in low.split("?")[0]:
-                ext = ".webp"
-            elif ".png" in low.split("?")[0]:
-                ext = ".png"
-            else:
-                ext = ".jpg"
             dest = os.path.join(out_dir, "image_%02d%s" % (i + 1, ext))
             if os.path.exists(dest):
                 n += 1
-                continue
-            try:
-                req = urllib.request.Request(u, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
-                    "Referer": "https://civitai.com/",
-                })
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = resp.read()
-                with open(dest, "wb") as f:
-                    f.write(data)
-                n += 1
-            except Exception:
-                pass
+            else:
+                try:
+                    req = urllib.request.Request(u, headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
+                        "Referer": "https://civitai.com/",
+                    })
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = resp.read()
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                    n += 1
+                except Exception:
+                    pass
+            if str(im.get("type") or "").lower() == "video":
+                mp4 = (im.get("url") or "").strip()
+                vdest = _local_video_file(base, i + 1)
+                if mp4 and not (os.path.exists(vdest) and os.path.getsize(vdest) > 1024):
+                    if _download_video(mp4, vdest, proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
+                                       verify=self.cfg.get("ssl_verify", True)):
+                        n += 1
             self._img_dl_state["done"] = self._img_dl_state.get("done", 0) + 1
         self._img_dl_state["done"] = total
         return json.dumps({"ok": True, "downloaded": n, "dir": out_dir})
@@ -2522,10 +2676,85 @@ class Api:
             "prompt_notes": prompt_notes,
         }, ensure_ascii=False)
 
+    def _images_dir_files(self, p):
+        """<base>.images/ 下全部图片文件（字典序）。返回绝对路径列表，目录缺失返回 []。"""
+        base = os.path.splitext(p)[0]
+        d = base + ".images"
+        if not os.path.isdir(d):
+            return []
+        exts = (".jpg", ".jpeg", ".png", ".webp")
+        try:
+            names = sorted(fn for fn in os.listdir(d)
+                           if fn.lower().endswith(exts) and os.path.isfile(os.path.join(d, fn)))
+        except OSError:
+            return []
+        return [os.path.join(d, fn) for fn in names]
+
+    def _images_dir_first(self, p):
+        """封面候选回退：<base>.images/ 下 image_%d.* 命名优先，否则字典序第一个图片文件。"""
+        files = self._images_dir_files(p)
+        if not files:
+            return None
+        numbered = [fp for fp in files if re.match(r"image_\d+[.]", os.path.basename(fp), re.I)]
+        ordered = sorted(numbered) if numbered else files
+        return ordered[0]
+
+    def _cover_thumb(self, p, cover, size, seq=0, thumb_dir=None):
+        """单张封面缩略图（复用内存/磁盘缓存；seq>0 时缓存 key 追加 _seq 防止多图串项）。
+        seq=0 与 get_covers 共享同一条缓存。失败返回 ''（调用方决定忽略）。"""
+        try:
+            stt = os.stat(cover)
+            key = (p, int(stt.st_mtime_ns), stt.st_size, int(size)) + ((seq,) if seq else ())
+            hit = self._cover_cache.get(key)
+            if hit:
+                return hit
+            from PIL import Image
+            import hashlib
+            import io
+            import base64
+            cache_path = None
+            if thumb_dir:
+                try:
+                    mtime = int(os.path.getmtime(cover))
+                except Exception:
+                    mtime = 0
+                cache_key = hashlib.sha1(os.path.normcase(
+                    os.path.abspath(cover)).encode("utf-8")).hexdigest()
+                cache_sub = "_%d" % seq if seq else ""
+                cache_path = os.path.join(
+                    thumb_dir, "%s_%d_%d%s.jpg" % (cache_key, mtime, size, cache_sub))
+                try:
+                    if os.path.exists(cache_path):
+                        with open(cache_path, "rb") as f:
+                            return base64.b64encode(f.read()).decode()
+                except Exception:
+                    pass
+            im = Image.open(cover).convert("RGB")
+            im.thumbnail((size, size))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=(96 if int(size) >= 1024 else 88 if int(size) > 320 else 82), subsampling=(0 if int(size) >= 1024 else 2))
+            raw = buf.getvalue()
+            # 未命中：写入磁盘缓存（写失败/磁盘满静默，不破坏原逻辑）
+            if cache_path:
+                try:
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    with open(cache_path, "wb") as f:
+                        f.write(raw)
+                except Exception:
+                    pass
+            b64s = base64.b64encode(raw).decode()
+            if len(self._cover_cache) > 4000:
+                self._cover_cache.clear()
+            self._cover_cache[key] = b64s
+            return b64s
+        except Exception:
+            return ""
+
     def get_covers(self, paths, size=64, cache_dir=None):
         """批量返回封面（JSON 字符串：{path: base64}），size 为缩略边长（列表 64 / 瀑布流 320）。
 
-        cache_dir 为空时取 posix_compat.thumb_cache_dir()；None/空则不缓存（原逻辑直读）。"""
+        cache_dir 为空时取 posix_compat.thumb_cache_dir()；None/空则不缓存（原逻辑直读）。
+        find_cover 未命中时回退读取 <base>.images/ 下字典序第一个图片文件作封面。"""
         out = {}
         try:
             size = int(size or 64)
@@ -2541,55 +2770,90 @@ class Api:
         for p in (paths or [])[:80]:
             cover = model_manager.find_cover(p)
             if not cover or not os.path.exists(cover):
+                cover = self._images_dir_first(p)
+            if not cover or not os.path.exists(cover):
                 continue
+            thumb = self._cover_thumb(p, cover, size, 0, thumb_dir)
+            if thumb:
+                out[p] = thumb
+        return json.dumps(out, ensure_ascii=False)
+
+    def get_covers_multi(self, paths, size=220, n=3):
+        """批量返回轮播帧（JSON：{path: [[src, isVideo], ...]}）。
+
+        数据源合并：本地封面（b64，现有缓存管线）→ .civitai.info 的 images（远程 URL，
+        image 项转 C 站 width=460 缩略、video 项给 imageUrl 首帧 + mp4 直链标记 isVideo）
+        → 本地 .images/ 补位。远程 URL 由前端 hover 时才加载（预取零流量）。
+        旧 info（无 type）按 image 处理，一样有轮播。"""
+        out = {}
+        try:
+            size = int(size or 220)
+        except Exception:
+            size = 220
+        try:
+            n = max(1, min(int(n or 3), 12))
+        except Exception:
+            n = 3
+        try:
+            thumb_dir = posix_compat.thumb_cache_dir()
+        except Exception:
+            thumb_dir = None
+        for p in (paths or [])[:80]:
             try:
-                stt = os.stat(cover)
-                key = (p, int(stt.st_mtime_ns), stt.st_size, int(size))
-                hit = self._cover_cache.get(key)
-                if hit:
-                    out[p] = hit
-                    continue
-                from PIL import Image
-                import hashlib
-                import io
-                import base64
-                cache_path = None
-                if thumb_dir:
-                    try:
-                        mtime = int(os.path.getmtime(cover))
-                    except Exception:
-                        mtime = 0
-                    # 磁盘缓存键：路径 sha1（与内存缓存 key 元组分离，互不覆盖）
-                    cache_key = hashlib.sha1(os.path.normcase(
-                        os.path.abspath(cover)).encode("utf-8")).hexdigest()
-                    cache_path = os.path.join(
-                        thumb_dir, "%s_%d_%d.jpg" % (cache_key, mtime, size))
-                    try:
-                        if os.path.exists(cache_path):
-                            with open(cache_path, "rb") as f:
-                                out[p] = base64.b64encode(f.read()).decode()
+                items = []
+                cover = model_manager.find_cover(p)
+                if not cover or not os.path.exists(cover):
+                    cover = self._images_dir_first(p)
+                if cover and os.path.exists(cover):
+                    b = self._cover_thumb(p, cover, size, 0, thumb_dir)
+                    if b:
+                        items.append([b if b.startswith("data:") else "data:image/jpeg;base64," + b, False])
+                # .civitai.info 的远程 images（含视频项）——封面已占第 1 帧时跳过 info[0]（通常与封面同源）
+                info = {}
+                try:
+                    fp_info = model_manager.find_info_file(p)
+                    if fp_info and os.path.exists(fp_info):
+                        with open(fp_info, "r", encoding="utf-8") as fh:
+                            info = json.load(fh)
+                except Exception:
+                    info = {}
+                base_p = os.path.splitext(p)[0]
+                remote = [(i, im) for i, im in enumerate(info.get("images") or []) if isinstance(im, dict)]
+                for i, img in remote:
+                    if items and i == 0:
+                        continue  # info[0] 通常与封面同源，跳过避免轮播首帧重复
+                    if len(items) >= n:
+                        break
+                    t = str(img.get("type") or "").lower()
+                    if t == "video":
+                        mp4 = (img.get("url") or "").strip()
+                        local_uri = _local_video_uri(base_p, i + 1)
+                        if local_uri:
+                            items.append([local_uri, True])   # 本地落盘视频：离线可播
+                        else:
+                            poster = (img.get("imageUrl") or "").strip()
+                            if poster:
+                                items.append([_civitai_thumb_url(poster), False])
+                            if mp4:
+                                items.append([mp4, True])     # 远程 mp4：hover 时流式播放
+                    else:
+                        u = (img.get("url") or "").strip()
+                        if u:
+                            items.append([_civitai_thumb_url(u), False])
+                # 本地 .images/ 补位（info 缺失或不足 n 张时）
+                if len(items) < n:
+                    seq = 1
+                    for fimg in self._images_dir_files(p):
+                        if fimg == (cover or ""):
                             continue
-                    except Exception:
-                        cache_path = os.path.join(
-                            thumb_dir, "%s_%d_%d.jpg" % (cache_key, mtime, size))
-                im = Image.open(cover).convert("RGB")
-                im.thumbnail((size, size))
-                buf = io.BytesIO()
-                im.save(buf, "JPEG", quality=(96 if int(size)>=1024 else 88 if int(size)>320 else 82), subsampling=(0 if int(size)>=1024 else 2))
-                raw = buf.getvalue()
-                # 未命中：写入磁盘缓存（写失败/磁盘满静默，不破坏原逻辑）
-                if cache_path:
-                    try:
-                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                        with open(cache_path, "wb") as f:
-                            f.write(raw)
-                    except Exception:
-                        pass
-                b64s = base64.b64encode(raw).decode()
-                if len(self._cover_cache) > 4000:
-                    self._cover_cache.clear()
-                self._cover_cache[key] = b64s
-                out[p] = b64s
+                        b = self._cover_thumb(p, fimg, size, seq, None)  # seq>0 仅内存缓存，防 thumb_cache 膨胀
+                        if b:
+                            items.append([b if b.startswith("data:") else "data:image/jpeg;base64," + b, False])
+                            seq += 1
+                            if len(items) >= n:
+                                break
+                if items:
+                    out[p] = items
             except Exception:
                 continue
         return json.dumps(out, ensure_ascii=False)
@@ -3835,18 +4099,22 @@ class Api:
                 b, _ = os.path.splitext(r["path"])
                 dest = b + ".preview.png"
                 if not os.path.exists(dest):
-                    for img in imgs:
-                        u = img.get("url") or ""
-                        if not u:
-                            continue
+                    cover_url = _pick_cover_url(imgs)
+                    if cover_url:
                         for _ in range(3):
-                            if _download_image(u, dest,
+                            if _download_image(cover_url, dest,
                                                proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
                                                verify=self.cfg.get("ssl_verify", True)):
                                 ok += 1
                                 break
-                        if os.path.exists(dest):
-                            break
+                # 视频项 mp4 一并落盘（跳过已存在；与「下载封面」同批，进度不细分）
+                if imgs:
+                    try:
+                        _ensure_local_videos(b, imgs,
+                                             proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
+                                             verify=self.cfg.get("ssl_verify", True))
+                    except Exception:
+                        pass
                 self.mm_progress["done"] += 1
             self.mm_progress["running"] = False
             self.mm_progress["result"] = ok

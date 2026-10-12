@@ -69,6 +69,7 @@ function closeImageViewer() {
   imageViewerRequest++;
   if (!imageViewer) return;
   const {root,keyHandler,focus,entry} = imageViewer;
+  const video=root.querySelector('video');if(video&&typeof video.pause==='function')video.pause();   // 关闭查看器时暂停视频
   if(entry){entry.image.onload=null;entry.image.remove();if(![...viewerDecodedCache.values()].includes(entry))disposeViewerEntry(entry);}
   if(imageViewer.zoomRaf)cancelAnimationFrame(imageViewer.zoomRaf);
   document.removeEventListener('keydown',keyHandler,true);root.remove();imageViewer=null;
@@ -241,6 +242,36 @@ async function loadViewerImage(index){
   v.root.querySelector('#ivCount').textContent=(index+1)+' / '+covers.length;
   v.root.querySelector('.iv-prev').disabled=index===0;v.root.querySelector('.iv-next').disabled=index===covers.length-1;
   for(const id of ['ivShare','ivSite'])v.root.querySelector('#'+id).disabled=!(c.image_page||c.orig_url||c.url);
+  // 视频项：后端 get_gallery_image 对视频会报错，跳过 b64 / 解码缓存，直接用 mp4 直链 + 首帧 poster
+  if(c.type==='video' && c.url){
+    for(const vd of v.root.querySelectorAll('video'))vd.pause();
+    let video=v.root.querySelector('.iv-stage-video');
+    const ivImg=v.root.querySelector('#ivImage');
+    if(!video){
+      video=document.createElement('video');
+      video.className='iv-stage-video';
+      video.controls=true;video.autoplay=true;
+      video.preload='metadata';video.draggable=false;
+      video.setAttribute('playsinline','');
+      const canvas=v.root.querySelector('.iv-image-canvas');
+      canvas.append(video);
+    }
+    if(ivImg)ivImg.style.display='none';   // 每次切到视频都藏起图片，避免重叠
+    if(v.entry && ![...viewerDecodedCache.values()].includes(v.entry))disposeViewerEntry(v.entry);
+    const area=v.root.querySelector('.iv-image-scroll');
+    video.style.display='';
+    video.style.maxWidth=Math.max(240,area.clientWidth-24)+'px';
+    video.style.maxHeight=Math.max(160,area.clientHeight-24)+'px';
+    video.src=c.url;video.poster=c.poster||'';
+    video.load();
+    v.entry=null;v.full=null;
+    renderGeneration(c);
+    v.root.querySelector('#ivStatus').textContent='视频：来源直连播放，不做本地解码缓存；上一张/下一张或关闭即暂停';
+    return;
+  }
+  // 图片项：停掉并隐藏查看器里可能残留的视频，恢复正常图片显示
+  for(const vd of v.root.querySelectorAll('video')){vd.pause();vd.style.display='none';}
+  const resetImg=v.root.querySelector('#ivImage');if(resetImg&&resetImg.style.display==='none')resetImg.style.display='';
   if(!cached && viewerWarmRequests.has(key)){
     v.root.querySelector('#ivStatus').textContent='本地高清缓存准备中…';cached=await viewerWarmRequests.get(key);
     if(imageViewer!==v || request!==imageViewerRequest)return;

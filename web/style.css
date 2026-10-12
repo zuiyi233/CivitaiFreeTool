@@ -572,8 +572,9 @@ textarea.rules {
 }
 .ms-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-hover); }
 .ms-card.checked { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.35); }
-.ms-img-wrap { width: 100%; background: var(--surface); }
+.ms-img-wrap { width: 100%; background: var(--surface); position: relative; }
 .ms-img { width: 100%; display: block; object-fit: cover; min-height: 90px; background: var(--surface2); }
+.ms-img-alt { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: var(--surface2); opacity: 0; transition: opacity 0.35s ease; pointer-events: none; }
 .ms-name {
   padding: 8px 10px 2px;
   font-size: calc(13px * var(--type-scale, 1)); font-weight: 500; color: var(--text);
@@ -885,6 +886,8 @@ textarea.rules {
   object-fit: contain;
 }
 .detail-thumbs { display: flex; gap: 8px; flex-wrap: wrap; }
+.detail-thumb-box { position: relative; display: inline-flex; }
+.detail-thumb-box .detail-thumb { display: block; }
 .detail-thumb {
   width: 64px; height: 64px;
   border-radius: 8px;
@@ -893,6 +896,7 @@ textarea.rules {
   border: 2px solid transparent;
 }
 .detail-thumb.on { border-color: var(--primary); }
+.thumb-video-badge { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: none; display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: rgba(0,0,0,.62); color: #fff; font-size: 11px; font-style: normal; font-family: Arial, Helvetica, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,.35); }
 .detail-right { flex: 1; padding: 18px 20px; min-width: 0; }
 .detail-title { font-size: calc(21px * var(--type-scale, 1)); font-weight: 700; color: var(--text); margin-bottom: 4px; }
 .detail-cname { font-size: calc(13px * var(--type-scale, 1)); color: var(--primary); margin-bottom: 10px; }

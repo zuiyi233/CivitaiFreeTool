@@ -439,7 +439,7 @@ class CivitaiFreeGUI(tk.Tk):
         # 2. 下载 C 站封面为 <名>.preview.png（SD WebUI 可识别；后台线程，不阻塞 UI）
         if not os.path.exists(base + ".preview.png"):
             images = (meta.get("info") or {}).get("images") or []
-            cover_url = images[0].get("url") if images else ""
+            cover_url = reverse_parse.pick_cover_url(images)
             if cover_url:
                 threading.Thread(target=_download_image,
                                  args=(cover_url, base + ".preview.png"), daemon=True).start()

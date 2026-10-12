@@ -255,9 +255,10 @@ const state = {
   display: [],
   mmChecked: new Set(),
   coverCache: new Map(),   // 前端封面缓存（path → dataURI）：重绘时同步填充，删除/刷新不再闪屏
+  coverCacheMulti: new Map(), // 瀑布流 hover 轮播多图缓存（path → [dataURI,...]）：get_covers_multi 批量预取，不影响单图链路
   mmSel: new Set(),
   mmSort: { col: "name", rev: false },
-  mmTypeF: "", mmBaseF: "", mmStF: "", mmFolderF: "", mmAuthorF: "",   // Metro 筛选：底模 / 更新状态 / 文件夹 / 作者
+  mmTypeF: "", mmBaseF: "", mmStF: "", mmFolderF: "", mmAuthorF: "", mmCoverF: "",   // Metro 筛选：底模 / 更新状态 / 文件夹 / 作者 / 封面
   mmUpdOnly: false,          // 只看有更新的模型（更新检测筛选）
   mmUpdItems: null,          // 更新检测结果（path → 记录），「更新」页面用
   mmUpdCheckedAt: 0,
@@ -1755,6 +1756,7 @@ document.addEventListener("keydown", (e) => {
 
 // ===== 瀑布流视图 =====
 function renderMasonry(rows) {
+  document.querySelectorAll("#mmMasonry .ms-card").forEach((c) => _stopCarousel(c));  // 重建前清理轮播定时器
   $("#mmTableWrap").style.display = "none";
   $("#mmMasonry").style.display = "block";
   $("#mmMasonry").innerHTML = rows.map((r, i) => {
@@ -1822,8 +1824,140 @@ async function loadMasonryThumbs(start) {
       _markBatch(miss.map((r) => r.path), "fail");     // 拉取失败：统一显示"封面加载失败"
     }
   }
+  // 多图 hover 轮播预取：视口可见的未缓存模型批量请求 1-3 张；滚动时由 _onMmScroll 节流补充
+  prefetchMultiForCards(_visibleMasonryCards());
   loadMasonryThumbs(start + 40);
 }
+// ===== 瀑布流多图预取（渲染批 + 滚动节流共用）与卡片 hover 轮播：仅用已缓存 dataURI 叠层淡入（不发新请求），列表视图不参与 =====
+let _multiPrefetching = false, _multiScrollTimer = null;
+function _visibleMasonryCards() {
+  const vh = window.innerHeight || document.documentElement.clientHeight;
+  return Array.prototype.filter.call(
+    document.querySelectorAll("#mmMasonry .ms-card"),
+    (c) => { const b = c.getBoundingClientRect(); return b.top < vh && b.bottom > 0; });
+}
+async function prefetchMultiForCards(cards) {
+  if (_multiPrefetching || !cards || !cards.length) return;
+  const need = cards.map((c) => c.dataset.path).filter((p) => p && !state.coverCacheMulti.has(p));
+  if (!need.length) return;
+  _multiPrefetching = true;
+  try {
+    const raw = await api.call("get_covers_multi", need);
+    const multi = (typeof raw === "string") ? JSON.parse(raw || "{}") : (raw || {});
+    if (multi && typeof multi === "object") {
+      if (state.coverCacheMulti.size > 4000) state.coverCacheMulti.clear();
+      for (const [p, list] of Object.entries(multi)) {
+        if (!Array.isArray(list) || !list.length) continue;
+        // 帧格式 [[src, isVideo], ...]：src 为 dataURI（本地）或 https/file URL（远程/落盘视频），原样使用
+        state.coverCacheMulti.set(p, list
+          .filter((f) => Array.isArray(f) && f[0])
+          .map((f) => {
+            const src = String(f[0]);
+            return [/^data:/i.test(src) || /^https?:/i.test(src) || /^file:/i.test(src) ? src : "data:image/jpeg;base64," + src, !!f[1]];
+          }));
+        if (typeof _startCarousel !== "function") continue;
+        // 正在 hover 该卡片且刚拿到多图 → 立即启动轮播
+        document.querySelectorAll("#mmMasonry .ms-card:hover").forEach((cd) => { if (cd.dataset.path === p) _startCarousel(cd, p); });
+      }
+    }
+  } catch (e) { /* 多图预取失败静默：无 hover 轮播，单图链路不受影响 */ }
+  finally { _multiPrefetching = false; }
+}
+function _onMmScroll() {
+  if (_multiScrollTimer) return;
+  _multiScrollTimer = setTimeout(() => { _multiScrollTimer = null; prefetchMultiForCards(_visibleMasonryCards()); }, 300);
+}
+window.addEventListener("scroll", _onMmScroll, { passive: true });
+const _mmScrollEl = document.getElementById("mmMasonry");
+if (_mmScrollEl) _mmScrollEl.addEventListener("scroll", _onMmScroll, { passive: true });
+const _masonryCarousel = new WeakMap(); // card → {timer, cur}
+const _MM_CAROUSEL_MS = 3000;   // 轮换间隔：用户约定 ~3 秒
+function _startCarousel(card, path) {
+  const list = state.coverCacheMulti && state.coverCacheMulti.get(path);
+  if (!Array.isArray(list) || list.length < 2 || _masonryCarousel.has(card)) return;
+  const wrap = card.querySelector(".ms-img-wrap");
+  if (!wrap) return;
+  let idx = 1;   // 主封面固定第一张，轮播从第 2 张起
+  let cur = null; // 当前叠层元素（img 或 video）
+  let loading = false; // 远程帧预载中：定时器本次跳过，防叠帧
+  const dead = new Set(); // 预载失败的远程帧：本次悬停内直接跳过，不再反复试
+  const st = { timer: null, cur: null };   // cur 必须回写，_stopCarousel 才能清叠层/暂停视频
+  _masonryCarousel.set(card, st);
+  const mount = (el) => {
+    if (cur) { if (cur.tagName === "VIDEO") { try { cur.pause(); } catch (_) {} } cur.remove(); cur = null; }
+    wrap.append(el); cur = el; st.cur = el;
+    requestAnimationFrame(() => { if (cur === el) el.style.opacity = "1"; });  // .ms-img-alt 默认 opacity:0，淡入
+  };
+  const tick = () => { if (!card.isConnected) { _stopCarousel(card); return; } if (loading) return; show(); };
+  const rearm = () => { clearInterval(st.timer); st.timer = setInterval(tick, _MM_CAROUSEL_MS); };  // 以挂载时刻重排，保证每帧驻留均匀
+  const show = () => {
+    for (let tries = 0; tries < list.length; tries++) {
+      if (idx >= list.length) idx = 1;
+      const frame = list[idx] || [];
+      const src = String(frame[0] || ""), isVideo = !!frame[1];
+      if (isVideo && /^https?:|^file:/i.test(src)) {
+        // 视频帧：静音自动循环播放（C 站卡片行为）；file:/// 本地落盘视频离线可播
+        const v = document.createElement("video");
+        v.className = "ms-img ms-img-alt"; v.muted = true; v.loop = true; v.autoplay = true;
+        v.playsInline = true; v.preload = "metadata"; v.style.opacity = "1";
+        v.onerror = () => { if (cur === v) { try { v.pause(); } catch (_) {} v.remove(); if (cur === v) cur = null; } };
+        v.src = src;
+        mount(v);
+        const p = v.play && v.play(); if (p && p.catch) p.catch(() => {});
+        idx = idx + 1; rearm(); return;
+      }
+      if (/^data:/i.test(src)) {
+        const alt = document.createElement("img");
+        alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
+        alt.style.opacity = "1";
+        alt.src = src;   // 本地 b64 立即可用
+        mount(alt);
+        idx = idx + 1; rearm(); return;
+      }
+      // 远程图帧：预载成功才切换（防空白遮主图）；失败记入 dead 跳过，不当场递归重试
+      if (dead.has(src)) { idx = idx + 1; continue; }
+      const pre = new Image();
+      let done = false;
+      const finish = (ok) => {
+        if (done) return;
+        done = true; loading = false;
+        if (!ok) { dead.add(src); return; }   // 本拍保持现状，下一拍由 tick 推进到后续帧
+        const alt = document.createElement("img");
+        alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
+        alt.style.opacity = "1";
+        alt.src = src;
+        mount(alt);
+        idx = idx + 1;
+        rearm();
+      };
+      pre.onload = () => finish(true);
+      pre.onerror = () => finish(false);
+      loading = true;
+      pre.src = src;
+      setTimeout(() => finish(false), 6000);   // 挂起帧 6s 超时跳过
+      return;
+    }
+  };
+  show();
+}
+function _stopCarousel(card) {
+  const st = _masonryCarousel.get(card);
+  if (!st) return;
+  clearInterval(st.timer);
+  if (st.cur) { if (st.cur.tagName === "VIDEO") { try { st.cur.pause(); } catch (_) {} } st.cur.remove(); }
+  _masonryCarousel.delete(card);
+}
+document.addEventListener("mouseover", (e) => {
+  const card = e.target && e.target.closest ? e.target.closest("#mmMasonry .ms-card") : null;
+  if (!card || _masonryCarousel.has(card)) return;
+  _startCarousel(card, card.dataset.path || "");
+});
+document.addEventListener("mouseout", (e) => {
+  const card = e.target && e.target.closest ? e.target.closest("#mmMasonry .ms-card") : null;
+  if (!card) return;
+  if (e.relatedTarget && card.contains(e.relatedTarget)) return;   // 仍在卡片内移动
+  _stopCarousel(card);
+});
 $("#mmViewToggle").addEventListener("click", () => {
   state.mmView = state.mmView === "masonry" ? "list" : "masonry";
   $("#mmViewToggle").textContent = state.mmView === "masonry" ? "列表视图" : "瀑布流";
@@ -1932,6 +2066,13 @@ function applyMmFilter() {
       const u = r.upd || {};
       const st = u.has_update ? "upd" : (r.upd ? (u.other_base ? "other" : "latest") : "none");
       return st === state.mmStF;
+    });
+  }
+  if (state.mmCoverF) {
+    // 封面筛选：有图（含视频封面）/无图。coverCache 兜底自愈「扫描后才补下封面」的行级字段滞后
+    rows = rows.filter((r) => {
+      const has = !!r.has_cover || (state.coverCache && state.coverCache.has(r.path));
+      return state.mmCoverF === "cover" ? has : !has;
     });
   }
   state.display = rows.slice();
@@ -3180,6 +3321,7 @@ async function showModelDetail(path, historyId = "") {
   detailImgIdx = 0;
   detailImgLocalPath = null;
   const mainB64 = covers.find((c) => c.b64);
+  const firstVideo = (covers.length && covers[0] && covers[0].type === "video") ? covers[0] : null;   // 首个示例是视频时主图直接渲染 <video>
   detailImgLocalPath = (mainB64 && mainB64.local && d.path) ? d.path : null;
   detailImgIdx = 0;
   const panel = $("#detailPanel");
@@ -3193,13 +3335,17 @@ async function showModelDetail(path, historyId = "") {
     '</div>' +
     '<div class="dt-body">' +
     '<div class="detail-left">' +
-    (mainB64
-      ? '<img class="detail-main-img" id="dMain" src="data:image/jpeg;base64,' + mainB64.b64 + '"/>'
-      : covers.length?'<img class="detail-main-img" id="dMain" data-empty="true" alt="示例图片"/>':'<div class="detail-main-img dt-empty" id="dMain">' + _icon("image", "ic-lg") + '<span>暂无封面</span></div>') +
+    (firstVideo
+      ? '<video class="detail-main-img" id="dMain" controls preload="metadata" title="放大观看视频（播放器自带全屏）" src="' + esc(firstVideo.url) + '" poster="' + esc(firstVideo.poster || "") + '"></video>'
+      : mainB64
+        ? '<img class="detail-main-img" id="dMain" src="data:image/jpeg;base64,' + mainB64.b64 + '"/>'
+        : covers.length?'<img class="detail-main-img" id="dMain" data-empty="true" alt="示例图片"/>':'<div class="detail-main-img dt-empty" id="dMain">' + _icon("image", "ic-lg") + '<span>暂无封面</span></div>') +
     '<div class="detail-thumbs">' + covers.map((c, i) =>
-      c.b64
-        ? '<img class="detail-thumb' + (i === 0 ? " on" : "") + '" data-i="' + i + '" src="data:image/jpeg;base64,' + c.b64 + '"/>'
-        : '<img class="detail-thumb" data-i="' + i + '" data-url="' + esc(c.url || "") + '" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"/>'
+      c.type === "video"
+        ? '<span class="detail-thumb-box"><img class="detail-thumb' + (i === 0 ? " on" : "") + '" data-i="' + i + '" data-url="' + esc(c.poster || "") + '" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"/><i class="thumb-video-badge" aria-hidden="true">▶</i></span>'
+        : (c.b64
+            ? '<img class="detail-thumb' + (i === 0 ? " on" : "") + '" data-i="' + i + '" src="data:image/jpeg;base64,' + c.b64 + '"/>'
+            : '<img class="detail-thumb" data-i="' + i + '" data-url="' + esc(c.url || "") + '" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"/>')
     ).join("") + "</div></div>" +
     '<div class="detail-right">' +
     '<div class="detail-title">' + esc(info.name || d.name || "-") + "</div>" +
@@ -3244,7 +3390,7 @@ async function showModelDetail(path, historyId = "") {
         '<button class="btn" id="dJson" data-tip="生成 WebUI 能识别的元数据文件">' + _icon("file") + '生成 SD 可读 JSON</button>' +
       "</div></div>" +
       '<div class="dt-ag"><div class="dt-ag-h">图片</div><div class="dt-ag-b">' +
-        '<button class="btn" id="dAllImgs" data-tip="把 C 站该模型的全部示例图下载到「模型名.images」文件夹">' + _icon("download") + '下载示例图</button>' +
+        '<button class="btn" id="dAllImgs" data-tip="把 C 站该模型的示例图（最多 20 张，视频取首帧）下载到「模型名.images」文件夹">' + _icon("download") + '下载示例图</button>' +
       "</div></div>" +
     "</div>" +
     "</div></div>";
@@ -3253,10 +3399,11 @@ async function showModelDetail(path, historyId = "") {
     panel.querySelector('.detail-title').insertAdjacentHTML('afterend', '<p class="history-model">历史信息缓存 · 本地文件已移走或不存在，仅供查看</p>');
     panel.querySelectorAll('#dEditInfo,#dRename,#dRenameC,#dCover,#dRp,#dSync,#dTranslate,#dLocalize,#dJson,#dAllImgs').forEach(button => button.disabled = true);
   }
-  // 自动加载所有 URL 缩略图（避免空占位）
+  // 自动加载所有 URL 缩略图（避免空占位）；视频项取首帧图（poster）转 b64，绝不把 mp4 直链当图片请求
   covers.forEach((c, i) => {
-    if (!c.b64 && c.url) {
-      api.call("get_cover_b64", c.url).then((b64) => {
+    const thumbUrl = c.type === "video" ? (c.poster || "") : (c.url || "");
+    if (!c.b64 && thumbUrl) {
+      api.call("get_cover_b64", thumbUrl).then((b64) => {
         if (generation !== detailGeneration) return;
         if (!b64) {
           // 加载失败：移除该占位缩略图
@@ -3275,18 +3422,46 @@ async function showModelDetail(path, historyId = "") {
       });
     }
   });
-  $("#dMain", panel).addEventListener("click", () => openImageViewer(detailRow, detailImgIdx));
-  $("#dMain", panel).setAttribute("title", "点击放大图片并查看生成数据");
-  $("#dMain", panel).tabIndex=0;
-  $("#dMain", panel).addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();openImageViewer(detailRow,detailImgIdx);}});
+  const bindMainImage=()=>{   // 图片主图绑定“点击放大查看”（同一 img 只绑一次）；视频主图有原生控制条，不抢点击
+    const m=$("#dMain",panel);if(!m||m.tagName!=="IMG"||m.dataset.mainBound)return;
+    m.dataset.mainBound="1";
+    m.addEventListener("click",()=>openImageViewer(detailRow,detailImgIdx));
+    m.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();openImageViewer(detailRow,detailImgIdx);}});
+    m.setAttribute("title", "点击放大图片并查看生成数据");m.tabIndex=0;
+  };
+  bindMainImage();
   // 画廊切换
   let imageChoiceGeneration=0;
   const loadB64=async i=>{
     const c=covers[i];if(!c)return;
     const choice=++imageChoiceGeneration;detailImgIdx=i;detailImgLocalPath=c.local?d.path:null;
-    const image=panel.querySelector('#dMain');delete image.dataset.hdIndex;
     panel.querySelectorAll('.detail-thumb').forEach(t=>t.classList.toggle('on',Number(t.dataset.i)===i));
     const current=()=>generation===detailGeneration && detailImgIdx===i && choice===imageChoiceGeneration;
+    const prevMain=$("#dMain",panel);
+    // 视频项：主图换 <video controls>，mp4 直连远程（不走 b64），poster 用首帧图；切走前先停旧视频
+    if(c.type==='video'&&c.url){
+      if(prevMain&&prevMain.tagName==='VIDEO')prevMain.pause();
+      let video=$("#dMain",panel);
+      if(!video||video.tagName!=='VIDEO'){
+        video=document.createElement('video');video.className='detail-main-img';video.id='dMain';
+        if(prevMain)prevMain.replaceWith(video);
+        video=$("#dMain",panel)||video;
+      }
+      video.controls=true;video.preload='metadata';video.autoplay=true;
+      video.src=c.url;video.poster=c.poster||'';
+      video.setAttribute('title','放大观看视频（播放器自带全屏）');video.tabIndex=0;
+      if(video.onclick)video.onclick=null;
+      delete video.dataset.empty;delete video.dataset.hdIndex;
+      return;
+    }
+    // 图片项：先停掉并移除主图区的视频
+    if(prevMain&&prevMain.tagName==='VIDEO'){
+      prevMain.pause();
+      const img=document.createElement('img');img.className='detail-main-img';img.id='dMain';
+      prevMain.replaceWith(img);
+    }
+    const image=$("#dMain",panel);delete image.dataset.hdIndex;
+    if(image.tagName==='IMG')bindMainImage();
     const warm=typeof warmViewedGallery==='function'?await warmViewedGallery(detailRow,i):null;
     if(!current())return;
     if(warm){image.src=warm.url;image.dataset.hdIndex=String(i);image.style.opacity='1';delete image.dataset.empty;return;}
@@ -3642,6 +3817,7 @@ document.addEventListener("keydown", (e) => {
 });
 function closeDetail() {
   detailGeneration++;
+  const dvd=$("#detailPanel video");if(dvd&&dvd.pause)dvd.pause();
   $("#detailMask").style.display = "none";
   $("#detailPanel").innerHTML = "";
   detailRow = null;
@@ -5187,6 +5363,8 @@ function bindMmMetro() {
   if (bf) bf.addEventListener("change", () => { state.mmBaseF = bf.value; applyMmFilter(); });
   const af2 = document.getElementById("mmAuthorF");
   if (af2) af2.addEventListener("change", () => { state.mmAuthorF = af2.value; applyMmFilter(); });
+  const cf = document.getElementById("mmCoverF");
+  if (cf) cf.addEventListener("change", () => { state.mmCoverF = cf.value; applyMmFilter(); });
   if (sf) sf.addEventListener("change", () => { state.mmStF = sf.value; applyMmFilter(); });
   if (so) so.addEventListener("change", () => {
     if (!so.value) state.mmSort = { col: null, rev: false };
