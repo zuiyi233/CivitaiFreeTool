@@ -40,8 +40,8 @@ class FakeLib:
         self.calls.append(("list_items", flt))
         return {"items": self.items, "total": self.total}
 
-    def facets(self):
-        self.calls.append(("facets",))
+    def facets(self, root_ids=None):
+        self.calls.append(("facets", root_ids))
         return self.facets_val
 
     def detail(self, item_id):
@@ -438,8 +438,16 @@ class ListDetailTests(LibRPCTestBase):
                          {"id": 2, "path": vid, "kind": "video", "ext": ".mp4"}]
             lib.total = 2
             out = json.loads(a.lib_list(json.dumps(evil, ensure_ascii=False)))
-            # 校验在 A2 层：flt 解析后必须原样透传（未知键/evil sort 一字不改）
-            self.assertEqual([c for c in lib.calls if c[0] == "list_items"], [("list_items", evil)])
+            # 校验在 A2 层：flt 解析后客户端键必须原样透传（未知键/evil sort 一字不改）
+            sent = [c for c in lib.calls if c[0] == "list_items"][-1][1]
+            self.assertEqual({k: v for k, v in sent.items() if k != "root_ids"}, evil)
+            # root_ids 由服务端注入并覆盖客户端值（前端不得自行放宽作用域）
+            self.assertIn("root_ids", sent)
+            evil.pop("root_ids", None)
+            evil_with_roots = dict(evil)
+            evil_with_roots["root_ids"] = ["客户端伪造"]
+            a.lib_list(json.dumps(evil_with_roots, ensure_ascii=False))
+            self.assertNotIn("客户端伪造", [c for c in lib.calls if c[0] == "list_items"][-1][1]["root_ids"])
             row = out["items"][0]
             self.assertEqual(row["snippet"], "x" * 120)
             self.assertTrue(row["thumb"])

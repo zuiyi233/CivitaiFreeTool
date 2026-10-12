@@ -177,6 +177,11 @@ def _root_id(root_abs):
     return hashlib.sha1(os.path.normcase(root_abs).encode("utf-8", "ignore")).hexdigest()[:16]
 
 
+def root_id(root_abs):
+    """配置根 → root_id：调用方（RPC 层）据此把「已移出配置的根」的行从列表里排除。"""
+    return _root_id(os.path.normpath(os.path.abspath(str(root_abs or ""))))
+
+
 def _ext_of(filename):
     return os.path.splitext(filename)[1].lower()
 
@@ -652,6 +657,14 @@ class MediaLibrary(object):
         """所有用户输入只进 bind 参数；集合条件用 ? 占位符拼 IN，跨维度 AND、同维度 OR。"""
         where = ["missing_since IS NULL"]
         params = []
+        if flt.get("root_ids") is not None:
+            # 移出配置的根：行保留（重新加回目录即恢复，标签/收藏不丢），但不再出现在列表里
+            ids = [str(x) for x in _as_list(flt.get("root_ids"))]
+            if ids:
+                where.append("root_id IN (%s)" % _placeholders(ids))
+                params.extend(ids)
+            else:
+                where.append("1 = 0")
         kind = str(flt.get("kind") or "").strip().lower()
         if kind in ("image", "video"):
             where.append("kind = ?")
@@ -747,35 +760,46 @@ class MediaLibrary(object):
             return row["dir_path"] or ""
         return ""
 
-    def facets(self):
-        """分面聚合（§5.3），全部只统计在场文件；facet 下拉上限 300 项。"""
+    def facets(self, root_ids=None):
+        """分面聚合（§5.3），全部只统计在场文件；facet 下拉上限 300 项。
+        root_ids 非 None 时与 list_items 同口径限定在配置的根之内，分面计数才不会算进幽灵行。"""
+        args = []
+        scope = "missing_since IS NULL"
+        if root_ids is not None:
+            ids = [str(x) for x in _as_list(root_ids)]
+            if ids:
+                scope += " AND root_id IN (%s)" % _placeholders(ids)
+                args = ids
+            else:
+                scope += " AND 1 = 0"
         with self._db() as conn:
             checkpoints = [{"name": r["checkpoint"], "count": r["n"]} for r in conn.execute(
-                "SELECT checkpoint, COUNT(*) AS n FROM items WHERE missing_since IS NULL AND checkpoint <> '' "
-                "GROUP BY checkpoint ORDER BY n DESC, checkpoint ASC LIMIT ?", (FACET_LIMIT,))]
+                "SELECT checkpoint, COUNT(*) AS n FROM items WHERE " + scope + " AND checkpoint <> '' "
+                "GROUP BY checkpoint ORDER BY n DESC, checkpoint ASC LIMIT ?", list(args) + [FACET_LIMIT])]
             loras_map = {}
-            for r in conn.execute("SELECT loras_json FROM items WHERE missing_since IS NULL AND loras_json <> '[]'"):
+            for r in conn.execute("SELECT loras_json FROM items WHERE " + scope + " AND loras_json <> '[]'", args):
                 for name in _json_loads(r["loras_json"], []):
                     if isinstance(name, str) and name:
                         loras_map[name] = loras_map.get(name, 0) + 1
             loras = [{"name": n, "count": c} for n, c in
                      sorted(loras_map.items(), key=lambda kv: (-kv[1], kv[0]))[:FACET_LIMIT]]
             dirs = [{"name": r["dir_path"], "count": r["n"], "path": r["dir_path"]} for r in conn.execute(
-                "SELECT dir_path, COUNT(*) AS n FROM items WHERE missing_since IS NULL "
-                "GROUP BY dir_path ORDER BY n DESC, dir_path ASC LIMIT ?", (FACET_LIMIT,))]
+                "SELECT dir_path, COUNT(*) AS n FROM items WHERE " + scope + " "
+                "GROUP BY dir_path ORDER BY n DESC, dir_path ASC LIMIT ?", list(args) + [FACET_LIMIT])]
             # 相关子查询统计「在场文件」的标签数：LEFT JOIN + INNER JOIN 混写会漏掉只有缺失文件的标签
             tags = [{"id": r["id"], "name": r["name"], "color": r["color"], "count": r["count"]} for r in conn.execute(
                 "SELECT tags.id AS id, tags.name AS name, tags.color AS color, "
                 "(SELECT COUNT(*) FROM item_tags WHERE item_tags.tag_id = tags.id "
-                " AND item_tags.item_id IN (SELECT id FROM items WHERE missing_since IS NULL)) AS count "
-                "FROM tags ORDER BY count DESC, tags.name ASC LIMIT ?", (FACET_LIMIT,))]
+                " AND item_tags.item_id IN (SELECT id FROM items WHERE " + scope + ")) AS count "
+                "FROM tags ORDER BY count DESC, tags.name ASC LIMIT ?", list(args) + [FACET_LIMIT])]
             kinds = {"image": 0, "video": 0}
-            for r in conn.execute("SELECT kind, COUNT(*) AS n FROM items WHERE missing_since IS NULL GROUP BY kind"):
+            for r in conn.execute("SELECT kind, COUNT(*) AS n FROM items WHERE " + scope + " GROUP BY kind", args):
                 kinds[r["kind"]] = r["n"]
-            total = conn.execute("SELECT COUNT(*) FROM items WHERE missing_since IS NULL").fetchone()[0]
-            starred = conn.execute("SELECT COUNT(*) FROM items WHERE missing_since IS NULL AND starred = 1").fetchone()[0]
-            no_meta = conn.execute("SELECT COUNT(*) FROM items WHERE missing_since IS NULL AND has_meta = 0").fetchone()[0]
-            missing = conn.execute("SELECT COUNT(*) FROM items WHERE missing_since IS NOT NULL").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM items WHERE " + scope, args).fetchone()[0]
+            starred = conn.execute("SELECT COUNT(*) FROM items WHERE " + scope + " AND starred = 1", args).fetchone()[0]
+            no_meta = conn.execute("SELECT COUNT(*) FROM items WHERE " + scope + " AND has_meta = 0", args).fetchone()[0]
+            missing = conn.execute("SELECT COUNT(*) FROM items WHERE missing_since IS NOT NULL"
+                                   + (" AND root_id IN (%s)" % _placeholders(args) if args else ""), args).fetchone()[0]
         return {"checkpoints": checkpoints, "loras": loras, "dirs": dirs, "tags": tags,
                 "kinds": kinds, "starred": int(starred), "no_meta": int(no_meta),
                 "missing": int(missing), "total": int(total)}

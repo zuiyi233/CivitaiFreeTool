@@ -1023,5 +1023,53 @@ class ConnectionPolicyTests(LibraryCase):
         self.assertEqual(self.lib.list_items({"starred": True})["total"], 1)
 
 
+class RootScopeTests(LibraryCase):
+    """移出配置的根：行保留但不得出现在列表/分面里（重新加回即恢复，标签收藏不丢）。"""
+
+    def setUp(self):
+        LibraryCase.setUp(self)
+        self.root2 = Path(self._tmp.name) / "other"
+        self.root2.mkdir()
+        self.make("a.png")
+        other = self.root2 / "b.png"
+        other.write_bytes(b"payload")
+        stamp = time.time() - 5000
+        os.utime(other, (stamp, stamp))
+        self.lib.scan([str(self.root), str(self.root2)])
+        self.id1 = media_library.root_id(str(self.root))
+        self.id2 = media_library.root_id(str(self.root2))
+
+    def test_root_ids_restricts_list_and_total(self):
+        self.assertEqual(self.lib.list_items({})["total"], 2)               # 不传 = 不限定（旧行为不变）
+        one = self.lib.list_items({"root_ids": [self.id1]})
+        self.assertEqual(one["total"], 1)
+        self.assertEqual([i["filename"] for i in one["items"]], ["a.png"])
+        self.assertEqual(self.lib.list_items({"root_ids": []})["total"], 0)  # 一个根都没配 → 空视图
+
+    def test_facets_share_the_same_scope(self):
+        star = self.lib.list_items({"root_ids": [self.id1]})["items"][0]
+        self.lib.set_star(star["id"], True)
+        f_all = self.lib.facets()
+        f_one = self.lib.facets(root_ids=[self.id1])
+        f_none = self.lib.facets(root_ids=[])
+        self.assertEqual((f_all["total"], f_one["total"]), (2, 1))
+        self.assertEqual((f_one["starred"], f_one["image"] if "image" in f_one else f_one["kinds"]["image"]), (1, 1))
+        self.assertEqual([d["path"] for d in f_one["dirs"]], [""])
+        self.assertEqual((f_none["total"], f_none["starred"], f_none["dirs"]), (0, 0, []))
+
+    def test_unconfigured_root_rows_survive_and_come_back(self):
+        self.lib.scan([str(self.root)])                     # 只扫 root1：root2 的行不得被判缺失（§4.3）
+        hidden = self.lib.list_items({"root_ids": [self.id2]})
+        self.assertEqual(hidden["total"], 1)
+        row = hidden["items"][0]
+        self.assertIsNone(row["missing_since"])
+        self.lib.set_star(row["id"], True)
+        tid = self.lib.save_tag(0, "留着", "", -1)
+        self.lib.set_tags(row["id"], [tid])
+        back = self.lib.list_items({"root_ids": [self.id1, self.id2], "starred": True})
+        self.assertEqual([i["filename"] for i in back["items"]], ["b.png"])
+        self.assertEqual([t["name"] for t in back["items"][0]["tags"]], ["留着"])
+
+
 if __name__ == "__main__":
     unittest.main()

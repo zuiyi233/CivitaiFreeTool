@@ -5050,8 +5050,16 @@ class Api:
         return {"started": bool(r.get("started")),
                 "reason": "" if r.get("started") else str(r.get("msg", ""))}
 
+    def _media_root_ids(self):
+        """配置根的 root_id 列表；查询层据此排除「已移出配置的根」留下的行。"""
+        try:
+            import media_library
+            return [media_library.root_id(r) for r in self._media_roots()]
+        except Exception:
+            return []
+
     def lib_list(self, flt_json):
-        """筛选+分页列表，JSON 字符串（§5.2）。flt 原样透传：sort/group_by 白名单等校验在 A2 层"""
+        """筛选+分页列表，JSON 字符串（§5.2）。sort/group_by 白名单等校验在 A2 层"""
         try:
             flt = json.loads(flt_json or "{}")
             if not isinstance(flt, dict):
@@ -5059,13 +5067,15 @@ class Api:
         except Exception:
             return json.dumps({"ok": False, "msg": "筛选参数格式错误",
                                "items": [], "total": 0, "offset": 0, "limit": 0}, ensure_ascii=False)
+        # 作用域由服务端决定：客户端传来的 root_ids 一律覆盖，避免前端自行放宽范围
+        flt["root_ids"] = self._media_root_ids()
         lib = self._media_lib()
         data = lib.list_items(flt) or {}
         items = [self._lib_enrich(r) for r in (data.get("items") or [])]
         facets = data.get("facets")
         if facets is None:
             try:
-                facets = lib.facets()
+                facets = lib.facets(root_ids=flt["root_ids"])
             except Exception:
                 facets = {}
         return json.dumps({"ok": True, "items": items,
