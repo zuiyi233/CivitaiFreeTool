@@ -86,6 +86,7 @@ DEFAULTS = {
     "model_list_size": 3,               # 1 精简名称但保留信息列 / 2 无封面和作者 / 3 完整（现有最大）
     "masonry_info_mode": "always",     # always / slide / fade
     "masonry_overlay_size": "partial", # partial / full
+    "masonry_autoplay": True,          # 不悬停也轮播：每 3 秒只换一张卡片的一帧
     "name_scroll_speed": 70,          # px/s
     "name_scroll_start_pause": 350,   # ms
     "name_scroll_end_pause": 250,     # ms
@@ -206,6 +207,7 @@ def load():
 def normalize_ui_preferences(cfg):
     if cfg.get("masonry_info_mode","always") not in ("always","slide","fade"):cfg["masonry_info_mode"]="always"
     if cfg.get("masonry_overlay_size","partial") not in ("partial","full"):cfg["masonry_overlay_size"]="partial"
+    cfg["masonry_autoplay"] = cfg.get("masonry_autoplay", True) is not False   # 默认开；只有显式 false 才关
     if cfg.get("download_name_mode", "original") not in ("original", "civitai", "chinese"): cfg["download_name_mode"] = "original"
     cfg["filename_include_version"] = cfg.get("filename_include_version") is True
     if cfg.get("multi_file_download", "ask") not in ("ask", "first", "all"): cfg["multi_file_download"] = "ask"

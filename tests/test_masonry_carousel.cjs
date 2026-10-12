@@ -110,6 +110,46 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
   assert.equal(await asked(),askedBefore+1,'没有多图帧的模型，重复 hover 只该问一次');
   ok('无多图模型重复 hover 不重复请求（会话内记一次）');
 
+  // 淡入淡出：新帧必须以 opacity:0 插入、下一帧才抬到 1（旧写法在 append 前就写死 style.opacity="1"，等于自己把过渡废掉，切换很生硬）
+  const fade=await page.evaluate(async()=>{
+    const c=[...document.querySelectorAll('#mmMasonry .ms-card')].find(x=>{const l=state.coverCacheMulti.get(x.dataset.path);return Array.isArray(l)&&l.length>=2;});
+    _stopCarousel(c);
+    const st=_carouselPlayer(c,c.dataset.path,true);
+    _carouselAdvance(st);
+    const seen=[];
+    for(let i=0;i<14;i++){ await new Promise(r=>requestAnimationFrame(r));
+      const a=[...c.querySelectorAll('.ms-img-alt')];
+      if(a.length) seen.push({n:a.length,op:a.map(x=>Number(getComputedStyle(x).opacity))}); }
+    return {first:seen[0]||null,last:seen[seen.length-1]||null,maxN:Math.max(0,...seen.map(s=>s.n))};
+  });
+  assert(fade.first,'淡入探针没抓到叠层帧');
+  assert(fade.first.op[0]<0.9,'新帧不是从透明淡入的（computed opacity 起始 '+fade.first.op[0]+'）');
+  assert(fade.last.op[fade.last.op.length-1]>0.9,'淡入没收敛到不透明');
+  assert(fade.maxN<=2,'交叉期最多旧新两层，实测 '+fade.maxN);
+  ok('换帧是淡入：以透明插入、下一帧抬起，交叉期最多两层');
+
+  // 自动轮播：鼠标完全不碰网格，也要自己换帧
+  await page.mouse.move(4,4);
+  await page.evaluate(()=>{document.querySelector('.content').scrollTop=0;
+    [...document.querySelectorAll('#mmMasonry .ms-card')].forEach(c=>_stopCarousel(c));});
+  await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length>0,null,{timeout:9000});
+  const autoA=await page.evaluate(()=>[...document.querySelectorAll('#mmMasonry .ms-img-alt')].map(a=>String(a.src)));
+  await page.waitForFunction(prev=>{const now=[...document.querySelectorAll('#mmMasonry .ms-img-alt')].map(a=>String(a.src));
+    return now.some(s=>!prev.includes(s));},autoA,{timeout:15000});
+  ok('不悬停也自动轮播：无鼠标介入时自动挂帧并继续换到新的帧');
+
+  const perCard=await page.evaluate(()=>Math.max(...[...document.querySelectorAll('#mmMasonry .ms-card')].map(c=>c.querySelectorAll('.ms-img-alt').length)));
+  assert(perCard<=2,'自动轮播下每张卡最多旧新两层，实测 '+perCard);
+  ok('自动轮播按卡片各自一层（交叉期两层），不会叠罗汉');
+
+  // 关掉设置里的自动轮播后，不悬停就不该再动
+  await page.evaluate(()=>{state.cfg.masonry_autoplay=false;
+    [...document.querySelectorAll('#mmMasonry .ms-card')].forEach(c=>_stopCarousel(c));});
+  await page.waitForTimeout(4200);
+  assert.equal(await page.evaluate(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length),0,'关闭自动轮播后仍在挂帧');
+  await page.evaluate(()=>{state.cfg.masonry_autoplay=true;});
+  ok('设置项 masonry_autoplay 关掉即停，悬停轮播不受影响');
+
   assert.equal(errors.length,0,JSON.stringify(errors));
   ok('全部轮播检查无前端异常');
   console.log('PASS '+passed+' masonry carousel checks');

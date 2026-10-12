@@ -1880,98 +1880,179 @@ function _onMmScroll() {
 // 而元素上的 scroll 事件不冒泡——挂在 window 的冒泡监听和挂在 #mmMasonry 的监听历史上一次都没触发过，
 // 于是首屏之后多图帧再也不会预取，hover 无帧可轮。捕获阶段能收到任意滚动容器的 scroll。
 window.addEventListener("scroll", _onMmScroll, { passive: true, capture: true });
-const _masonryCarousel = new WeakMap(); // card → {timer, cur}
-const _MM_CAROUSEL_MS = 3000;   // 轮换间隔：用户约定 ~3 秒
-function _startCarousel(card, path) {
+const _masonryCarousel = new WeakMap(); // card → 播放器状态（帧列表、游标、在途预载、归属）
+const _autoPlayers = new Set();         // 自动轮播中的卡片（WeakMap 不可遍历，另存一份可迭代的登记）
+const _MM_CAROUSEL_MS = 3000;   // 悬停轮播：约 3 秒/帧（用户约定）
+const _MM_AUTO_MS = 3000;       // 自动轮播：每拍只推进一张卡片，整屏不会同时闪
+const _MM_FADE_MS = 350;        // 淡入时长，与 CSS .ms-img-alt 的 transition 保持一致
+function _reducedMotion() { try { return window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; } }
+function _masonryShown() { const el = document.getElementById("mmMasonry"); return !!el && el.offsetParent !== null; }
+function _carouselPlayer(card, path, auto) {
+  const old = _masonryCarousel.get(card);
+  if (old) return old;
   const list = state.coverCacheMulti && state.coverCacheMulti.get(path);
-  if (!Array.isArray(list) || list.length < 2 || _masonryCarousel.has(card)) return;
+  if (!Array.isArray(list) || list.length < 2) return null;   // 只有一张就没必要轮
   const wrap = card.querySelector(".ms-img-wrap");
-  if (!wrap) return;
-  let idx = 1;   // 主封面固定第一张，轮播从第 2 张起
-  let cur = null; // 当前叠层元素（img 或 video）
-  let loading = false; // 远程帧预载中：定时器本次跳过，防叠帧
-  const dead = new Set(); // 预载失败的远程帧：本次悬停内直接跳过，不再反复试
-  const st = { timer: null, cur: null };   // cur 必须回写，_stopCarousel 才能清叠层/暂停视频
+  if (!wrap) return null;
+  const st = { card, wrap, list, idx: 1, cur: null, loading: false, seq: 0, dead: new Set(), timer: null, auto: !!auto };
   _masonryCarousel.set(card, st);
-  const mount = (el) => {
-    // 归属检查：本轮已经 _stopCarousel 过（鼠标移开）而预载才回来时，绝不能把帧挂上去——
-    // 那会在卡片上留下一张没人负责清理的孤儿叠图，直到下次重渲染才消失。
-    if (_masonryCarousel.get(card) !== st) { if (el.tagName === "VIDEO") { try { el.pause(); } catch (_) {} } return false; }
-    wrap.querySelectorAll(".ms-img-alt").forEach((n) => { if (n.tagName === "VIDEO") { try { n.pause(); } catch (_) {} } n.remove(); });  // 一律清干净，叠层只允许一张
-    wrap.append(el); cur = el; st.cur = el;
-    requestAnimationFrame(() => { if (cur === el && _masonryCarousel.get(card) === st) el.style.opacity = "1"; });
-    return true;
-  };
-  const tick = () => { if (!card.isConnected) { _stopCarousel(card); return; } if (loading) return; show(); };
-  const rearm = () => { if (_masonryCarousel.get(card) !== st) return;  // 停播后回来的帧不再排下一拍，否则留下一个没人回收的定时器
-    clearInterval(st.timer); st.timer = setInterval(tick, _MM_CAROUSEL_MS); };  // 以挂载时刻重排，保证每帧驻留均匀
-  const show = () => {
-    for (let tries = 0; tries < list.length; tries++) {
-      if (idx >= list.length) idx = 1;
-      const frame = list[idx] || [];
-      const src = String(frame[0] || ""), isVideo = !!frame[1];
-      if (isVideo && /^https?:|^file:/i.test(src)) {
-        // 视频帧：静音自动循环播放（C 站卡片行为）；file:/// 本地落盘视频离线可播
-        const v = document.createElement("video");
-        v.className = "ms-img ms-img-alt"; v.muted = true; v.loop = true; v.autoplay = true;
-        v.playsInline = true; v.preload = "metadata"; v.style.opacity = "1";
-        v.onerror = () => { if (cur === v) { try { v.pause(); } catch (_) {} v.remove(); if (cur === v) cur = null; } };
-        v.src = src;
-        if (mount(v)) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); }
-        idx = idx + 1; rearm(); return;
-      }
-      if (/^data:/i.test(src)) {
-        const alt = document.createElement("img");
-        alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
-        alt.style.opacity = "1";
-        alt.src = src;   // 本地 b64 立即可用
-        mount(alt);
-        idx = idx + 1; rearm(); return;
-      }
-      // 远程图帧：预载成功才切换（防空白遮主图）；失败记入 dead 跳过，不当场递归重试
-      if (dead.has(src)) { idx = idx + 1; continue; }
-      const pre = new Image();
-      let done = false;
-      const finish = (ok) => {
-        if (done) return;
-        done = true; loading = false;
-        if (!ok) { dead.add(src); return; }   // 本拍保持现状，下一拍由 tick 推进到后续帧
-        const alt = document.createElement("img");
-        alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
-        alt.style.opacity = "1";
-        alt.src = src;
-        mount(alt);
-        idx = idx + 1;
-        rearm();
-      };
-      pre.onload = () => finish(true);
-      pre.onerror = () => finish(false);
-      loading = true;
-      pre.src = src;
-      setTimeout(() => finish(false), 6000);   // 挂起帧 6s 超时跳过
-      return;
+  return st;
+}
+function _nextFrame(fn) {
+  let done = false;
+  const run = () => { if (done) return; done = true; fn(); };
+  try { window.requestAnimationFrame(() => run()); } catch (e) { /* 没有 rAF 就只靠超时 */ }
+  setTimeout(run, 48);   // rAF 不跑时（后台标签页、最小化窗口）也要把帧显出来，不能永远停在 opacity:0
+}
+function _carouselMount(st, el) {
+  // 归属检查：本轮已经停播（鼠标移开 / 卡片滚出视口）而预载才回来时，绝不能把帧挂上去——
+  // 那会在卡片上留下一张没人负责清理的孤儿叠图，直到下次重渲染才消失。
+  if (_masonryCarousel.get(st.card) !== st) { if (el.tagName === "VIDEO") { try { el.pause(); } catch (_) {} } return false; }
+  const prev = st.cur;
+  st.wrap.append(el);           // 新帧压在旧帧之上（同为 absolute inset:0，后插入的在上层）
+  st.cur = el;
+  // 关键：先按 CSS 的 opacity:0 插入，下一帧再抬到 1，过渡才会真的跑。
+  // 以前这里在 append 之前就把 style.opacity 写成 "1"，等于自己把淡入废掉了，所以切换很生硬。
+  _nextFrame(() => { el.style.opacity = "1"; });   // 超时兜底：后台标签页/最小化窗口里 rAF 不跑，否则叠层会永远停在 opacity:0
+  if (prev) {
+    // 旧帧保持不透明直到新帧淡到位再摘：交叉期间两张都半透明会透出底下的主封面，反而闪一下
+    let dropped = false;
+    const drop = () => {
+      if (dropped) return;
+      dropped = true;
+      if (prev.tagName === "VIDEO") { try { prev.pause(); } catch (_) {} }
+      prev.remove();
+    };
+    el.addEventListener("transitionend", drop, { once: true });
+    setTimeout(drop, _MM_FADE_MS + 260);   // 隐藏标签页里 transition 可能不派发，超时兜底
+  }
+  return true;
+}
+function _carouselRearm(st) {
+  if (_masonryCarousel.get(st.card) !== st) return;   // 停播后回来的帧不再排下一拍，否则留下无人回收的定时器
+  if (st.auto) return;                                // 自动模式的节拍归全局调度器，卡片自己不挂定时器
+  clearInterval(st.timer);
+  st.timer = setInterval(() => { if (!st.card.isConnected) { _stopCarousel(st.card); return; } _carouselAdvance(st); }, _MM_CAROUSEL_MS);
+}
+function _carouselAdvance(st) {
+  if (_masonryCarousel.get(st.card) !== st || st.loading) return;
+  const list = st.list;
+  const my = ++st.seq;    // 每次推进递增：预载回来时若已不是最新请求就丢弃
+  for (let tries = 0; tries < list.length; tries++) {
+    if (st.idx >= list.length) st.idx = 1;   // 主封面固定第 1 张，轮播从第 2 张起并在此回卷
+    const frame = list[st.idx] || [];
+    const src = String(frame[0] || ""), isVideo = !!frame[1];
+    if (isVideo && st.auto) { st.idx = st.idx + 1; continue; }   // 自动轮播不播视频帧：一屏多路解码不划算，悬停时才播
+    if (isVideo && /^https?:|^file:/i.test(src)) {
+      const v = document.createElement("video");
+      v.className = "ms-img ms-img-alt"; v.muted = true; v.loop = true; v.autoplay = true;
+      v.playsInline = true; v.preload = "metadata";
+      v.onerror = () => { if (st.cur === v) { try { v.pause(); } catch (_) {} v.remove(); st.cur = null; } };
+      v.src = src;
+      if (_carouselMount(st, v)) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); }
+      st.idx = st.idx + 1; _carouselRearm(st); return;
     }
-  };
-  st.timer = setInterval(tick, _MM_CAROUSEL_MS);  // 心跳先挂上：原来只有挂载成功才 rearm，首帧预载一失败就再也没有下一拍，轮播永久停摆
-  show();
+    if (/^data:/i.test(src)) {
+      const alt = document.createElement("img");
+      alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
+      alt.src = src;   // 本地 b64 立即可用
+      _carouselMount(st, alt);
+      st.idx = st.idx + 1; _carouselRearm(st); return;
+    }
+    if (st.dead.has(src)) { st.idx = st.idx + 1; continue; }
+    const pre = new Image();
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      if (my !== st.seq) return;   // 期间已另起一帧请求：这一份整体作废，也不去动它的 loading
+      st.loading = false;
+      if (!ok) { st.dead.add(src); st.idx = st.idx + 1; _carouselRearm(st); return; }   // 失败也要继续排拍，不能停摆
+      const alt = document.createElement("img");
+      alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
+      alt.src = src;
+      _carouselMount(st, alt);
+      st.idx = st.idx + 1;
+      _carouselRearm(st);
+    };
+    pre.onload = () => finish(true);
+    pre.onerror = () => finish(false);
+    st.loading = true;
+    pre.src = src;
+    setTimeout(() => finish(false), 6000);   // 挂起帧 6s 超时跳过
+    return;
+  }
+  st.idx = 1; _carouselRearm(st);   // 所有帧都不可用：继续排拍，别把这一轮卡死
+}
+function _startCarousel(card, path) {
+  const st = _carouselPlayer(card, path, false);
+  if (!st) return;
+  st.auto = false;                       // 悬停接管：改由这张卡自己的节拍驱动
+  if (!st.timer) _carouselRearm(st);
+  _carouselAdvance(st);                  // 立刻推进一帧，第一拍不等 3 秒
 }
 function _stopCarousel(card) {
   const st = _masonryCarousel.get(card);
   if (!st) return;
   clearInterval(st.timer);
-  _masonryCarousel.delete(card);   // 先摘登记：在途的预载回来时 mount() 会发现归属已变而丢弃这一帧
+  _masonryCarousel.delete(card);   // 先摘登记：在途的预载回来时挂载点会发现归属已变而丢弃这一帧
+  _autoPlayers.delete(card);
   const wrap = card.querySelector(".ms-img-wrap") || card;
-  wrap.querySelectorAll(".ms-img-alt").forEach((n) => { if (n.tagName === "VIDEO") { try { n.pause(); } catch (_) {} } n.remove(); });  // 按 DOM 清而不是只清 st.cur：历史上漏掉的孤儿叠图也顺手治好
+  wrap.querySelectorAll(".ms-img-alt").forEach((n) => { if (n.tagName === "VIDEO") { try { n.pause(); } catch (_) {} } n.remove(); });  // 按 DOM 清：淡入中的新帧与还没摘的旧帧一起收
   st.cur = null;
 }
+// 自动轮播：不悬停也换帧。每拍只挑一张在视口内、没被悬停、有多图帧的卡片推进一帧，
+// 整屏因此是"隔几秒动一处"而不是同时闪；挑中的顺序按游标轮转，转一圈每张卡片都会被换一次。
+let _autoCursor = 0, _autoTimer = null;
+function _mmAutoSweep() {
+  _autoPlayers.forEach((card) => {
+    if (!_masonryCarousel.get(card)) { _autoPlayers.delete(card); return; }
+    const b = card.getBoundingClientRect();
+    const inView = b.top < (window.innerHeight || 0) && b.bottom > 0;
+    if (!card.isConnected || !inView || card.matches(":hover")) { _stopCarousel(card); _autoPlayers.delete(card); }
+  });
+}
+function _mmAutoTick() {
+  if (!state.cfg || state.cfg.masonry_autoplay === false) return;
+  if (_reducedMotion() || document.hidden || !_masonryShown()) return;   // 后台标签页不偷偷拉图
+  _mmAutoSweep();
+  const cards = _visibleMasonryCards().filter((c) => {
+    if (c.matches(":hover")) return false;
+    const st = _masonryCarousel.get(c);
+    if (st && st.timer) return false;      // 悬停中的卡片归它自己的节拍
+    const frames = state.coverCacheMulti && state.coverCacheMulti.get(c.dataset.path || "");
+    return Array.isArray(frames) && frames.length >= 2;   // 只有一张的卡片挑中也无事发生，节拍就白空转
+  });
+  if (!cards.length) {
+    const any = _visibleMasonryCards();    // 一帧都没预取到时顺手催一次，下一拍就有得换
+    if (any.length) prefetchMultiForCards(any);
+    return;
+  }
+  if (_autoCursor >= cards.length) _autoCursor = 0;
+  const card = cards[_autoCursor++];
+  const path = card.dataset.path || "";
+  if (path && !state.coverCacheMulti.has(path)) prefetchMultiForCards([card]);
+  const st = _carouselPlayer(card, path, true);
+  if (!st) return;
+  st.auto = true;
+  _autoPlayers.add(card);
+  _carouselAdvance(st);
+}
+function _mmAutoSetInterval(on) {
+  if (on && !_autoTimer) _autoTimer = setInterval(_mmAutoTick, _MM_AUTO_MS);
+  else if (!on && _autoTimer) { clearInterval(_autoTimer); _autoTimer = null; }
+}
+_mmAutoSetInterval(true);
 document.addEventListener("mouseover", (e) => {
   const card = e.target && e.target.closest ? e.target.closest("#mmMasonry .ms-card") : null;
-  if (!card || _masonryCarousel.has(card)) return;
+  if (!card) return;
+  const st = _masonryCarousel.get(card);
+  if (st && st.timer) return;      // 已经是悬停节拍在跑，不重复起
   const path = card.dataset.path || "";
   // 首屏预取只覆盖当时可见的卡片；滚下来之前先 hover 到那张卡时就地补一次请求，
   // 拿到帧后 prefetchMultiForCards 会对仍在 :hover 的卡片自动起播。
   if (path && !state.coverCacheMulti.has(path)) prefetchMultiForCards([card]);
-  _startCarousel(card, path);
+  _startCarousel(card, path);      // 悬停接管：自动轮播留下的播放器直接升级成每 3 秒一帧的专属节拍
 });
 document.addEventListener("mouseout", (e) => {
   const card = e.target && e.target.closest ? e.target.closest("#mmMasonry .ms-card") : null;
@@ -4561,6 +4642,7 @@ const SETTING_FIELDS = [
   ["界面", "model_list_size", "模型列表大小", "select", [["3","完整 · 最大（当前样式）"],["2","紧凑 · 无封面/作者"],["1","极简 · 名称精简（信息列保留）"]]],
   ["界面", "masonry_info_mode", "瀑布流卡片介绍", "select", [["always","常驻介绍（当前样式）"],["slide","只看封面 · 悬停滑出介绍"],["fade","只看封面 · 悬停淡入介绍"]]],
   ["界面", "masonry_overlay_size", "悬浮介绍覆盖范围", "select", [["partial","卡片下方部分"],["full","整个卡片"]]],
+  ["界面", "masonry_autoplay", "瀑布流自动轮播：不悬停也换帧（每 3 秒只动一张卡片，会按需拉取 C 站缩略图；关闭后仅悬停时轮播）", "bool"],
   ["界面", "name_scroll_speed", "名称滚动速度（像素/秒）", "number"],
   ["界面", "name_scroll_start_pause", "名称滚动：开头停顿（毫秒）", "number"],
   ["界面", "name_scroll_end_pause", "名称滚动：末尾停顿（毫秒）", "number"],
@@ -4913,7 +4995,7 @@ $("#settingsForm").addEventListener("change", (e) => {
     api.call("save_config", { [key]: val }).then((ok) => {
       if (!ok) setStatus("外观已预览，保存失败，请重试");
     }).catch(() => setStatus("外观已预览，保存失败，请重试"));
-  } else if (["effects_fps_limit", "cache_original_images", "gallery_cache_mb", "zebra_rows", "masonry_info_mode", "masonry_overlay_size", "name_scroll_speed", "name_scroll_start_pause", "name_scroll_end_pause", "pointer_effects", "pointer_effect_quality", "cache_detail_images", "ui_font", "ui_text_size", "window_appearance", "integrated_titlebar", "folder_picker_show_paths"].includes(key)) {
+  } else if (["effects_fps_limit", "cache_original_images", "gallery_cache_mb", "zebra_rows", "masonry_info_mode", "masonry_overlay_size", "masonry_autoplay", "name_scroll_speed", "name_scroll_start_pause", "name_scroll_end_pause", "pointer_effects", "pointer_effect_quality", "cache_detail_images", "ui_font", "ui_text_size", "window_appearance", "integrated_titlebar", "folder_picker_show_paths"].includes(key)) {
     state.cfg[key] = val;
     if(key==="cache_original_images" && val===false && typeof clearViewerImageCache==="function")clearViewerImageCache();
     applyUiAppearance();

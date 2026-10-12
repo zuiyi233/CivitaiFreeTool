@@ -512,7 +512,7 @@ html[data-masonry-info]:not([data-masonry-info=always]) .ms-sub{display:block!im
 html:is([data-theme^=light],[data-theme=modern],[data-theme=metro][data-scheme=light])[data-masonry-info]:not([data-masonry-info=always]) .ms-info{background:rgba(255,255,255,.88);color:#16202d;}
 html:is([data-theme^=light],[data-theme=modern],[data-theme=metro][data-scheme=light])[data-masonry-info]:not([data-masonry-info=always]) .ms-info :is(.ms-sub,.ms-meta,.ms-size){color:#384555;}
 .ms-card:focus-visible{outline:2px solid var(--primary);outline-offset:2px;}
-@media(prefers-reduced-motion:reduce){html .ms-info{transition:none!important;}}
+@media(prefers-reduced-motion:reduce){html .ms-info{transition:none!important;}html .ms-img-alt{transition:none!important;}}
 
 /* Larger, readable hover text without changing the card or global UI scale. */
 html[data-masonry-info]:not([data-masonry-info=always]) .ms-info .ms-name{font-size:calc(15px * var(--type-scale,1));line-height:1.45;padding:6px 12px 4px;font-weight:650;}
