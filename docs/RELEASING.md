@@ -9,6 +9,9 @@
 5. 只提交应用源码、长期测试与发布文档；**不能上传 API Key、用户配置、任务/历史 JSON、图片缓存或用户模型/素材目录**。
 6. 正常推送 main，不强推。附件清单须绑定这次提交的完整 SHA。
 7. Release 附件为版本号 EXE、Windows 便携 ZIP、Chrome 扩展 ZIP、Firefox 扩展 ZIP、源码 ZIP、SHA256SUMS.txt；扩展 ZIP 的 manifest.json 必须位于根目录，不嵌套旧 ZIP。
+   - 便携 ZIP 用 `CivitaiFreeTool/` 单层根目录，内含 `CivitaiFreeToolWeb.exe`、`更新说明.md`、`使用说明.txt`、`chrome-extension/**`、`firefox-extension/**`；只放文件不放目录项，全部 deflate。两份说明**不在仓库里**：`更新说明.md` 由 `docs/releases/v<版本>.md` 精简成用户视角，`使用说明.txt` 只把版本号换掉、其余文案沿用。源码 ZIP 用 `git archive HEAD`（不加前缀，根级就是 `.github/`、`CHANGELOG.md`）。`SHA256SUMS.txt` 为 5 行 `<64位哈希>␣␣<文件名>`、按文件名排序、CRLF、无 BOM。
 8. `python scripts/release_github.py <版本> docs/releases/v<版本>.md --assets-dir <附件目录>` 只发布完整、哈希匹配的附件：先草稿，上传并验证远端 SHA256/大小，全部通过后才公开。出错保持草稿，不把“建了 Release”当作完成。
+9. 发到二开节点时用 `--repo <owner>/<name> --remote origin`，脚本会强制“发布目标与源码推送的仓库是同一个”，对不上就在取凭据之前中止；默认仍指官方仓库。发到 fork 时不要动 `upstream`。
+10. 发布后逐项核对，别把“脚本退出 0”当成完成：Release 的 `tag/draft/published_at/target_commitish` 与资产数、远端重新下载的 `SHA256SUMS.txt` 与本地逐字节一致、目标仓库上这次提交的 Actions 是否真的跑过。**fork 的 Actions 可能与主仓库不同步**——本项目 fork 上 `tests` 工作流状态是 active 但历史运行数为 0（同期主仓库 220 次），此时门禁只有本机全量回归，必须如实写明“CI 未在发布仓库上验证过”，不能拿主仓库的历史绿灯代替。
 
 认证使用环境变量或 Git Credential Manager，认证信息不写日志、源码、清单或聊天。Firefox 包未签名，仅支持临时加载；永久安装需要 Mozilla 签名。
