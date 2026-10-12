@@ -94,7 +94,7 @@ def read_mp4_meta(path, max_window_bytes=16*1024*1024):
 - 文本标签取值顺序（兼容矩阵，抄 Sidebar-Gallery 语义，不抄它的 PyAV）：容器 `udta` 优先，再逐 `trak`；键名依次 `©cmt` → `comment` → `©des` → `description`；`meta/ilst/©cmt/data` 需跳过 16 字节 data 头（`size(4) 'data' version+flags(4) locale(4)`）。独立 `prompt`/`workflow` 标签（`©cmt` 之外的 `udta` 直接子盒）同样接受。
 - comment 若是 JSON dict：只取其中 `prompt`/`workflow` 键（两种、单种、合并都接受）；不是 JSON 则当纯文本忽略（`note` 记录）。
 - `duration`：`mvhd`（version 0/1 两种时间基）；`width/height`：首个 `tkhd`（16.16 定点）；无 `stts` 计算 fps 需求 → 不实现 fps（二期再说，属偏差记录项）。
-- EBML（`.webm/.mkv`）v1 **不解析**，入库 `kind='video', has_meta=False`。
+- EBML（`.webm/.mkv`）v1 不解析；**第三轮起解析**（时长 / 帧率 / 宽高 / `Tags→comment` 的提示词与工作流），口径见 §21。
 
 ### 2.5 sidecar 兜底
 
@@ -312,7 +312,7 @@ def scan(self, roots, exclude=(), progress=None, cancel=None):
 |---|---|---|
 | DB 文件 | `<config.APP_DIR>/media_library.db` | 设计文档 §3 |
 | 图片扩展名 | `.png .jpg .jpeg .webp .gif` | §3.1 |
-| 视频扩展名 | `.mp4 .mov .webm .mkv`（后两者仅入库不解析） | §3.1 |
+| 视频扩展名 | `.mp4 .mov .webm .mkv`（webm/mkv 自第三轮起按 §21 解析 EBML） | §3.1 |
 | PNG 文本块 | 单块上限 8MB，最多 64 块，命中即停 | §2.3 |
 | mp4 窗口 | 整读 ≤16MB，否则首/尾各 16MB | §2.4 |
 | sidecar | 上限 8MB，`<base>.json` → `<base>.workflow.json` | §2.5 |
@@ -422,13 +422,14 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 
 ## 14. 验收状态（2026-10-12，第二轮更新）
 
-- 后端门禁：`python -m pytest -q` **649 passed / 50 subtests**（本功能前基线 398）；资源库用例 226 项 = 元数据 82（`test_media_meta.py`）+ 索引与扫描 102（`test_media_library.py`）+ RPC 层 42（`test_media_rpc.py`）。`node --check web/app.js` 与 `py_compile`（webui / media_library / media_meta / browser_bridge）全通过。
+- 后端门禁：`python -m pytest -q` **694 passed / 50 subtests**（本功能前基线 398）；资源库用例 267 项 = 元数据 121（`test_media_meta.py`，含 EBML 39 项）+ 索引与扫描 104（`test_media_library.py`，含定向补解析 2 项）+ RPC 层 42（`test_media_rpc.py`）。`node --check web/app.js` 与 `py_compile`（webui / media_library / media_meta / browser_bridge / scripts）全通过。
 - 真实库验收：`D:\ComfyUI_Mie_2026_V8.0\ComfyUI\output`（2792 条目、2260 图 / 532 视频、4.7GB，**全程只读**）——首扫解析 ~7s、增量重扫 0.2–2s；列表首屏（200 条 + 分面）190ms、续拉跳分面 45ms、分面聚合（带根作用域）130ms、FTS ~50ms；视频页并发 `/api/media` 由 ~200 路降到 1 路。覆盖率与延迟明细见 §15.0 与版本说明实测表。
 - 第二轮新增项的实数据验证：v1→v2 迁移 0.36 秒且逐列核对老数据一列未变；`extract_version` 自愈在真实库补解析 2035 行 / 31.1 秒，第二轮 182 毫秒空转，补完覆盖率与全新库逐字段相等；§17 搬家重连用真实库副本造改名（added 3 / relinked 3、旧行仍在、旧文件仍在磁盘时 relinked=0）；§18 标注导出 23ms（40 条 / 6.3KB）、导入试算 38ms、真写 45ms，**试算与真写六项计数逐项一致**。
 - 界面走查（浏览器模式真实页面，47531）：第一轮的扫描进度、网格与缩略图、类型 / 底模 / 标签 / 仅收藏 / 仅无元数据、关键词搜索、分组标题、标签建改删、收藏、详情视频播放与 seek（206）、模型引用跳转与未命中、分页续拉、`media_page_size` 生效之外，本轮补验：三组分面 chip 的真实计数与点击生效（euler（1023）→「筛选 1023 项 / 共 2799 项」）、时长备注「只匹配视频（图片没有时长字段）」、多选选 3 项批量收藏后统计条「收藏 3」、「选中筛选结果全部」跨分页取到 1023 个 id 并按 3 片 ×500 执行（状态行「1023 项生效」与服务端 `facets.starred=1023` 一致）、详情 `←`/`→` 走到 `3 / 200`、导出得 `资源库标注-20261012-2151.json`（3 条）、导入先出六项试算（含故意塞的 1 条认不出）再确认写入、标签「导入验收」按名字与颜色重建。控制台无 error。
 - 冻结产物复验（`dist/CivitaiFreeToolWeb.exe`，2.6.27 版本资源已同步）：用真实配置的只读副本 + 自造合成小库（`output_synth`）起实例，浏览器模式进资源库自动增量重扫、新界面全部在位；删除只走 UI 删自己的合成副本（2799 → 2797，D 盘 3 个同名原件完好）。
 - 窗口模式像素级复检（**原「未覆盖」项已补齐**）：同一冻结 EXE 以 pywebview 窗口模式开真实窗口（1266×783），桌面自动化截图核对——网格 4 列缩略图、三组 chip 行、时长输入 + 备注、导出 / 导入按钮、多选态的卡片勾选角标 + 选择行 + 操作提示条、详情面板（标题「资源详情」+ 位置 `1 / 200` + 前后翻页 / 关闭 + 字段区 +「生成参数按字段名提取」分组）均无重叠、无截断。**这一步查出一个结构检查看不见的问题**：尺寸组两行封顶后 37 个值只露 2 个，组内滚动条几乎无人发现 → 按 §20.3「分面溢出展开」补了控件并重打包复检：没溢出的组不挂控件（采样器 4 值），调度器 / 尺寸组挂「展开（共 5 项）」「展开（共 37 项）」，展开后该组独占一行、37 个值全部露出、文案变「收起」，再点回到与初始一致的两行版位。
 - 仍然只以结构证据代替的一步：自动化内置浏览器的 `visibilityState=hidden` 且视口高度为 0，「IntersectionObserver 真实进视口」在浏览器模式无法触发，用「250 张卡全部只有 `data-src`、`src` 数 0、`/api/media` 请求数 0，手动 hydrate 后 readyState=4 且解码出 832×480 首帧」代替，并在窗口模式的真实截图里复核了卡片首帧渲染；视频「播放中 seek」只在浏览器模式实测过 206，窗口模式验到挂载与首帧为止。
+- 第三轮（§21）验收：EBML 用 ffmpeg 现造样本与 ffprobe 对账（`webm/vp9 832x1248 24000/1001 5s`、`mkv/h264 640x480 30fps 3s`，时长 5.005/3.0、帧率 23.976/30.0、宽高逐位一致，`meta_source=ebml_tag`），并把同一份 comment 喂 mp4 通路做同形对照；冻结产物端到端复跑（临时根 4 文件：真实 png + 三种容器）统计条「共 4 项 图片 1 视频 3」、尺寸分面 `832x1248（3）+640x480（1）`、卡片时长 5.0/3.0/5.0 秒，真实窗口截屏确认渲染。详情长文本展开在真实 Chromium 量到折叠 `70/187` → 展开 `187/187`、文案与 `aria-pressed` 正确、`Enter` 后焦点留在控件；**它的窗口模式像素图当轮没做**（前台被全屏应用占住，未去抢输入），该缺口如实记在这里。页顶「webm 与 mkv 只入库、不解析元数据」的过时文案已改。
 - 批量 RPC 边界：`_LIB_BATCH_MAX=2000` 服务端拒超量、前端按 500 分片；未知 / 已消失 id 只过滤不报错（`_live_ids`）。测试数据：只用合成 PNG / mp4 字节与临时目录，真实库只读扫描，未删除任何用户文件。
 
 ## 15. 功能完善第二轮（v1.2，2026-10-12 实测驱动）
@@ -479,7 +480,7 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 
 ### 15.4 本轮明确不做（取舍写死）
 
-- **EBML（webm/mkv）元数据**：真实库 0 条，写出来没有验收样本；等真出现样本再做，届时扩展名白名单与 §3.1 一起改。
+- ~~**EBML（webm/mkv）元数据**~~：当时以「真实库 0 条、没有验收样本」缓做；**第三轮已实现**（§21），验收样本改用 ffmpeg 现造 + ffprobe 对账，不再依赖用户库里恰好有这类文件。其余三条取舍（JPEG EXIF、自动标签、伪造 negative）维持。
 - **JPEG EXIF/XMP 解析器**：756 张全是无标记的 `sha256_*.jpg`，为它们造解析器零收益。
 - **自动标签（底模即标签）**：沿用 §13.12 的两份真相问题，不做。
 - **伪造 negative**：现代工作流确实没有负面提示词（29/2792），不从采样参数以外的地方凑。
@@ -551,7 +552,7 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 - **同路径文件被就地替换且 mtime 不比旧值大**：对账只看 size+mtime，无内容哈希，元数据不会刷新。真实库里 756 张下载图按 sha256 命名不受影响，属低概率；补哈希的成本是每次扫描多读整片文件。
 - **`facets()` 的 loras 逐行 Python 解析**：2792 行 ~60ms 无压力，触及设计自设的 10 万级上限时才需要 EAV facts 索引（§3.2 已缓期的那条）。
 - **include/exclude 分面、批次聚合、对比视图、CLIP 以图搜图**：前者在 2792 规模收益不明确；后者要下模型跑 GPU，与本功能"stdlib + Pillow"的边界冲突，是另一个产品。
-- **§15.4 的取舍维持不变**（webm/mkv=0 条、jpg 全为无标记下载图、negative 仅 1% 不伪造、自动标签两份真相不做）。
+- **§15.4 的取舍**：jpg 全为无标记下载图、negative 仅 1% 不伪造、自动标签两份真相不做——这三条维持；webm/mkv 一条已在第三轮翻案（§21），理由是「用户以后会有」而不是「现在就有」。
 
 
 
@@ -583,8 +584,9 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 - 分面溢出展开（窗口模式像素复检后补）：`.lib-facet-opts` 默认两行封顶 + 组内滚动，但真实窗口 1266px 下尺寸组一屏只露 4 个值、滚动条几乎看不见。改为渲染后量一次真实溢出（`scrollHeight > clientHeight + 2`），**只在真没露全时**往 `.lib-facet-group` 追加 `[data-lib-facetmore]`（`.lib-facet-more`，`role=button` + `tabindex=0`，文案「展开（共 N 项）」/「收起」）。控件挂组上而不是滚动容器里——塞进容器它自己就落在折行以下，等于看不见。展开态是 `slot._open` + `.lib-facet-opts.is-open`（`max-height: min(60vh, 560px)`），并且 `.lib-facet-group:has(> .lib-facet-opts.is-open) { flex: 1 1 100% }` 让展开那一组独占一行（留在三列里展开会竖成一列，比折叠态更难扫）；重绘前记焦点、重绘后把焦点接回同一个控件（展开钮与 chip 都是被整个替换的元素）。并入重绘签名，`resize` 与进页时 `libFacetRemeasure()` 重量一次（隐藏态量到的是 0，会让判断停在旧布局）。委托顺序：`[data-lib-facetmore]` 在 `.lib-facet-chip[data-lib-facetval]` 之前判，两者互不误伤。
 - 多选与批量：`#libSelectMode` `#libSelRow` `#libSelState` `#libSelProg` `#libSelAllPage` `#libSelAllFilter` `#libSelClear` `#libSelBar` `#libSelBarCount` `#libSelStar` `#libSelUnstar` `#libSelTagAdd` `#libSelTagRemove` `#libSelReverse` `#libSelWorkflow` `#libSelDelete` `#libSelTagPop` `#libSelTagHint` `#libSelTagCount` `#libSelTagApply`，卡片勾选角标 `.ms-check` / `.cbox`（由 `#libGrid.lib-selecting` 控制显隐）。
 - 标注转移：`#libExportAnn` `#libImportAnn` `#libImportFile`。
+- 详情长文本展开（正面 / 负面提示词共用 `libDetailDescHtml` + `libFillDescMore`）：正文块加 `.lib-desc`（折叠态 `#detailPanel .detail-desc.lib-desc { max-height: calc(13px*1.8*3*var(--type-scale,1)); overflow:hidden }`），**共享类 `.detail-desc` 的全局行为不动**（模型库详情也在用，它是 180px 固定高滚动框）。控件 `#detailPanel` 内的 `[data-lib-descmore]`（`.lib-desc-more`）与正文块**同级**挂在 `.dt-sec` 里，文案「展开全文（共 N 字）」/「收起」，`role=button` + `tabindex=0` + `aria-pressed`，`Enter`/`Space` 与鼠标同权，重画后焦点接回；展开态 `min(60vh, 560px)` + 块内滚动，所以 `title` 里如实写「没看全就滚动」，不承诺「展开即全文」。三条硬口径：① 必须在详情浮层 `display:flex` **之后**量（隐藏态 `scrollHeight`/`clientHeight` 都是 0，会误判成没溢出）；② 内嵌 `@font-face` 换字会改行高，`document.fonts.ready` 后用同一个判定重测一次，令牌 `lib.detailRequest` 对不上或已离开资源库页就不动 DOM；③ 展开态按 `String(detail.id)` 存在 `lib.descOpen` + `lib.descOpenId`，翻页换条目与关详情都回折叠态。空正文（只有占位文案）与没溢出的正文一律不挂控件。
 - 详情翻页：`#libDetailPos` `#libDetailPrev` `#libDetailNext`（详情头动态生成）。
-- 对应状态键：`lib.filters.{samplers,schedulers,sizes,duration_min,duration_max}`、`lib.{selectMode,sel,selAnchor,byId,prog,batchRunning,selTagIds,selTagMode,selFetching,selFetchToken}`。
+- 对应状态键：`lib.filters.{samplers,schedulers,sizes,duration_min,duration_max}`、`lib.{selectMode,sel,selAnchor,byId,prog,batchRunning,selTagIds,selTagMode,selFetching,selFetchToken,descOpen,descOpenId}`。
 
 ### 20.4 延迟实测（真实库 2792 + 合成根 7 = 2799 条，同机同盘）
 
@@ -600,6 +602,26 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 | 搬家重连扫描 | 0.28 s（3 行重连，收藏与标签到位，旧行保留） |
 
 给分面加 `(root_id, col)` 复合部分索引实测只把 133ms 降到 128ms（噪声级），**不做**；首屏 190ms 里那 130ms 是分面本身，翻页已经跳过。真要再压只能按查询签名缓存分面，本期不引入这层状态。
+
+## 21. 第三轮：EBML 解析与详情长文本展开（v1.3，2026-10-13）
+
+### 21.1 `media_meta.py`：`.webm` / `.mkv` 的 EBML（`EXTRACT_VERSION = 3`）
+
+纯 stdlib 流式读取，风格与 `read_mp4_meta` 一致：不抛异常、畸形输入降级为部分结果、有读取上限、不整文件读进内存。
+
+1. **元素 ID 以实测钉死**（两条曾被按记忆写错过，用真实文件才试得出来）：`Segment 0x18538067`、`Info 0x1549A966`、`TimecodeScale 0x2AD7B1`、`Duration 0x4489`、**`Tracks 0x1654AE6B`**（不是 0x1654AE67）、`TrackEntry 0xAE`、`TrackType 0x83`、`DefaultDuration 0x23E383`、`Video 0xE0`、`PixelWidth 0xB0`、`PixelHeight 0xBA`、`DisplayWidth 0xB5` / `DisplayHeight 0xB6`、**`Tags 0x1254C367`**（不是 0x1254C076）、`Tag 0x7373`、`SimpleTag 0x67C8`、`TagName 0x45A3`、`TagString 0x4487`、`Cluster 0x1F43B675`。ID 与数据长度都是变长（前导零位数定长；`0xFF...` 表未知长度）。不依赖 `SeekHead` / `Cues`。
+2. **时长**：`duration = TimecodeScale × Duration / 1e9`（`TimecodeScale` 缺省 1,000,000）。`Duration` 的 FLOAT **宽度不固定**：4 / 8 字节都常见，0 / 1 / 2 字节的畸形实现按 IEEE 754 高位补零处理；解出非正或 `>= 1e9` 秒的一律丢弃。
+3. **帧率**：视频轨（`TrackType == 1`）的 `DefaultDuration` **单位是纳秒**，`fps = 1e9 / DefaultDuration`，保留 3 位（实测 ffmpeg 24000/1001→41708375、25→40000000、30→33333333 都能精确还原；按 `1e6/DD` 会得到 0.008–0.024 的荒谬值）。合法区间 `0.01 <= fps <= 10000`，越界或拿不到都留 `None`，**不默认 30**。
+4. **宽高**：同一条视频轨 `Video → PixelWidth/PixelHeight`；只有 `DisplayWidth/DisplayHeight` 时也接受，并在 `extra.ebml.sizing = "display"` 标出来。
+5. **提示词 / 工作流**：`Tags → Tag → SimpleTag`，`TagName` 大小写不敏感命中白名单 `comment|description|title|prompt|workflow`，取值优先序 `comment → title → description → prompt → workflow`；值就是 mp4 `©cmt` 那条路的同一个 `{"prompt":…,"workflow":…}` JSON，**必须复用同一个后处理入口**（`_absorb`），所以 `prompt/negative/checkpoint/loras/models/seed/steps/cfg/sampler/scheduler` 的语义与 mp4 完全同形，差异只在 `source = "ebml_tag"`。**不读 Segment 级 `Title(0x7BA9)`**：ffmpeg 的 `-metadata title=` 落在那里，而 ComfyUI / VHS 写 `comment`；把随机库的标题也当 JSON 试只会误报「不是 ComfyUI 文本记录」。
+6. **窗口与上限**：`MAX_EBML_ELEMENTS = 20000`、`MAX_EBML_READ_BYTES = 8MB`、`MAX_EBML_LEAF_BYTES = 4MB`（更大的叶子＝附件/字幕，跳过不读）。`Cluster` 按声明长度整块跳过；未知长度的 Cluster 只能逐个子元素读到下一个顶层元素，靠 `MAX_EBML_ELEMENTS` 兜住不死循环。`Info` 通常在头部，`Tags` 有的封装器写在最后一个 Cluster 之后 → 头部窗口没拿到标签时再扫尾部窗口。
+7. **provenance**：`extra.ebml = {doctype, segment_found, window(whole|head+tail), elements, clusters, read_bytes, used[实际取值的元素名], tags[命中的 TagName], tags_at(whole|head|tail), [sizing], [big_leaves], [stopped]}`。旧的 `"v1 不解析 EBML"` 字符串不再存在。
+8. **升级自愈改成定向口径**：`media_library._EXTRACT_SCOPED_REPARSE = {3: (".webm", ".mkv")}` + `_stale_reparse_stmt(current, version)`。跨过的版本里只要有一个是「整库级」改动就退回整库补解析（宁可多标不可漏标）；全是定向版本时只 `WHERE ext IN (...)`。**理由**：真实库 2792 行里 webm/mkv 是 0 个，为这一版让全库重解析是实测 2035 行 / 31 秒的纯浪费。
+9. **验收样本**（用户库里 0 条，所以自己造真样本对账）：ffmpeg 生成 `webm/vp9 832x1248 24000/1001 5s` 与 `mkv/h264 640x480 30fps 3s`，`-metadata comment=` 写入 ComfyUI 形状 JSON；与 ffprobe 对账 `duration 5.005 / 3.0`、`fps 23.976 / 30.0`、宽高逐位一致，`comment` 里的 `seed/steps` 回收成功。同一份 comment 喂 mp4 通路得到同样的字段（差异只在 `source`），证明「复用同一入口」不是口号。
+
+### 21.2 详情长文本展开的实测数字（口径见 §20.3）
+
+真实库条目：3464 字提示词折叠 `clientHeight 70 / scrollHeight 1497` → 展开 `403 / 1497`（60vh 上限，块内可滚）；418 字条目 `70 / 187` → 展开 `187 / 187` → 再点回 `70`；36 字条目 `23 / 23` **不挂控件**；无提示词条目只有占位文案、不挂控件；`←/→` 翻页与关详情重开都回到折叠态；`Enter` / `Space` 与鼠标同权且焦点留在控件上；同面板里非 `lib-desc` 的 `.detail-desc` computed 仍是 `180px / auto`（共享类未动）。**负面提示词**：真实库 0 条带 negative，该分支是用页面内注入 1233 字长文本走同一个 helper 验的，没有真实样本这一点如实记下。
 
 ## 12. 补充钉死（A4/A5 共用，与 §6/§9 同权重）
 
