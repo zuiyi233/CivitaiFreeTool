@@ -420,13 +420,16 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 13. **两种界面模式的海报抓帧都可用**（实测）：浏览器模式 `http://127.0.0.1:port` 页面 + `url_http` 同源，canvas 可直接回传（已落盘 23 张海报验证）；窗口模式（pywebview，`file://` 页面 + `url_local` 的 `file:///` 视频）用一个等价探针页确认 Blink 允许 `file → file` 视频绘入 canvas 并 `toDataURL()` 成功，不会被跨源污染挡掉。因此不需要为窗口模式另设海报通路；若哪天某个 WebView2 版本收紧该规则，表现是海报缓存不增长、卡片仍走懒挂载的 `<video>` 直显，功能不坏。
 14. **移出配置的根目录不再产生幽灵卡片**：`media_roots` 里删掉一个目录后，它已入库的行原先仍会出现在网格与分面计数里，点开却是打不开的文件。现在 `media_library.root_id(abs)` 暴露与扫描同一套根哈希，`Api._media_root_ids()` 按**服务端**当前配置注入 `flt["root_ids"]`（客户端传来的同名键一律覆盖，前端无法自行放宽范围），`_build_where` 与 `facets(root_ids=)` 统一用 `root_id IN (?)` 限定作用域。行本身不删（30 天清理只针对文件真的消失），把目录加回配置即恢复，标签与收藏不丢。实测（冻结 EXE + 浏览器模式真实页面）：库内 2795 行，其中 3 行属已移出的 `L:\tmp\execheck\output`，页面显示「共 2792」，`bare.png` / `a.png` / `clip.mp4` 不再出现，kinds 2260+532=2792 自洽，伪造 `root_ids` 的请求仍返回 2792。
 
-## 14. 验收状态（2026-10-12）
+## 14. 验收状态（2026-10-12，第二轮更新）
 
-- 后端门禁：`python -m pytest -q` 578 passed / 50 subtests（本功能前基线 398）；新增 180 项资源库用例。
-- 真实库验收：`D:\ComfyUI_Mie_2026_V8.0\ComfyUI\output`（2792 条目、2260 图 / 532 视频、4.7GB）——首扫解析 ~7s、增量重扫 0.2–2s、列表 ~110ms、分面 ~100ms、FTS ~50ms；视频页并发 `/api/media` 由 ~200 路降到 1 路；元数据覆盖见 §13.1。
-- 界面走查（浏览器模式真实页面）：扫描进度、网格与缩略图、类型 / 底模 / 标签 / 仅收藏 / 仅无元数据筛选、关键词搜索、分组标题、标签建改删、收藏、详情视频播放与 seek（206）、模型引用跳转与未命中提示、分页续拉、`media_page_size` 生效、控制台无报错。
-- 冻结产物复验（`dist/CivitaiFreeToolWeb.exe`，2.6.27 版本资源已同步）：浏览器模式真实页面重扫得「新增 0 · 更新 0 · 共 2792」，首屏 200 卡，§13.14 的根作用域生效（3 行幽灵不再出现），控制台仅字体 `Slow network` info、无 error。
-- **未覆盖**：内置浏览器 `visibilityState=hidden` 且视口高度为 0，截图与「IntersectionObserver 真实进视口」这两步只能以结构证据代替；像素级观感（卡片间距、角标位置、明暗主题下的对比）需人工开一次窗口确认。
+- 后端门禁：`python -m pytest -q` **649 passed / 50 subtests**（本功能前基线 398）；资源库用例 226 项 = 元数据 82（`test_media_meta.py`）+ 索引与扫描 102（`test_media_library.py`）+ RPC 层 42（`test_media_rpc.py`）。`node --check web/app.js` 与 `py_compile`（webui / media_library / media_meta / browser_bridge）全通过。
+- 真实库验收：`D:\ComfyUI_Mie_2026_V8.0\ComfyUI\output`（2792 条目、2260 图 / 532 视频、4.7GB，**全程只读**）——首扫解析 ~7s、增量重扫 0.2–2s；列表首屏（200 条 + 分面）190ms、续拉跳分面 45ms、分面聚合（带根作用域）130ms、FTS ~50ms；视频页并发 `/api/media` 由 ~200 路降到 1 路。覆盖率与延迟明细见 §15.0 与版本说明实测表。
+- 第二轮新增项的实数据验证：v1→v2 迁移 0.36 秒且逐列核对老数据一列未变；`extract_version` 自愈在真实库补解析 2035 行 / 31.1 秒，第二轮 182 毫秒空转，补完覆盖率与全新库逐字段相等；§17 搬家重连用真实库副本造改名（added 3 / relinked 3、旧行仍在、旧文件仍在磁盘时 relinked=0）；§18 标注导出 23ms（40 条 / 6.3KB）、导入试算 38ms、真写 45ms，**试算与真写六项计数逐项一致**。
+- 界面走查（浏览器模式真实页面，47531）：第一轮的扫描进度、网格与缩略图、类型 / 底模 / 标签 / 仅收藏 / 仅无元数据、关键词搜索、分组标题、标签建改删、收藏、详情视频播放与 seek（206）、模型引用跳转与未命中、分页续拉、`media_page_size` 生效之外，本轮补验：三组分面 chip 的真实计数与点击生效（euler（1023）→「筛选 1023 项 / 共 2799 项」）、时长备注「只匹配视频（图片没有时长字段）」、多选选 3 项批量收藏后统计条「收藏 3」、「选中筛选结果全部」跨分页取到 1023 个 id 并按 3 片 ×500 执行（状态行「1023 项生效」与服务端 `facets.starred=1023` 一致）、详情 `←`/`→` 走到 `3 / 200`、导出得 `资源库标注-20261012-2151.json`（3 条）、导入先出六项试算（含故意塞的 1 条认不出）再确认写入、标签「导入验收」按名字与颜色重建。控制台无 error。
+- 冻结产物复验（`dist/CivitaiFreeToolWeb.exe`，2.6.27 版本资源已同步）：用真实配置的只读副本 + 自造合成小库（`output_synth`）起实例，浏览器模式进资源库自动增量重扫、新界面全部在位；删除只走 UI 删自己的合成副本（2799 → 2797，D 盘 3 个同名原件完好）。
+- 窗口模式像素级复检（**原「未覆盖」项已补齐**）：同一冻结 EXE 以 pywebview 窗口模式开真实窗口（1266×783），桌面自动化截图核对——网格 4 列缩略图、三组 chip 行、时长输入 + 备注、导出 / 导入按钮、多选态的卡片勾选角标 + 选择行 + 操作提示条、详情面板（标题「资源详情」+ 位置 `1 / 200` + 前后翻页 / 关闭 + 字段区 +「生成参数按字段名提取」分组）均无重叠、无截断。**这一步查出一个结构检查看不见的问题**：尺寸组两行封顶后 37 个值只露 2 个，组内滚动条几乎无人发现 → 按 §20.3「分面溢出展开」补了控件并重打包复检：没溢出的组不挂控件（采样器 4 值），调度器 / 尺寸组挂「展开（共 5 项）」「展开（共 37 项）」，展开后该组独占一行、37 个值全部露出、文案变「收起」，再点回到与初始一致的两行版位。
+- 仍然只以结构证据代替的一步：自动化内置浏览器的 `visibilityState=hidden` 且视口高度为 0，「IntersectionObserver 真实进视口」在浏览器模式无法触发，用「250 张卡全部只有 `data-src`、`src` 数 0、`/api/media` 请求数 0，手动 hydrate 后 readyState=4 且解码出 832×480 首帧」代替，并在窗口模式的真实截图里复核了卡片首帧渲染；视频「播放中 seek」只在浏览器模式实测过 206，窗口模式验到挂载与首帧为止。
+- 批量 RPC 边界：`_LIB_BATCH_MAX=2000` 服务端拒超量、前端按 500 分片；未知 / 已消失 id 只过滤不报错（`_live_ids`）。测试数据：只用合成 PNG / mp4 字节与临时目录，真实库只读扫描，未删除任何用户文件。
 
 ## 15. 功能完善第二轮（v1.2，2026-10-12 实测驱动）
 
@@ -551,6 +554,52 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 - **§15.4 的取舍维持不变**（webm/mkv=0 条、jpg 全为无标记下载图、negative 仅 1% 不伪造、自动标签两份真相不做）。
 
 
+
+## 20. 本轮接口与界面增量（覆盖 §5.2 的方法清单，§5.2 的表以本节 + §13.2 为准）
+
+### 20.1 新增 RPC（`lib_` 前缀，反射可见）
+
+| 方法 | 签名 | 返回 |
+|---|---|---|
+| `lib_set_star_batch` | `(ids_json:str, on:bool)` | `{"ok":bool,"count":int}` |
+| `lib_tag_add_batch` | `(ids_json:str, tag_ids_json:str)` | `{"ok":bool,"count":int,"tags":{item_id:[§5.1 tags]}}`（并集） |
+| `lib_tag_remove_batch` | `(ids_json:str, tag_ids_json:str)` | 同上形状（只摘指定标签） |
+| `lib_delete_batch` | `(ids_json:str)` | `{"ok":bool,"deleted":int,"missing":int}`；一次回收站调用，仍不连带 `.json` |
+| `lib_export_annotations` | `()` | `{"ok":bool,"count":int,"data":§18 档案}` |
+| `lib_import_annotations` | `(payload_json:str, dry_run:bool=True)` | `{"ok":bool,…stats}`；库层回 `msg` 时 `ok` 必为 false |
+
+- `ids_json` 是 id 数组的 JSON 字符串；服务端单次上限 `_LIB_BATCH_MAX = 2000`，前端按 `LIB_BATCH_CHUNK = 500` 分片。
+- 入参闸门（非数组 / 空 / 坏 JSON / 全非正整数 / 超限）一律 `ok:false` 且**一次库调用都不发**。
+
+### 20.2 `lib_list` 的入参与回包增量
+
+- `flt` 新键：`samplers`、`schedulers`、`sizes`（`"WxH"`）、`duration_min`、`duration_max`、`with_facets`。
+- 回包新键：`facets_skipped`（bool）。`with_facets` 传 `0/false/no/""` 时**不算分面**并回 `facets:{}`；前端只在首屏、筛选变化与写操作后带分面，续拉分页跳过。
+- `detail` 里超过 2^53 的 `seed` 以字符串下发（JS number 会掉精度；真实库实测 0 行命中，属防御口径）。
+
+### 20.3 新增 DOM id（§9.1 清单之外）
+
+- 分面与时长：`#libSamplerFacet` `#libSchedulerFacet` `#libSizeFacet` `#libDurMin` `#libDurMax`，筛选组类 `.lib-facet-group/-title/-opts/-empty/-chip`（chip 本体复用 `.lib-chips` / `.lib-chip[aria-pressed]` / `.lib-chip-x`）。
+- 分面溢出展开（窗口模式像素复检后补）：`.lib-facet-opts` 默认两行封顶 + 组内滚动，但真实窗口 1266px 下尺寸组一屏只露 4 个值、滚动条几乎看不见。改为渲染后量一次真实溢出（`scrollHeight > clientHeight + 2`），**只在真没露全时**往 `.lib-facet-group` 追加 `[data-lib-facetmore]`（`.lib-facet-more`，`role=button` + `tabindex=0`，文案「展开（共 N 项）」/「收起」）。控件挂组上而不是滚动容器里——塞进容器它自己就落在折行以下，等于看不见。展开态是 `slot._open` + `.lib-facet-opts.is-open`（`max-height: min(60vh, 560px)`），并且 `.lib-facet-group:has(> .lib-facet-opts.is-open) { flex: 1 1 100% }` 让展开那一组独占一行（留在三列里展开会竖成一列，比折叠态更难扫）；重绘前记焦点、重绘后把焦点接回同一个控件（展开钮与 chip 都是被整个替换的元素）。并入重绘签名，`resize` 与进页时 `libFacetRemeasure()` 重量一次（隐藏态量到的是 0，会让判断停在旧布局）。委托顺序：`[data-lib-facetmore]` 在 `.lib-facet-chip[data-lib-facetval]` 之前判，两者互不误伤。
+- 多选与批量：`#libSelectMode` `#libSelRow` `#libSelState` `#libSelProg` `#libSelAllPage` `#libSelAllFilter` `#libSelClear` `#libSelBar` `#libSelBarCount` `#libSelStar` `#libSelUnstar` `#libSelTagAdd` `#libSelTagRemove` `#libSelReverse` `#libSelWorkflow` `#libSelDelete` `#libSelTagPop` `#libSelTagHint` `#libSelTagCount` `#libSelTagApply`，卡片勾选角标 `.ms-check` / `.cbox`（由 `#libGrid.lib-selecting` 控制显隐）。
+- 标注转移：`#libExportAnn` `#libImportAnn` `#libImportFile`。
+- 详情翻页：`#libDetailPos` `#libDetailPrev` `#libDetailNext`（详情头动态生成）。
+- 对应状态键：`lib.filters.{samplers,schedulers,sizes,duration_min,duration_max}`、`lib.{selectMode,sel,selAnchor,byId,prog,batchRunning,selTagIds,selTagMode,selFetching,selFetchToken}`。
+
+### 20.4 延迟实测（真实库 2792 + 合成根 7 = 2799 条，同机同盘）
+
+| 路径 | 实测 |
+|---|---|
+| `lib_list` 首屏 200 条（含分面） | 190 ms |
+| `lib_list` 续拉 200 条（`with_facets=0`） | 45 ms |
+| `facets()` 不带作用域 / 带 `root_ids` | 62 ms / 130 ms |
+| `list_items(200)` / `_lib_enrich×200` / `json.dumps` | 15 / 8 / 1 ms |
+| v1 → v2 迁移 | 0.36 s（老列逐列核对未变） |
+| 升级后补解析扫描 | 31.1 s（重解析 2035 行，跳过 757 行）；第二轮 182 ms |
+| 标注导出 40 条 / 导入试算 / 真写 | 23 / 38 / 45 ms（试算与真写计数逐项一致） |
+| 搬家重连扫描 | 0.28 s（3 行重连，收藏与标签到位，旧行保留） |
+
+给分面加 `(root_id, col)` 复合部分索引实测只把 133ms 降到 128ms（噪声级），**不做**；首屏 190ms 里那 130ms 是分面本身，翻页已经跳过。真要再压只能按查询签名缓存分面，本期不引入这层状态。
 
 ## 12. 补充钉死（A4/A5 共用，与 §6/§9 同权重）
 
