@@ -4,10 +4,29 @@ from pathlib import Path
 import urllib.request,urllib.error
 from urllib.parse import quote,urlsplit
 ROOT=Path(__file__).resolve().parents[1]
-API='https://api.github.com/repos/ADVICEsama/CivitaiFreeTool'
+DEFAULT_REPO='ADVICEsama/CivitaiFreeTool'      # 默认仍指官方；二开自测发布用 --repo 指定自己的 fork
 
 def git(*args):
     return subprocess.check_output(['git','-c','safe.directory='+str(ROOT),'-C',str(ROOT),*args],text=True).strip()
+
+def normalize_repo(value):
+    """只接受 owner/name；顺手容忍用户贴进来的完整仓库 URL。"""
+    repo=str(value or '').strip().rstrip('/')
+    if repo.startswith(('http://','https://','git@','ssh://')):
+        parts=[p for p in repo.replace(':','/').split('/') if p]
+        repo='/'.join(parts[-2:]) if len(parts)>=2 else ''
+    if repo.endswith('.git'):repo=repo[:-4]
+    if repo.count('/')!=1 or not all(repo.split('/')):raise RuntimeError('目标仓库要写成 owner/name：'+str(value))
+    return repo
+
+def remote_repo(remote):
+    """从 git remote URL 取 owner/name（https 与 ssh 两种写法都支持）。"""
+    url=str(git('remote','get-url',remote) or '').strip().rstrip('/')
+    if not url:return ''
+    parts=[p for p in url.replace(':','/').split('/') if p]
+    if len(parts)<2:return ''
+    if parts[-1].endswith('.git'):parts[-1]=parts[-1][:-4]
+    return '/'.join(parts[-2:])
 
 def authentication():
     value=os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
@@ -25,9 +44,15 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('version');parser.add_argument('notes');parser.add_argument('--assets-dir',type=Path,required=True)
+    parser.add_argument('--repo',default=DEFAULT_REPO,help='发布目标仓库 owner/name（二开发布填自己的 fork；默认官方）')
+    parser.add_argument('--remote',default='origin',help='源码推送的 git remote 名，用来强制"代码与发布同一个仓库"')
     args=parser.parse_args();version=args.version.lstrip('v');tag='v'+version
-    head=git('rev-parse','HEAD');remote=git('ls-remote','origin','refs/heads/main').split()[0]
-    if remote!=head:raise RuntimeError('origin/main 未包含当前提交；请先安全推送源码')
+    repo=normalize_repo(args.repo);api='https://api.github.com/repos/'+repo
+    head=git('rev-parse','HEAD');remote=git('ls-remote',args.remote,'refs/heads/main').split()[0]
+    if remote!=head:raise RuntimeError(args.remote+'/main 未包含当前提交；请先安全推送源码')
+    # 发布目标必须就是源码推过去的那个仓库：以前 API 地址写死官方、remote 却是 fork，两边对不上也没人报警
+    pushed=remote_repo(args.remote)
+    if pushed.lower()!=repo.lower():raise RuntimeError('目标仓库 %s 与 %s 指向的 %s 不一致；发布与源码推送必须同一个仓库'%(repo,args.remote,pushed or '(取不到)'))
     manifest=json.loads((args.assets_dir/'release_assets.json').read_text(encoding='utf-8'))
     if manifest['version']!=version or manifest['commit']!=head:raise RuntimeError('附件清单与版本或源码提交不一致')
     required={'CivitaiFreeToolWeb-'+version+'.exe','CivitaiFreeTool-Windows-'+tag+'.zip','CivitaiFreeTool-ChromeExtension-'+tag+'.zip','CivitaiFreeTool-FirefoxExtension-'+tag+'.zip','CivitaiFreeTool-Source-'+tag+'.zip','SHA256SUMS.txt'}
@@ -44,10 +69,10 @@ def main():
         req=urllib.request.Request(url,data=payload,headers=headers,method=method or ('POST' if payload else 'GET'))
         if payload:req.add_header('Content-Type','application/json')
         with opener.open(req,timeout=90) as r:return json.load(r)
-    try:release=request(API+'/releases/tags/'+tag)
+    try:release=request(api+'/releases/tags/'+tag)
     except urllib.error.HTTPError as e:
         if e.code!=404:raise
-        release=request(API+'/releases',{'tag_name':tag,'target_commitish':head,'name':'CivitaiFreeTool '+tag,'body':Path(args.notes).read_text(encoding='utf-8-sig'),'draft':True,'prerelease':False})
+        release=request(api+'/releases',{'tag_name':tag,'target_commitish':head,'name':'CivitaiFreeTool '+tag,'body':Path(args.notes).read_text(encoding='utf-8-sig'),'draft':True,'prerelease':False})
     print('校验发布:',release['html_url'],flush=True)
     existing={a['name']:a for a in release.get('assets',[])};verified=[]
     for a in manifest['assets']:
@@ -66,7 +91,7 @@ def main():
                 for chunk in iter(lambda:r.read(1024*1024),b''):sha.update(chunk)
             if sha.hexdigest()!=a['sha256']:raise RuntimeError('远端下载校验失败: '+a['name'])
         verified.append({'name':a['name'],'size':a['size'],'sha256':a['sha256'],'url':asset['browser_download_url']});print('附件已校验:',a['name'],flush=True)
-    if release.get('draft'):release=request(API+'/releases/'+str(release['id']),{'draft':False},method='PATCH')
+    if release.get('draft'):release=request(api+'/releases/'+str(release['id']),{'draft':False},method='PATCH')
     receipt={'version':version,'commit':head,'url':release['html_url'],'draft':release['draft'],'verified_assets':verified}
     (args.assets_dir/'github-release-receipt.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps({'url':receipt['url'],'draft':receipt['draft'],'attachments':len(verified)},ensure_ascii=False),flush=True)
