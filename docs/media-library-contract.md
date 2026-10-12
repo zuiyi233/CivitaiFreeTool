@@ -45,7 +45,7 @@ def extract(path, ext=None, max_chunk_bytes=8*1024*1024, max_window_bytes=16*102
 ```python
 {
   "has_meta": bool,          # 只要拿到 prompt/workflow 之一即 True
-  "source": str,             # 'png_text' | 'webp_exif' | 'mp4_udta' | 'sidecar' | 'none'
+  "source": str,             # 'png_text' | 'webp_exif' | 'jpeg_exif' | 'mp4_udta' | 'sidecar' | 'none'
   "prompt": str, "negative": str, "note": str,
   "checkpoint": str,         # 底模文件名（带扩展名，basename，无则 ''）
   "loras": [str],            # LoRA 文件名列表（basename）
@@ -396,6 +396,28 @@ A4 新增 CSS 仅限：`.lib-card` 差异（视频角标定位、`?` 元数据�
 4. §2 参考项目 Sidebar-Gallery 的 mp4 读取实为 PyAV（**不是**纯 atom 解析）→ 本项目自研 atom 读取，兼容矩阵照其语义；其 fps 提取（stts）本期不做。
 5. §5 「~10 个 RPC」→ 16 个（分面/标签/海报回传各自独立，合并反而增加协议分支）。
 6. 新增 `/api/media` Range 流式端点：设计文档未提，但浏览器模式（http origin）下 `file:///` 不可用，且既有 `_local_video_uri` 明确只在 pywebview 下生效 —— 无此端点则浏览器模式视频无法播放。
+
+## 13. 实机验收后的修订（v1.1，2026-10-12）
+
+在用户的真实库上验收（`D:\ComfyUI_Mie_2026_V8.0\ComfyUI\output`，2792 个在库条目：2260 图 / 532 视频，4.7GB），并做了一轮独立质量复核，以下以实测为准修订本契约：
+
+1. **元数据覆盖按字段名回收（新增 §2.6）。** 实测发现 1129/2792（40%）条目虽有内嵌 workflow 却提不出提示词与底模：这些工作流走 `SamplerCustomAdvanced` + `BasicGuider.conditioning` + 自定义节点（如 `MiniMaxH3ReferenceToVideo.prompt`、`H3VMMasterLoader.unet_name`、`CLIPLoader.clip_name`），而 `image_gallery.comfy_generation` 只从 KSampler 家族的 `positive` 链出发。`media_meta` 增加**纯字段名**兜底层（不猜节点语义、不改 `comfy_metadata` 的“未知节点不猜”原则）：
+   - 底模 `ckpt_name|unet_name|diffusion_model`，LoRA `lora_name|lora_*|*_lora`（值须落在 `comfy_metadata.WEIGHT_SUFFIXES`）；
+   - 提示词 `prompt|text|caption|positive_text`，跳过 Note/Markdown/TextPanel/Primitive*/Comfy*Expression/Reroute/AnythingIndex 类文档节点，去重后以 `" | "` 连接、上限 4000 字，**不**据此伪造 negative；
+   - 链式结果优先，兜底只在链式为空时生效，并把来源写进 `extra`：`prompt_source`=`chain|name_fallback`、`classification_source`=`chain|field_name`；UI 对 `name_fallback` 明确标注「按字段名提取」。
+   实测效果：提示词 800→1820（29%→65%），底模分类 1279→1910（46%→68%），LoRA 759→1369，distinct 底模 21→32，mp4 提示词 0/426→354/426。
+2. **§5.2 的 `lib_stats` / `lib_facets` 已删除**：页头统计与分面都由 `lib_list` 的 `facets` 一次带回，两个独立 RPC 无调用点。§3.1 的 `folder_tree()` / `thumbs_ready()` 同样删除——目录面板按 `facets.dirs` 建树（§5.3），缩略图就绪判定在 `Api._lib_enrich` 里按文件系统实况算（海报文件可能被缓存清理，DB 标记会说谎）。`§5.2` 表内其余方法不变。
+3. **§7 网格缩略图边长补一句**：CSS 像素按规格 320，设备像素按 `dpr` 放大到最多 960（`Math.min(960, 320*dpr)`）以免高分屏发虚；详情 800 不变。这是对规格的解释，不是改数值。
+4. **播放 URL 单一来源**：`url_local` / `url_http` 只由 `Api._lib_play_urls` 生成（传输层职责），`media_library` 不再拼 URL、不再 import `browser_bridge`。`thumb` 同理只在 `_lib_enrich` 判定。
+5. **海报写入归库层**：`lib_save_poster` 只做守卫（视频扩展名 + 配置的媒体根之内 + 已入库登记），落盘、2MB 上限、`has_poster` 同步统一由 `MediaLibrary.set_poster(path, data)` 负责；未入库路径**不得**先在海报目录造文件。根目录判定两侧都过 `normcase(realpath)`，与 `browser_bridge._media_within_roots` 一致。
+6. **扫描启动竞态**：`lib_scan` 的检查-占位改在 `self._lib_scan_lock` 内完成，状态字典原地 `update` 不再重新绑定（原实现两个并发调用可各起一个全量 walk 线程，输家的 `finally` 会清掉赢家的 `running`）。
+7. **重叠根目录**：`MediaLibrary.scan` 先剔除严格嵌套在另一根内的根（等值重复保留先出现的），结果里回 `skipped_roots`，避免同一 `path` 的 `INSERT OR REPLACE` 重置 `added_at` / `starred`。
+8. **折叠错误行**：`_ErrorSink.finish` 先把明细裁到 `ERRORS_MAX` 再追加「另有 N 条错误已折叠」，webui 不再二次截断（原实现会把折叠行截掉，UI 少报）。
+9. **视频卡懒挂载（性能）**：`<video>` 只带 `data-src`，由单个 `IntersectionObserver`（root `#libViewport`、`rootMargin:150%`）在进入视口附近时才赋 `src` 并启动海报抓帧，滚远即 `pause()+removeAttribute('src')+load()` 释放解码器。实测：250 张视频卡从 ~200 路并发 `/api/media` 流降到 1 路。
+10. **卡片动作补「送逆向解析」**（设计文档 §5 要求，走 `rp_add_paths` + 反向解析页）。标签补齐**删除**入口（`lib_tag_delete` 原先无调用点）。
+11. 新增配置项 `media_page_size` 实测生效（改 250 后页面每批 250）；`lib_rescan_if_stale` 的 60s 阈值与增量重扫实测：2792 条目全量首扫解析约 7s，增量重扫 0.2–2s。
+12. **设计文档 §7 P3 的「自动标签（底模 / LoRA 即标签）」不单独实现**：底模 / LoRA 已经是 `facets.checkpoints` / `facets.loras` 两个可直接筛选、带计数的分面维度（§13.1 的字段名回收把覆盖率从 46% 提到 68%），再把同样的名字物化成 `tags` 行只会让同一事实有两份真相、并让标签表被模型文件名淹没。用户自建标签仍是独立维度（父子标签、颜色、计数）。分组视图与卡片跳工作流分析 / 逆向解析都已实现。
+
 
 ## 12. 补充钉死（A4/A5 共用，与 §6/§9 同权重）
 

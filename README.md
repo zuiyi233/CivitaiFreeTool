@@ -2,11 +2,13 @@
 
 > 免费的 Civitai / HuggingFace 模型下载与本地模型管理工作台。
 
-![Version](https://img.shields.io/badge/version-2.6.26-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
+![Version](https://img.shields.io/badge/version-2.6.27-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
 
 [下载最新版](https://github.com/ADVICEsama/CivitaiFreeTool/releases/latest) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/ADVICEsama/CivitaiFreeTool/issues) · [Linux / macOS](LINUX.md)
 
 ## 当前工作台
+
+- **资源库（v2.6.27）**：把 ComfyUI output 的图片 / 视频索引成本地库，按类型 / 底模 / LoRA / 文件夹 / 标签筛选，可搜提示词、可播放视频、可收藏打标签，模型引用能直接跳回模型库对应条目。纯 stdlib sqlite 索引 + 纯 Python 读 PNG 文本块与 mp4 atom（不依赖 ffmpeg），几万条目不卡；增量扫描，删除只回收媒体本体不动共用的工作流 `.json`。设置里填输出目录（支持多根与局域网共享路径，有自动探测）。详见 [版本说明](docs/releases/v2.6.27.md)。
 
 - **文件夹显示 / 排除（v2.6.26）**：首次默认显示全部。点父文件夹会统一显示或排除整个子树，覆盖之前的子目录选择；再单独点子目录可覆盖父目录。只想显示 A/B：先排除 A，再显示 B。勾选 A 后排除 B：只排除 B 子树，其它内容保留。只筛选显示，不移动 / 删除文件；选择立即保存。
 
