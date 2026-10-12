@@ -92,3 +92,9 @@ reference/
 .serena/
 .zcode/
 .zcode-scan-rows.json
+
+# ===== 资源库本地数据（用户资产索引，不属于源码）=====
+media_library.db
+media_library.db-wal
+media_library.db-shm
+media_posters/

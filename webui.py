@@ -13,7 +13,7 @@ import time
 
 import webview
 
-APP_VERSION = "2.6.26"
+APP_VERSION = "2.6.27"
 
 from functools import wraps
 
@@ -224,6 +224,19 @@ class Api:
         self._rp_state = {"running": False, "paused": False, "done": 0, "total": 0}
         self._rp_pause_ev = threading.Event()
         self._rp_stop_ev = threading.Event()
+        # ===== 资源库 =====（契约 §5.4 追加字段；状态字典名加下划线前缀——
+        # 同名的实例属性会遮蔽 §5.2 的 RPC 方法 lib_scan_state()，桥侧 getattr 取到的就是 dict 而不是方法）
+        self.media_lib = None            # 懒建（见 _media_lib()）
+        self._lib_scan_st = {"running": False, "phase": "", "done": 0, "total": 0,
+                             "msg": "", "roots": [], "errors": []}
+        self._lib_cancel = threading.Event()
+        self._lib_thumb_sem = threading.Lock()
+        self._lib_scan_lock = threading.Lock()  # 只在「查 running + 置 running」那一小段持有：与缩略图锁职责不同
+        self._lib_last_scan_at = 0.0     # 会话内上次扫描完成时刻（rescan_if_stale 的 60s 阈值参照）
+        # set_media_roots 由 A6 并发落地：属性不存在时跳过，保证本文件在旧桥上仍可导入/构造
+        _set_media_roots = getattr(browser_bridge, "set_media_roots", None)
+        if callable(_set_media_roots):
+            _set_media_roots(self._media_roots_for_bridge)
         # 所有回调依赖都初始化后再恢复。重启只恢复记录，不擅自开始网络下载。
         self.dl.load_tasks(resume=False)
 
@@ -1384,6 +1397,9 @@ class Api:
         """后台扫描；返回立即，进度/结果轮询 get_scan_state"""
         if self.mm_scan_state["running"]:
             return {"started": False}
+        # 与资源库扫描互斥：两者都是全量 walk 磁盘，并发会互拖（同 migrate_data_storage 的跨功能占用检查）
+        if getattr(self, "_lib_scan_st", {}).get("running"):
+            return {"started": False, "msg": "资源库扫描进行中"}
         self.mm_scan_state = {"running": True, "rows": [], "msg": "", "roots": []}
 
         def work():
@@ -4836,3 +4852,395 @@ class Api:
             return {"ok": True, "msg": "翻译结果: %s" % out}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+
+    # ===== 资源库 =====
+    # 薄封装层：sqlite/扫描/校验逻辑全在 media_library（A2）；本段只做 RPC 形状、缩略图与播放 URL。
+    # 方法名不带下划线即可被 browser_bridge._rpc 反射调用，无需注册；大数据负载一律 json.dumps 返回
+    # （同 get_scan_rows：js_api 大 list 转换会卡死桥接）。
+    _MEDIA_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")      # 兜底用（§3.1，优先取模块常量）
+    _MEDIA_VID_EXTS = (".mp4", ".mov", ".webm", ".mkv")
+
+    def _media_lib(self):
+        """懒建媒体库实例；media_library.db_path() 变化即重建（测试 patch config.APP_DIR 依赖这条）。"""
+        import media_library
+        path = media_library.db_path()
+        if self.media_lib is None or getattr(self, "_media_lib_path", "") != path:
+            self.media_lib = media_library.MediaLibrary(path)
+            self._media_lib_path = path
+        return self.media_lib
+
+    def _media_roots(self):
+        """配置的扫描根（原样保序：不存在的根要留给 MediaLibrary.scan 记 unreachable，不在这里过滤）"""
+        roots = self.cfg.get("media_roots") or []
+        if isinstance(roots, str):
+            roots = [roots]
+        return [s for s in (str(r).strip() for r in roots) if s]
+
+    def _media_roots_for_bridge(self):
+        """注入给 browser_bridge（A6 的 /api/media 允许目录校验用）；返回列表而非迭代器，桥侧线程独立读取"""
+        try:
+            return list(self._media_roots())
+        except Exception:
+            return []
+
+    def _lib_exts(self):
+        try:
+            import media_library
+            return (tuple(media_library.IMAGE_EXTS), tuple(media_library.VIDEO_EXTS))
+        except Exception:
+            return self._MEDIA_IMG_EXTS, self._MEDIA_VID_EXTS
+
+    def _lib_thumb(self, b64):
+        b = b64 or ""
+        if not b:
+            return ""
+        return b if b.startswith("data:") else "data:image/jpeg;base64," + b
+
+    def _lib_poster_path(self, media_path):
+        """视频海报缓存文件路径；media_library 不可用时返回 ''。"""
+        try:
+            import media_library
+            return media_library.poster_path(media_path) or ""
+        except Exception:
+            return ""
+
+    def _lib_poster_b64(self, media_path):
+        """视频海报缓存 → data URL；无缓存返回 ''（只读缓存文件，A3 绝不在此生成帧）"""
+        import base64
+        try:
+            pp = self._lib_poster_path(media_path)
+            if pp and os.path.isfile(pp):
+                with open(pp, "rb") as f:
+                    return self._lib_thumb(base64.b64encode(f.read(2 * 1024 * 1024 + 1)).decode())
+        except Exception:
+            pass
+        return ""
+
+    def _lib_play_urls(self, path):
+        """双 URL：pywebview 页面用 file:///，浏览器模式页面走 /api/media（前端按 __browserMode 挑选）"""
+        import pathlib
+        import urllib.parse
+        ap = os.path.abspath(path or "")
+        try:
+            local = pathlib.Path(ap).as_uri()
+        except Exception:
+            local = ""
+        try:
+            port = int(browser_bridge.port() or 0)
+        except Exception:
+            port = 0
+        http = ("http://127.0.0.1:%d/api/media?p=%s" % (port, urllib.parse.quote(ap))) if port else ""
+        return local, http
+
+    def _lib_enrich(self, row):
+        """A2 行 → §5.1 items 形状：补 thumb/snippet/url_local/url_http（校验逻辑不在这层）"""
+        r = dict(row or {})
+        p = str(r.get("path") or "")
+        ext = os.path.splitext(p)[1].lower()
+        img_exts, vid_exts = self._lib_exts()
+        if r.get("kind") == "video" or (not r.get("kind") and ext in vid_exts):
+            # 只判存在性：一页 200 行若逐行 base64 读海报（≤2MB/张）会白烧几倍磁盘带宽
+            pp = self._lib_poster_path(p)
+            r["thumb"] = bool(pp) and os.path.isfile(pp)
+        else:
+            r["thumb"] = ext in img_exts and os.path.isfile(p)
+        if "snippet" not in r:
+            r["snippet"] = str(r.get("prompt") or "")[:120]
+        local, http = self._lib_play_urls(p)
+        r["url_local"], r["url_http"] = local, http
+        return r
+
+    def _lib_state_roots(self, res):
+        """§5.2 roots 形状：dict 条目原样透传；纯字符串按 ok 包装（兼容 A2 两种回传形态）"""
+        out = []
+        for item in (res.get("roots") or []):
+            if isinstance(item, dict):
+                out.append(item)
+            elif item:
+                out.append({"path": str(item), "status": "ok", "count": 0})
+        return out
+
+    def lib_scan(self):
+        """后台增量扫描；立即返回，进度轮询 lib_scan_state（模式照抄 scan_models）"""
+        roots = self._media_roots()
+        exclude = self.cfg.get("media_exclude_dirs") or []
+        # 「读 running」与「置 running」必须原子：浏览器模式两个标签页（或 lib_scan 撞上
+        # lib_rescan_if_stale）会并发进来，无锁的先后两步会起两个全量 walk 线程，
+        # 而败者 finally 里那句 running=False 清掉的正是赢者刚置上的标志。
+        with self._lib_scan_lock:
+            if self._lib_scan_st["running"]:
+                return {"started": False, "msg": "资源库扫描已在进行"}
+            # 跨功能互斥照抄 migrate_data_storage：模型库扫描同样全量 walk 磁盘，两者并发会互拖
+            if self.mm_scan_state.get("running"):
+                return {"started": False, "msg": "模型扫描进行中"}
+            if not roots:
+                return {"started": False, "msg": "未配置资源目录，请到设置页添加 ComfyUI 输出目录"}
+            st = self._lib_scan_st
+            # 原地复位同一个 dict，绝不重新绑定：lib_scan_state / scan_models 的互斥检查、
+            # 扫描线程的 finally 都必须读到同一个对象，否则「前端停止轮询一个仍在跑的扫描」
+            st.update({"running": True, "phase": "walk", "done": 0, "total": 0,
+                       "msg": "", "roots": [], "errors": []})
+            self._lib_cancel.clear()
+
+        def progress(d):
+            if not isinstance(d, dict):
+                return
+            try:
+                st["done"] = int(d.get("done") or 0)
+                st["total"] = int(d.get("total") or 0)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            st["phase"] = str(d.get("phase") or st.get("phase") or "")
+            st["msg"] = str(d.get("msg") or "")
+
+        def work():
+            try:
+                res = self._media_lib().scan(roots, exclude=exclude,
+                                             progress=progress, cancel=self._lib_cancel.is_set)
+                res = res if isinstance(res, dict) else {}
+                st["roots"] = self._lib_state_roots(res)
+                # 明细折叠行由库侧一次性排布（ERRORS_MAX 条明细 + 1 条折叠说明）：
+                # 这里再切一次会把折叠提示挤掉，UI 于是少报（§4.5）
+                st["errors"] = [str(e)[:200] for e in (res.get("errors") or [])]
+                st["phase"] = "done"
+                st["msg"] = "扫描完成：新增 %s · 更新 %s · 共 %s" % (
+                    res.get("added", 0), res.get("updated", 0), res.get("total", 0))
+                skipped = [s for s in (res.get("skipped_roots") or []) if isinstance(s, dict)]
+                if skipped:
+                    st["msg"] += "（重叠目录已跳过 %d 个：%s）" % (
+                        len(skipped), "、".join(str(s.get("path") or "") for s in skipped[:3]))
+                self._lib_last_scan_at = time.time()
+            except Exception as e:
+                st["msg"] = "扫描失败: %s" % e
+            finally:
+                st["running"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"started": True, "msg": ""}
+
+    def lib_scan_state(self):
+        """轻量轮询状态（不含行数据，避免桥接传输大对象卡死）"""
+        st = self._lib_scan_st
+        return {"running": bool(st.get("running")), "phase": st.get("phase", ""),
+                "done": int(st.get("done") or 0), "total": int(st.get("total") or 0),
+                "msg": st.get("msg", ""), "roots": list(st.get("roots") or []),
+                "errors": list(st.get("errors") or [])}
+
+    def lib_cancel_scan(self):
+        self._lib_cancel.set()
+        return {"ok": True}
+
+    def lib_rescan_if_stale(self):
+        """页面进入触发：距上次扫描 ≥60s 才起（§7）；库侧 last_scan_at() 存在则优先（跨会话判定）"""
+        if not self._media_roots():
+            return {"started": False, "reason": "no_roots"}
+        if self._lib_scan_st.get("running"):
+            return {"started": False, "reason": "running"}
+        last = 0.0
+        try:
+            fn = getattr(self._media_lib(), "last_scan_at", None)
+            if callable(fn):
+                last = float(fn() or 0)
+        except Exception:
+            pass
+        last = max(last, float(self._lib_last_scan_at or 0))
+        if last and time.time() - last < 60:
+            return {"started": False, "reason": "fresh"}
+        r = self.lib_scan()
+        return {"started": bool(r.get("started")),
+                "reason": "" if r.get("started") else str(r.get("msg", ""))}
+
+    def lib_list(self, flt_json):
+        """筛选+分页列表，JSON 字符串（§5.2）。flt 原样透传：sort/group_by 白名单等校验在 A2 层"""
+        try:
+            flt = json.loads(flt_json or "{}")
+            if not isinstance(flt, dict):
+                flt = {}
+        except Exception:
+            return json.dumps({"ok": False, "msg": "筛选参数格式错误",
+                               "items": [], "total": 0, "offset": 0, "limit": 0}, ensure_ascii=False)
+        lib = self._media_lib()
+        data = lib.list_items(flt) or {}
+        items = [self._lib_enrich(r) for r in (data.get("items") or [])]
+        facets = data.get("facets")
+        if facets is None:
+            try:
+                facets = lib.facets()
+            except Exception:
+                facets = {}
+        return json.dumps({"ok": True, "items": items,
+                           "total": int(data.get("total") or 0),
+                           "offset": int(data.get("offset", flt.get("offset", 0)) or 0),
+                           "limit": int(data.get("limit", flt.get("limit", 0)) or 0),
+                           "facets": facets or {}}, ensure_ascii=False)
+
+    def lib_detail(self, item_id):
+        """详情，JSON 字符串；§7 详情边长 800 的预览在这里生成（图片走 _cover_thumb，视频读海报缓存）"""
+        d = self._media_lib().detail(item_id)
+        if not isinstance(d, dict):
+            return json.dumps({"ok": False, "msg": "条目不存在"}, ensure_ascii=False)
+        out = self._lib_enrich(d)
+        out["exists"] = bool(out.get("path")) and os.path.isfile(out["path"])
+        img_exts, _ = self._lib_exts()
+        if img_exts and os.path.splitext(str(out.get("path") or ""))[1].lower() in img_exts:
+            try:
+                thumb_dir = posix_compat.thumb_cache_dir()
+            except Exception:
+                thumb_dir = None
+            out["preview"] = self._lib_thumb(self._cover_thumb(out["path"], out["path"], 800, 0, thumb_dir))
+        else:
+            out["preview"] = self._lib_poster_b64(str(out.get("path") or ""))
+        out["ok"] = True
+        return json.dumps(out, ensure_ascii=False)
+
+    def lib_get_thumbs(self, paths_json, size=320):
+        """批量缩略图 JSON 字符串 {path: dataURL|""}；单次 40 路径上限（§7），超出截断。
+        图片复用 _cover_thumb(媒体文件同时作命名空间键与源)——缓存键 sha1(abspath)+mtime+size
+        落 thumb_cache_dir()，与模型封面共库，零新增缓存代码；视频只读海报缓存，无则 ""。"""
+        try:
+            paths = json.loads(paths_json or "[]")
+        except Exception:
+            paths = []
+        try:
+            size = int(size or 320)
+        except (TypeError, ValueError, OverflowError):
+            size = 320
+        try:
+            thumb_dir = posix_compat.thumb_cache_dir()
+        except Exception:
+            thumb_dir = None
+        img_exts, _ = self._lib_exts()
+        out = {}
+        with self._lib_thumb_sem:
+            for p in [x for x in (paths or []) if isinstance(x, str) and x][:40]:
+                try:
+                    if os.path.splitext(p)[1].lower() in img_exts:
+                        out[p] = self._lib_thumb(self._cover_thumb(p, p, size, 0, thumb_dir))
+                    else:
+                        out[p] = self._lib_poster_b64(p)
+                except Exception:
+                    out[p] = ""
+        return json.dumps(out, ensure_ascii=False)
+
+    def _lib_within_roots(self, real_normpath):
+        """绝对路径（已 realpath+normcase）是否落在配置的某个媒体根之内。
+
+        两侧都 normcase：与 browser_bridge._media_within_roots 保持一致，否则 Windows 上
+        配置写成 D:\\Out 而扫到的是 D:\\out\\a.png 时，这里会误判「不在资源目录内」而拒绝合法海报写入。
+        """
+        for root in self._media_roots():
+            try:
+                if not root or not isinstance(root, str):
+                    continue
+                rr = os.path.normcase(os.path.realpath(root))
+                while len(rr) > 1 and rr.endswith(("/", "\\")) and rr not in ("\\", "/"):
+                    rr = rr[:-1]
+                prefix = rr if rr.endswith(("/", "\\")) else rr + os.sep
+                if real_normpath == rr or real_normpath.startswith(prefix):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def lib_save_poster(self, path, data_b64):
+        """前端 canvas 抓帧回传海报（§7：长边 640 / q0.82 / ≤2MB）。只写 poster_path 缓存文件。"""
+        import base64
+        try:
+            import media_library
+        except Exception:
+            return {"ok": False, "msg": "资源库模块不可用"}
+        ext = os.path.splitext(str(path or ""))[1].lower()
+        _, vid_exts = self._lib_exts()
+        if ext not in vid_exts:
+            return {"ok": False, "msg": "仅视频可回传海报"}
+        # 防越权写文件：入库登记 + 位于配置的媒体根之内，两道都要过
+        try:
+            lib = self._media_lib()
+            if not self._lib_within_roots(os.path.normcase(os.path.realpath(os.path.abspath(path)))):
+                return {"ok": False, "msg": "路径不在资源目录内"}
+            check = getattr(lib, "get_item_by_path", None)
+            if callable(check) and not check(path):
+                return {"ok": False, "msg": "路径未入库"}
+            b = str(data_b64 or "")
+            if "," in b[:64] and b.strip().lower().startswith("data:"):
+                b = b.split(",", 1)[1]
+            raw = base64.b64decode(b)
+            if not raw:
+                return {"ok": False, "msg": "海报为空"}
+            # 落盘与 2MB 上限、has_poster 同步都归 media_library.set_poster（海报缓存是库的一侧资产）
+            return self._media_lib().set_poster(path, raw)
+        except Exception as e:
+            return {"ok": False, "msg": "保存海报失败: %s" % e}
+
+    def lib_set_star(self, item_id, on):
+        return {"ok": True, "starred": bool(self._media_lib().set_star(item_id, bool(on)))}
+
+    def lib_set_tags(self, item_id, tag_ids_json):
+        try:
+            ids = json.loads(tag_ids_json or "[]")
+        except Exception:
+            return {"ok": False, "msg": "标签参数格式错误"}
+        tags = self._media_lib().set_tags(item_id, ids)
+        return {"ok": True, "tags": tags if tags is not None else []}
+
+    def lib_tags(self):
+        return json.dumps(self._media_lib().list_tags() or [], ensure_ascii=False)
+
+    def lib_tag_save(self, tag_id, name, color, parent_id=-1):
+        # tag_id=0 新建 / parent_id=-1 无父：RPC 哨兵值原样透传给 A2 解释（§5.2）
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "id": 0, "msg": "标签名不能为空"}
+        try:
+            tid = self._media_lib().save_tag(tag_id, name, str(color or ""), parent_id)
+        except Exception as e:
+            return {"ok": False, "id": 0, "msg": str(e)[:200]}
+        return {"ok": bool(tid), "id": int(tid or 0), "msg": "" if tid else "保存失败"}
+
+    def lib_tag_delete(self, tag_id):
+        return {"ok": True, "removed": 1 if self._media_lib().delete_tag(tag_id) else 0}
+
+    def lib_delete(self, item_id):
+        """删除只回收媒体文件本体、绝不连带 sidecar：ComfyUI 的同名 .json 被生成的图片和
+        视频共享，删掉会毁掉另一件的元数据（rm_file 的连删语义在这里不适用）。"""
+        item = self._media_lib().get_item(item_id)
+        if not isinstance(item, dict):
+            return {"ok": False, "msg": "条目不存在"}
+        p = str(item.get("path") or "").strip()
+        if not p or not os.path.isfile(p):
+            return {"ok": False, "msg": "文件不存在"}
+        try:
+            if posix_compat.IS_WINDOWS:
+                ok = _recycle_to_trash([p])
+            else:
+                ok = posix_compat.trash([p])
+        except Exception as e:
+            return {"ok": False, "msg": "删除失败: %s" % e}
+        if not ok:
+            return {"ok": False, "msg": "删除失败"}
+        try:
+            self._media_lib().mark_gone(item_id)
+        except Exception:
+            pass
+        return {"ok": True, "msg": "已移入回收站"}
+
+    def lib_autodetect_roots(self):
+        """§6 候选顺序：安装目录 → 用户主目录 → 每个模型目录的父目录下 ComfyUI/output；取存在者、去重保序"""
+        cands = [os.path.join(config.INSTALL_DIR, "ComfyUI", "output"),
+                 os.path.join(os.path.expanduser("~"), "ComfyUI", "output")]
+        for d in (self.cfg.get("models_dirs") or []):
+            try:
+                if d:
+                    cands.append(os.path.join(os.path.dirname(os.path.normpath(str(d))), "ComfyUI", "output"))
+            except Exception:
+                continue
+        out, seen = [], set()
+        for c in cands:
+            try:
+                k = os.path.normcase(os.path.realpath(c))
+                if k not in seen and os.path.isdir(c):
+                    seen.add(k)
+                    out.append(c)
+            except Exception:
+                continue
+        return {"ok": True, "roots": out}

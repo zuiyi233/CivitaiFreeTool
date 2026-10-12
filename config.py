@@ -57,6 +57,9 @@ DEFAULTS = {
     "model_folder_visibility": {},     # 显式目录选择，更深层选择优先
     "model_folder_include_subfolders": True,  # 默认递归包含子目录
     "hidden_model_folders": [],         # 模型管理目录中隐藏的子文件夹
+    "media_roots": [],          # 资源库扫描根：ComfyUI output 等，每行一个绝对路径
+    "media_exclude_dirs": [],   # 资源库排除目录（相对根的 posix 路径，含子目录生效）
+    "media_page_size": 200,     # 资源库每批条数（归一化钳制 20..500，默认 200）
     "show_root_models": True,           # 是否显示模型目录根目录下的模型
     "metadata_format": "sd",            # sd / civitai / both（WebUI 可读 json 的格式；.civitai.info 始终生成）
     "dark_mode": True,                  # 深色/浅色主题（旧字段，兼容）
@@ -107,7 +110,7 @@ DEFAULTS = {
     "exit_when_page_closed": False,     # 浏览器模式：关闭页面后自动退出（有任务在下载时不退）
     "close_action": "exit",             # 点窗口关闭按钮：exit 退出（默认）/ minimize 最小化到任务栏
     "webview_disable_gpu": False,       # 禁用 WebView2 GPU 加速（软件渲染；默认关。软渲染会让氛围动画吃满 CPU）
-    "default_page": "models",           # 启动默认页（download/dlmanager/models/reverse/settings）
+    "default_page": "models",           # 启动默认页（download/dlmanager/models/library/reverse/settings）
 }
 
 CONFIG_PATH = os.path.join(APP_DIR, "user_config.json")
@@ -206,7 +209,7 @@ def normalize_ui_preferences(cfg):
     if cfg.get("download_name_mode", "original") not in ("original", "civitai", "chinese"): cfg["download_name_mode"] = "original"
     cfg["filename_include_version"] = cfg.get("filename_include_version") is True
     if cfg.get("multi_file_download", "ask") not in ("ask", "first", "all"): cfg["multi_file_download"] = "ask"
-    for key,default,lo,hi in [("max_concurrent_downloads",3,1,32),("effects_fps_limit",60,15,360),("gallery_cache_mb",1024,64,8192),("model_list_size",3,1,3),("name_scroll_speed",70,10,240),("name_scroll_start_pause",350,0,5000),("name_scroll_end_pause",250,0,5000)]:
+    for key,default,lo,hi in [("max_concurrent_downloads",3,1,32),("effects_fps_limit",60,15,360),("gallery_cache_mb",1024,64,8192),("model_list_size",3,1,3),("name_scroll_speed",70,10,240),("name_scroll_start_pause",350,0,5000),("name_scroll_end_pause",250,0,5000),("media_page_size",200,20,500)]:
         try:value=int(cfg.get(key,default));cfg[key]=0 if key=="effects_fps_limit" and value==0 else max(lo,min(hi,value))
         except (TypeError,ValueError,OverflowError):cfg[key]=default
     cfg['shortcuts_enabled']=cfg.get('shortcuts_enabled') is True
