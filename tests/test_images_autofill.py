@@ -63,14 +63,25 @@ class VideoEntryJudgementTests(unittest.TestCase):
         for junk in (None,'string',123,[],{}):
             self.assertFalse(f(junk))                                                 # 非 dict 不抛错
 
-    def test_video_url_ext_and_consistency(self):
-        self.assertEqual(webui.VIDEO_URL_EXTS,image_gallery.VIDEO_SUFFIXES)           # 两处尾缀表必须同口径
-        self.assertTrue(webui._video_url_ext(V1).endswith('.mp4'))
-        self.assertTrue(webui._video_url_ext('https://x/a/b/FILE.MP4?t=1').endswith('.mp4'))
-        self.assertEqual(webui._video_url_ext(U0),'');self.assertEqual(webui._video_url_ext(''),'')
-        self.assertEqual(webui._video_url_ext(None),'')
+    def test_video_ext_tables_stay_in_sync(self):
+        import reverse_parse
+        # 尾缀表在两处（reverse_parse 判定 / image_gallery 显示档拒写），不同步就会出现
+        # 「一边判视频、一边当静帧送去 PIL 解码」。webui 侧不再自己留一份。
+        self.assertEqual(reverse_parse.VIDEO_URL_EXTS,image_gallery.VIDEO_SUFFIXES)
+        self.assertFalse(hasattr(webui,'VIDEO_URL_EXTS'))
+        self.assertFalse(hasattr(webui,'_video_url_ext'))
         self.assertEqual(webui._video_source_url({'url':'  https://x/a.mp4  '}),'https://x/a.mp4')
         self.assertEqual(webui._video_source_url(None),'');self.assertEqual(webui._video_source_url('x'),'')
+
+    def test_gui_cover_path_never_picks_mp4(self):
+        """gui.py:442 直接调 reverse_parse.pick_cover_url（不经 webui），必须在共享判定里一起修好。"""
+        import reverse_parse
+        self.assertEqual(reverse_parse.pick_cover_url([{'url':V1},{'url':U0}]),U0)      # 无 type 的 mp4 不占封面
+        self.assertEqual(reverse_parse.pick_cover_url([{'url':V1}]),'')                 # 只剩视频且无 poster → 无封面
+        self.assertEqual(reverse_parse.pick_cover_url([{'url':V1,'imageUrl':POSTER1}]),POSTER1)
+        # webui 判定必须是同一份实现（否则两处会再次分叉）
+        for entry in ({'url':V1},{'url':U0},{'type':'video','url':U0},{'url':POSTER1}):
+            self.assertEqual(webui._is_video_entry(entry),reverse_parse.is_video_image_entry(entry))
 
     def test_pick_cover_url_never_returns_mp4_as_cover(self):
         self.assertEqual(webui._pick_cover_url([{'type':'video','url':V1},{'url':U0}]),U0)          # 静帧优先

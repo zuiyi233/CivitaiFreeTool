@@ -57,31 +57,24 @@ def _json_safe(value):
 
 
 def _pick_cover_url(imgs):
-    """选封面 URL：先用 _is_video_entry 滤掉视频帧，再交给 reverse_parse.pick_cover_url。
+    """选封面 URL —— 直接复用 reverse_parse.pick_cover_url（gui/webui 共用同一份判定）。
 
-    reverse_parse 那份只按 type 判视频，而真实库的 images[] 里 type 字段 100% 缺失 ——
-    不过滤就会把 .mp4 直链当封面去下载（gui._download_image 的 magic 校验会拒掉，结果是封面缺失）。
-    只剩视频项时退回视频首帧 imageUrl；老 info 连 poster 也没有 → 返回 ''，调用方按「无封面」处理。
-    （reverse_parse.py 不在本轮改动范围，所以过滤放在本文件的统一入口上。）"""
-    entries = [im for im in (imgs or []) if isinstance(im, dict)]
-    url = reverse_parse.pick_cover_url([im for im in entries if not _is_video_entry(im)])
-    if url:
-        return url
-    for im in entries:
-        if _is_video_entry(im):
-            poster = str(im.get("imageUrl") or "").strip()
-            if poster:
-                return poster
-    return ""
+    以前这里先自行滤一遍视频，是因为 reverse_parse 那份只按 type 判、而真实库的 images[]
+    里 type 字段 100% 缺失，不过滤就会把 .mp4 直链当封面下载。现在判定已收敂到
+    reverse_parse.is_video_image_entry（type 或 URL 尾缀），再包一层就是两处各写一遍，
+    早晚会再次分叉。只剩视频项且连 poster 也没有时返回 ''，调用方按「无封面」处理。"""
+    return reverse_parse.pick_cover_url(imgs)
 
 
 _VIDEO_LIMIT_PER_MODEL = 3  # 每模型自动/批量落盘的视频数上限（防止单模型拉爆带宽）
 
 
-def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=100 * 1024 * 1024):
+def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=100 * 1024 * 1024, deadline=None):
     """流式下载视频到本地（.tmp + 原子替换；过大/过小/失败返回 False）。与 _download_image（PIL 校验版）不同，
     视频无法用图片 magic bytes 校验，以体积下限兜底。
-    max_bytes 的默认值与 config.video_max_mb 同口径（100MB）——不留一个比设置更大的暗档。"""
+    max_bytes 的默认值与 config.video_max_mb 同口径（100MB）——不留一个比设置更大的暗档。
+    deadline 是 time.monotonic() 的绝对截止点：socket 级 timeout 只在两次 read 之间生效，
+    一条每次吐一点字节的慢流能永远不触发它，必须按墙钟斩断（补帧按帧预算传进来）。"""
     import urllib.request
     tmp = dest + ".tmp"
     try:
@@ -93,6 +86,8 @@ def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=1
         got = 0
         with opener.open(req, timeout=timeout) as r, open(tmp, "wb") as f:
             while True:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TimeoutError("video download deadline exceeded")
                 chunk = r.read(256 * 1024)
                 if not chunk:
                     break
@@ -119,25 +114,6 @@ def _local_video_file(base, idx):
     return os.path.join(base + ".images", "video_%02d.mp4" % idx)
 
 
-# 视频尾缀集合：与 image_gallery.is_video_source 保持一致。
-# 不在这里 import image_gallery —— 两处都要用，且那模块也会被独立调用。
-VIDEO_URL_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".avi")
-
-
-def _video_url_ext(u):
-    """URL/路径的尾缀（去 query/fragment，小写）；不是视频扩展名则返回 ''。"""
-    s = str(u or "").strip()
-    if not s:
-        return ""
-    try:
-        from urllib.parse import urlsplit
-        path = urlsplit(s).path
-    except Exception:
-        path = s.split("?")[0].split("#")[0]
-    low = path.lower()
-    return low if low.endswith(VIDEO_URL_EXTS) else ""
-
-
 def _is_video_entry(img):
     """info.json 的 images[] 条目是否为视频：type == 'video' **或** url/imageUrl 尾缀是视频扩展名。
 
@@ -146,12 +122,10 @@ def _is_video_entry(img):
     前端 <img> 收到 content-type: video/mp4 的 1.2~2.3MB 视频字节，图片永远解码不出来，
     带宽却已经花掉；查看器再按原图档下一遍（original 档视频均值 19.4MB）。
     按尾缀兜底是安全的：.jpeg 尾缀的 60 条抽样 HEAD 全是 image/png|webp|jpeg，没有伪装成
-    图片的视频。所有视频判定必须走这个入口，不要再就地写 type == 'video'。"""
-    if not isinstance(img, dict):
-        return False
-    if str(img.get("type") or "").lower() == "video":
-        return True
-    return bool(_video_url_ext(img.get("url")) or _video_url_ext(img.get("imageUrl")))
+    图片的视频。所有视频判定必须走这个入口，不要再就地写 type == 'video'。
+    实现只有一份，在 reverse_parse.is_video_image_entry——gui 的封面下载链路也走它，
+    两处各写一遍就会再次分叉（reverse_parse.pick_cover_url 曾因只看 type 而把 mp4 当封面）。"""
+    return reverse_parse.is_video_image_entry(img)
 
 
 def _video_source_url(img):
@@ -242,12 +216,13 @@ def _ensure_local_videos(base, images, proxy=None, verify=True, limit=_VIDEO_LIM
     return added
 
 
-def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_bytes=None):
+def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_bytes=None, deadline=None):
     """流式下载图片到本地（.tmp + 原子替换；超限/过小/非图片格式返回 False）。
 
     与 gui._download_image 的唯一区别是体积上限：上限来自 config.image_max_mb，超了直接丢弃，
     绝不留下半张图（半张图会让查看器解码失败并占着缓存额度）。magic bytes 校验顺带挡住
-    「.jpg 尾缀实为 mp4」这类伪装。"""
+    「.jpg 尾缀实为 mp4」这类伪装。deadline 是 time.monotonic() 的绝对截止点，
+    慢流靠 socket timeout 斩不断（见 _download_video 同一说明）。"""
     import urllib.request
     from gui import _is_image_bytes
     if max_bytes is None:
@@ -268,6 +243,8 @@ def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_
                 pass
             with open(tmp, "wb") as f:
                 while True:
+                    if deadline is not None and time.monotonic() > deadline:
+                        raise TimeoutError("image download deadline exceeded")
                     chunk = r.read(256 * 1024)
                     if not chunk:
                         break
@@ -294,14 +271,16 @@ def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_
         return False
 
 
-def _images_fill_targets(base, images, want_videos=True):
+def _images_fill_targets(base, images, want_videos=True, video_limit=None):
     """info images[] → <base>.images/ 落盘清单 [(kind, url, dest)]，kind 为 'image' 或 'video'。
 
     命名与「已存在即跳过」的幂等语义完全沿用 download_all_images：静帧 image_%02d.<ext>；
     视频首帧 poster 落 image_%02d.jpg、原片落 video_%02d.mp4（同序号，本地优先取用靠这个约定）。
-    判定一律走 _is_video_entry —— 老 info 没有 type 字段，只按 type 判会把 mp4 存成 image_XX.jpg。"""
+    判定一律走 _is_video_entry —— 老 info 没有 type 字段，只按 type 判会把 mp4 存成 image_XX.jpg。
+    video_limit：本次最多落几个 mp4（None=不限）。自动补帧必须带上限，见调用处。"""
     out_dir = base + ".images"
     targets = []
+    videos_left = None if video_limit is None else max(0, int(video_limit))
     for i, im in enumerate(images or []):
         if not isinstance(im, dict):
             continue
@@ -310,7 +289,9 @@ def _images_fill_targets(base, images, want_videos=True):
             if poster:
                 targets.append(("image", poster, os.path.join(out_dir, "image_%02d.jpg" % (i + 1))))
             mp4 = _video_source_url(im)
-            if mp4 and want_videos:
+            if mp4 and want_videos and (videos_left is None or videos_left > 0):
+                if videos_left is not None:
+                    videos_left -= 1
                 targets.append(("video", mp4, _local_video_file(base, i + 1)))
             continue
         u = str(im.get("url") or "").strip()
@@ -399,10 +380,12 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
                     stats["skipped"] += 1
                 elif kind == "video":
                     ok = _download_video(url, dest, timeout=min(180, max(5, int(left))), proxy=proxy,
-                                         verify=verify, max_bytes=_video_cap_bytes(cfg))
+                                         verify=verify, max_bytes=_video_cap_bytes(cfg),
+                                         deadline=started + deadline_s)
                 else:
                     ok = _download_image_limited(url, dest, timeout=min(60, max(5, int(left))), proxy=proxy,
-                                                 verify=verify, max_bytes=_image_cap_bytes(cfg))
+                                                 verify=verify, max_bytes=_image_cap_bytes(cfg),
+                                                 deadline=started + deadline_s)
         except Exception:
             ok = False
         if ok:
@@ -1957,6 +1940,9 @@ class Api:
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
                                "orig_url": u})
             else:
+                # width/height 不用在这里重复：下面 `c.update(image_gallery.generation(image, ...))`
+                # 会把 info 的 width/height/image_id 一并挂上（image_gallery.py:289），
+                # read_bytes 的防上采样就靠那个值。曾在此手动补一份，属重复实现。
                 covers.append({"type": "image", "url": u,
                                "prompt": (img.get("meta") or {}).get("prompt") or "",
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
@@ -2026,7 +2012,13 @@ class Api:
         import image_gallery
         try:
             item=self._gallery_item(path,index,history_id)
-            full=image_gallery.cache_load(item,self.cfg,'preview')
+            # 必须按当前显示档去读：preview() 现在把结果写进 ':w1440q80' 这档的键里，
+            # 而这里原来不带 tier，等于查另一个键位——查看过多少次都命不中，"秒开本地缓存"整条快路径空转。
+            width,quality=_gallery_display_tier(self.cfg)
+            full=image_gallery.cache_load(item,self.cfg,'preview',image_gallery.cache_tier(width,quality))
+            if not isinstance(full,dict) or not full.get('ok') or not full.get('b64'):
+                # 老缓存（无档位后缀）继续可用，不因本轮改档位而作废重下
+                full=image_gallery.cache_load(item,self.cfg,'preview')
             if not isinstance(full,dict) or not full.get('ok') or not full.get('b64'):
                 # 已有本地原图可以直接准备；没有本地文件时绝不在后台请求 CDN。
                 if not allow_local or self.cfg.get('cache_original_images') is not True or not item.get('local_path') or not os.path.isfile(item['local_path']):return {'ok':False,'cached':False}
@@ -2093,7 +2085,9 @@ class Api:
             form=getattr(getattr(controller,'window',None),'native',None)
             if form is None:return {'ok':False,'msg':'当前模式请使用网页图片复制'}
             owner=form.Handle.ToInt64()
-            preview=self.get_gallery_image(path,index,history_id)
+            # 复制必须按原图档取字节：这里若复用 get_gallery_image（已接显示档），
+            # 剪贴板里就是一张 C站转码过的 ≤1440px 图，和「保存来源图片」的承诺对不上。
+            preview=image_gallery.preview(self._gallery_item(path,index,history_id),self.cfg)
             if not preview.get('ok') or not preview.get('b64'):return {"ok":False,"msg":"图片未加载，无法复制"}
             result=image_gallery.copy_clipboard_image(base64.b64decode(preview['b64'],validate=True),owner)
             return {"ok":bool(result),"msg":"当前图片已复制，可直接粘贴" if result else "系统剪贴板不可用，可改用保存图片"}
@@ -2318,7 +2312,8 @@ class Api:
             images = self._info_images(path)
             if not images:
                 return {"ok": True, "started": False, "reason": "模型信息里没有示例图"}
-            pending = _fill_pending_targets(_images_fill_targets(base, images))
+            pending = _fill_pending_targets(_images_fill_targets(
+                base, images, video_limit=_VIDEO_LIMIT_PER_MODEL))
             if not pending:
                 return {"ok": True, "started": False, "reason": "本地帧已齐全", "total": len(images)}
             key = os.path.normcase(os.path.abspath(path))

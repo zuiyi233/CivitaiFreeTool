@@ -126,6 +126,43 @@ class DisplayUrlTests(unittest.TestCase):
         self.assertEqual(image_gallery.display_url(BIG,10**9,999,8000),'https://image.civitai.com/auth123/hashabc/width=4096,quality=100/img.png')
         self.assertIsNone(image_gallery.display_url(BIG,0,0,2048))  # 0/负数视为无档位
 
+    def test_natural_width_actually_reaches_the_guard(self):
+        """防上采样必须在「生产链路」成立，不只是 display_url 单测成立。
+        复核时发现 covers 没带 width → read_bytes 里 natural_width 恒为 None，
+        68%（328/479）本来就 ≤1440px 的图照样被 width=1440 顶大（实测 682KB→1.2MB）。
+        这里从 get_model_detail 一路打到真正请求的 URL，钉住接线。"""
+        import webui
+        with TemporaryDirectory() as d:
+            model = Path(d) / "m.safetensors"; model.write_bytes(b"fixture")
+            (Path(d) / "m.civitai.info").write_text(json.dumps({"name": "m", "images": [
+                {"url": NARROW, "width": 1200, "height": 800},   # 比档位窄：不该加 width
+                {"url": BIG, "width": 2048, "height": 1536},     # 比档位宽：该加 width
+            ]}), encoding="utf-8")
+            api = webui.Api.__new__(webui.Api)
+            api.cfg = {"cache_original_images": True, "image_max_mb": 20, "video_max_mb": 100,
+                       "fetch_deadline_s": 120, "gallery_display_width": 1440, "gallery_display_quality": 80,
+                       "proxy_enabled": False, "ssl_verify": True, "models_dir": d, "models_dirs": [d],
+                       "images_dir_autofill": False}
+            detail = json.loads(api.get_model_detail(str(model)))
+            by_url = {c["url"]: c for c in detail["covers"] if c.get("type") == "image"}
+            self.assertEqual(by_url[NARROW].get("width"), 1200, "covers 必须把 info 的 width 传下去")
+            self.assertEqual(by_url[BIG].get("width"), 2048)
+            asked = []
+
+            def spy(url, cfg, *a, **k):
+                asked.append(url)
+                raise OSError("stop before decode")
+            with patch("image_gallery._fetch", side_effect=spy):
+                for item, expect_width in ((by_url[NARROW], False), (by_url[BIG], True)):
+                    asked.clear()
+                    try:
+                        image_gallery.read_bytes(item, api.cfg, 1440, 80)
+                    except Exception:
+                        pass
+                    self.assertTrue(asked, "远程档应走到 _fetch")
+                    self.assertEqual("width=" in asked[0], expect_width,
+                                     "%s 期望 width 段=%s，实际 %s" % (item["url"][-22:], expect_width, asked[0]))
+
 class CacheTierKeyTests(unittest.TestCase):
     # 钉住第 5 条
     def test_cache_tier_strings(self):

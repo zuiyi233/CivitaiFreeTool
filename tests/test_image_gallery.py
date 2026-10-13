@@ -99,10 +99,17 @@ class ClipboardDibTests(unittest.TestCase):
     def test_native_copy_uses_owned_window_handle(self):
         import types
         api=webui.Api.__new__(webui.Api)
+        api.cfg={'cache_original_images':True}
         api._window_appearance_controller=types.SimpleNamespace(window=types.SimpleNamespace(native=types.SimpleNamespace(Handle=types.SimpleNamespace(ToInt64=lambda:123))))
-        api.get_gallery_image=Mock(return_value={'ok':True,'b64':base64.b64encode(b'fixture image bytes').decode()})
-        with patch.object(image_gallery,'copy_clipboard_image',return_value=True) as copy:
+        # 复制不能复用 get_gallery_image：那条已接显示档（C站 width=/quality= 转码，剥 EXIF 且 ≤1440px），
+        # 剪贴板里就不该是一张降级图。这里把它钉成「被调用即失败」。
+        api.get_gallery_image=Mock(side_effect=AssertionError('复制不应走显示档 get_gallery_image'))
+        api._gallery_item=Mock(return_value={'type':'image','url':'https://image.civitai.com/a/b/original=true/x.png'})
+        with patch.object(image_gallery,'preview',return_value={'ok':True,'b64':base64.b64encode(b'fixture image bytes').decode()}) as prev, \
+             patch.object(image_gallery,'copy_clipboard_image',return_value=True) as copy:
             self.assertTrue(api.copy_gallery_image('fixture.model',0)['ok']);copy.assert_called_once_with(b'fixture image bytes',123)
+            self.assertNotIn('max_width',(prev.call_args.kwargs or {}),'原图档请求不得带显示档宽度')
+            self.assertNotIn('quality',(prev.call_args.kwargs or {}),'原图档请求不得带显示档质量')
 
     def test_invalid_or_oversized_input_rejected(self):
         with self.assertRaises(Exception):image_gallery.clipboard_dib(b'not an image')

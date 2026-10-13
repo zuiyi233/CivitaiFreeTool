@@ -67,7 +67,7 @@ function displayViewerEntry(v,c,entry,memory){
   Object.assign(c,{meta:{...(c.meta||{}),...(entry.full.meta||{})},resources:entry.full.resources?.length?entry.full.resources:(c.resources||[]),metadata_source:entry.full.metadata_source||c.metadata_source,width:entry.full.width,height:entry.full.height});
   mergeViewerMetadata(c,entry.metadata);renderGeneration(c);setViewerZoom(1,null,true);
   const source=memory?'内存缓存：直接复用已解码图片':entry.full.cache_hit?'本地缓存：读取与解码完成':'首次加载完成';
-  v.root.querySelector('#ivStatus').textContent=source+viewerTierNote(entry.full)+(entry.full.original_available===false?'；仅有预览，来源原图不可用':entry.full.preview_limited?'；预览限制 4096 px，保存仍使用来源文件':'；滚轮直接缩放图片');
+  v.root.querySelector('#ivStatus').textContent=source+viewerTierNote(entry.full)+((entry.full.original_available===false&&entry.full.downgraded!==true)?'；仅有预览，来源原图不可用':entry.full.preview_limited?'；预览限制 4096 px，保存仍使用来源文件':'；滚轮直接缩放图片');
   v.root.dataset.imageSource=memory?'memory':entry.full.cache_hit?'disk':'first';
 }
 

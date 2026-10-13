@@ -166,15 +166,37 @@ def build_info(model, version, site_base="https://civitai.red"):
     return info
 
 
+VIDEO_URL_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".avi")
+
+
+def is_video_image_entry(img):
+    """info images[] 条目是否视频：`type=='video'` **或** url/imageUrl 尾缀是视频扩展名。
+
+    只信 type 会漏：真实库 479 条 images[] 的 type 字段 100% 缺失、107 条（22.3%）实为 .mp4，
+    只看 type 就会把 mp4 直链当封面下载（gui 与 webui 的封面链路都走这里）。
+    判定只留这一份，webui._is_video_entry 是它的转发。
+    尾缀表与 image_gallery.VIDEO_SUFFIXES 同口径（有测试对拍），两处不同步就会出现
+    「一边判视频、一边当静帧去 PIL 解码」。"""
+    if not isinstance(img, dict):
+        return False
+    if str(img.get("type") or "").lower() == "video":
+        return True
+    for key in ("url", "imageUrl"):
+        u = str(img.get(key) or "").strip()
+        if u and u.lower().split("?")[0].split("#")[0].endswith(VIDEO_URL_EXTS):
+            return True
+    return False
+
+
 def pick_cover_url(imgs):
-    """选封面 URL：优先第一个 type!='video' 项的 url；若只有 video 项则用其 imageUrl（mp4 首帧）；都无返回 ''。
-    旧数据无 type 字段按非 video 处理，行为与历史一致。供 gui/webui 的封面下载与缩略图链路共用，
-    确保视频 mp4 直链绝不进入图片下载/解析管线。"""
+    """选封面 URL：优先第一个非视频项的 url；只有 video 项时退回其 imageUrl（mp4 首帧）；都无返回 ''。
+    视频判定走 is_video_image_entry（type 或 URL 尾缀）——旧数据没有 type 字段，只看 type 会把 mp4 当封面。
+    供 gui/webui 的封面下载与缩略图链路共用，确保视频 mp4 直链绝不进入图片下载/解析管线。"""
     video_poster = ""
     for img in (imgs or []):
         if not isinstance(img, dict):
             continue
-        if str(img.get("type") or "").lower() == "video":
+        if is_video_image_entry(img):
             if not video_poster:
                 video_poster = (img.get("imageUrl") or "").strip()
             continue
