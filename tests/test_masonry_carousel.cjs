@@ -7,8 +7,13 @@ const root=path.resolve(__dirname,'..'),web=path.join(root,'web');
 const source=fs.readFileSync(path.join(__dirname,'test_ui_preferences.cjs'),'utf8').replace(/\r\n/g,'\n');
 const begin=source.indexOf('await page.addInitScript(')+'await page.addInitScript('.length,
       end=source.indexOf('\n    });\n    const url',begin)+6,init=eval('('+source.slice(begin,end)+')');
+const hangSockets=new Set();
 const server=http.createServer((req,res)=>{
-  const url=new URL(req.url,'http://localhost'),p=path.resolve(web,'.'+decodeURIComponent(url.pathname==='/'?'/index.html':url.pathname));
+  const url=new URL(req.url,'http://localhost');
+  // /hang.mp4：视频请求吊住不返回。Chromium 因此既不解码也不报错，<video> 会带着 poster 一直留在 DOM 上，
+  // 这正是「鼠标移过去之前」的真实状态；换成会立刻失败的 URL 元素会被 onerror 摘掉，poster 就没处可查。
+  if(url.pathname==='/hang.mp4'){const s=res.socket;s.setTimeout(0);hangSockets.add(s);s.on('close',()=>hangSockets.delete(s));return;}
+  const p=path.resolve(web,'.'+decodeURIComponent(url.pathname==='/'?'/index.html':url.pathname));
   if(!p.startsWith(web+path.sep)){res.writeHead(403).end();return;}
   fs.readFile(p,(e,b)=>{if(e){res.writeHead(404).end();return;}
     res.setHeader('Content-Type',p.endsWith('.js')?'application/javascript':p.endsWith('.css')?'text/css':'text/html; charset=utf-8');res.end(b);});
@@ -170,6 +175,139 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
   assert(perCard<=2,'自动轮播下每张卡最多旧新两层，实测 '+perCard);
   ok('自动轮播按卡片各自一层（交叉期两层），不会叠罗汉');
 
+  // ===== 视频帧的首帧静图（用户报的「模型播的是视频，首帧直接空白，鼠标移动过去才会播」） =====
+  // 以下检查点全部手动驱动播放器，且保持自动节拍关闭：这些用例断言「整个网格叠层清零」，
+  // 自动轮播会在别的卡片上合法挂帧。
+  await page.mouse.move(4,4);
+  await page.evaluate(()=>{state.cfg.masonry_autoplay=false;_mmAutoSetInterval(false);
+    [...document.querySelectorAll('#mmMasonry .ms-card')].forEach(c=>_stopCarousel(c));});
+  const posterDu=await page.evaluate(()=>{const c=document.createElement('canvas');c.width=240;c.height=180;
+    const g=c.getContext('2d');g.fillStyle='#ff2d95';g.fillRect(0,0,240,180);return c.toDataURL('image/jpeg');});
+  const vidPath=await page.evaluate(()=>window.fixturePaths[0]);
+  // 吊住不返回的视频请求：Chromium 既解不出帧也不报错，<video> 会一直留在 DOM 上显示 poster——
+  // 这正是「起播前」的真实状态，用 https://cdn.example 之类的话 DNS 失败会把元素直接摘掉。
+  const hangSrc='http://127.0.0.1:'+server.address().port+'/hang.mp4';
+
+  await page.evaluate(([p,poster,src])=>{
+    // 走真实链路：后端原样回三元组 → prefetchMultiForCards 的映射 → 缓存 → 挂 <video>
+    window.fixtureMultiCovers[p]=[window.fixtureMultiCovers[p][0],[src,true,poster],window.fixtureMultiCovers[p][2]];
+    state.coverCacheMulti.delete(p); _multiTried.delete(p);
+    prefetchMultiForCards([...document.querySelectorAll('#mmMasonry .ms-card')].filter(x=>x.dataset.path===p));
+  },[vidPath,posterDu,hangSrc]);
+  await page.waitForFunction(([p,poster])=>{const l=state.coverCacheMulti.get(p)||[];
+    return l.length===3&&String((l[1]||[])[2]||'')===poster;},[vidPath,posterDu],{timeout:6000});
+  const mounted=await page.evaluate(([p,poster,src])=>{
+    const c=[...document.querySelectorAll('#mmMasonry .ms-card')].find(x=>x.dataset.path===p);
+    _stopCarousel(c);
+    const cached=(state.coverCacheMulti.get(p)||[])[1]||[];
+    const st=_carouselPlayer(c,p,false);            // 悬停路径：视频帧必须挂 <video>
+    _carouselAdvance(st);
+    const el=c.querySelector('video.ms-img-alt');
+    return {cachedPoster:String(cached[2]||''),cachedIsVideo:!!cached[1],
+      attr:el?String(el.getAttribute('poster')||''):null,idl:el?String(el.poster||''):null,
+      videoWidth:Number(el&&el.videoWidth||0)};
+  },[vidPath,posterDu,hangSrc]);
+  assert.equal(mounted.cachedIsVideo,true);
+  assert.equal(mounted.cachedPoster,posterDu,'预取映射把帧三元组的第三格（首帧静图）丢掉了');
+  assert(mounted.attr,'视频帧没挂出 <video>');
+  assert(mounted.attr,'挂出来的 <video> 没有 poster 属性（起播前就是一块空白）');
+  assert.equal(mounted.attr,posterDu,'<video> 的 poster 必须就是后端给的这一帧首帧静图');
+  assert.equal(mounted.idl,posterDu);
+  await page.waitForTimeout(500);
+  const whilePending=await page.evaluate(([p,poster])=>{const c=[...document.querySelectorAll('#mmMasonry .ms-card')].find(x=>x.dataset.path===p);
+    const el=c&&c.querySelector('video.ms-img-alt');
+    return el?{poster:String(el.getAttribute('poster')||''),alt:c.querySelectorAll('.ms-img-alt').length,videoWidth:Number(el.videoWidth||0)}:null;},[vidPath,posterDu]);
+  assert(whilePending,'解码中的 <video> 被摘掉了，poster 顶不住空白期');
+  assert.equal(whilePending.poster,posterDu,'解码前 poster 丢了');
+  assert.equal(whilePending.videoWidth,0,'这条路径本来就没解出任何视频帧（poster 是唯一有画面的东西）');
+  assert.equal(whilePending.alt,1,'同一时刻只应有一层叠帧');
+  ok('视频帧的 <video> 带首帧静图：三元组第三格经预取映射仍在缓存里，poster 实测 '+posterDu.length+' 字节 data URL（开头 '+mounted.attr.slice(0,22)+'…），解码前元素留在卡片上（'+whilePending.alt+' 层叠帧）');
+  await page.evaluate(()=>[...document.querySelectorAll('#mmMasonry .ms-card')].forEach(c=>_stopCarousel(c)));
+
+  // 自动轮播遇到视频帧：有首帧静图就以静帧身份参与（后端已不再把 poster 单独占一帧，跳过就等于卡片变呆）
+  const autoPoster=await page.evaluate(([p,poster,src])=>{
+    state.coverCacheMulti.set(p,[window.fixtureMultiCovers[p][0],[src,true,poster],window.fixtureMultiCovers[p][2]]);
+    const c=[...document.querySelectorAll('#mmMasonry .ms-card')].find(x=>x.dataset.path===p);
+    _stopCarousel(c);
+    const st=_carouselPlayer(c,p,true); st.auto=true;
+    _carouselAdvance(st);
+    const alts=[...c.querySelectorAll('.ms-img-alt')];
+    return {tags:alts.map(a=>a.tagName),src:alts.length?String(alts[alts.length-1].src):'',idx:st.idx,videoOnly:st.videoOnly};
+  },[vidPath,posterDu,hangSrc]);
+  assert.equal(autoPoster.videoOnly,false,'这条 fixture 必须是「静帧+视频」混合帧，自动轮播才会走跳过/静图分支');
+  assert.deepEqual(autoPoster.tags,['IMG'],'自动轮播下带 poster 的视频帧必须以静图挂载');
+  assert.equal(autoPoster.src,posterDu,'自动轮播挂出来的静图就是这一帧的 poster');
+  assert.equal(autoPoster.idx,2,'视频帧以静图参与后游标要前进，不能卡在视频帧');
+  ok('自动轮播：有首帧静图的视频帧以静图参与轮播（挂出 IMG，src=poster，游标 '+autoPoster.idx+'）');
+
+  // 没有首帧静图的老帧仍然跳过：一屏多路解码不划算，这条语义不能被顺手改掉
+  const autoBare=await page.evaluate(([p,src])=>{
+    state.coverCacheMulti.set(p,[window.fixtureMultiCovers[p][0],[src,true,''],window.fixtureMultiCovers[p][2]]);
+    const c=[...document.querySelectorAll('#mmMasonry .ms-card')].find(x=>x.dataset.path===p);
+    _stopCarousel(c);
+    const st=_carouselPlayer(c,p,true); st.auto=true;
+    _carouselAdvance(st);
+    const alts=[...c.querySelectorAll('.ms-img-alt')];
+    return {tags:alts.map(a=>a.tagName),src:alts.length?String(alts[alts.length-1].src):''};
+  },[vidPath,hangSrc]);
+  assert.deepEqual(autoBare.tags,['IMG']);
+  assert.equal(autoBare.src,await page.evaluate(p=>window.fixtureMultiCovers[p][2][0],vidPath),'没有 poster 的视频帧在自动轮播里仍该跳过，换下一张静帧');
+  ok('自动轮播：没有首帧静图的视频帧仍按老语义跳过（不解码）');
+
+  // 抓帧入口的接线：只在没有首帧静图时抓，序号取自本地落盘名 video_XX.mp4（帧三元组里没有 info 序号）
+  const spy=await page.evaluate(([p,poster])=>{
+    const calls=[]; const real=window.captureModelVideoPoster;
+    window.captureModelVideoPoster=(v,path,idx)=>{calls.push([path,idx]);return Promise.resolve('');};
+    const c=[...document.querySelectorAll('#mmMasonry .ms-card')].find(x=>x.dataset.path===p);
+    _stopCarousel(c);
+    state.coverCacheMulti.set(p,[window.fixtureMultiCovers[p][0],['http://127.0.0.1:1/a.mp4',true,poster]]);
+    let st=_carouselPlayer(c,p,false); _carouselAdvance(st); _stopCarousel(c);           // 有 poster：不该抓
+    state.coverCacheMulti.set(p,[window.fixtureMultiCovers[p][0],['file:///D:/Demo/models/m0.safetensors.images/video_03.mp4',true,'']]);
+    st=_carouselPlayer(c,p,false); _carouselAdvance(st); _stopCarousel(c);               // 无 poster：抓，序号 3-1
+    window.captureModelVideoPoster=real;
+    return calls;
+  },[vidPath,posterDu]);
+  assert.deepEqual(spy,[[vidPath,2]],'瀑布流视频帧的抓帧触发/序号推导不对');
+  ok('瀑布流 hover 播起来的无首帧视频才触发抓帧，序号取自 video_03.mp4');
+
+  const idxChecks=await page.evaluate(()=>({
+    local:_videoFrameInfoIndex('file:///D:/Demo/models/m0.safetensors.images/video_03.mp4'),
+    upper:_videoFrameInfoIndex('file:///D:/Demo/models/m0.safetensors.images/video_07.MP4'),
+    remote:_videoFrameInfoIndex('https://image.civitai.com/x/abc/hash/original=true/gen9f8e.mp4'),
+    coverLocal:_coverVideoInfoIndex({images:[]},{url:'file:///D:/Demo/models/x.safetensors.images/video_12.mp4'}),
+    coverRemote:_coverVideoInfoIndex({images:[{url:'https://cdn/a.mp4'},{url:'https://cdn/b.jpg'}]},{url:'https://cdn/a.mp4',orig_url:'https://cdn/a.mp4'}),
+  }));
+  assert.deepEqual(idxChecks,{local:2,upper:6,remote:-1,coverLocal:11,coverRemote:0},'首帧落盘序号推导错了会写进别的帧');
+  ok('首帧序号推导：本地 video_XX 认得出，远程 mp4 直链认不出（返回 -1，不猜）');
+
+  // 抓帧本体：readyState>=2 → 离屏 canvas（长边 640 / JPEG q0.82）→ save_model_video_poster(path, infoIndex, dataURL)
+  const cap=await page.evaluate(async ([p])=>{
+    const realCtx=HTMLCanvasElement.prototype.getContext, realApi=window.pywebview.api, calls=[];
+    HTMLCanvasElement.prototype.getContext=function(t){return t==='2d'?{drawImage(){}}:realCtx.apply(this,arguments);};
+    window.pywebview={api:new Proxy({},{get:(_,m)=>{
+      if(typeof m!=='string')return undefined;
+      return async(...a)=>{ if(m==='save_model_video_poster'){calls.push(a);return {ok:true,msg:'fixture 首帧已保存',path:'x'};} return realApi[m](...a); };
+    }})};
+    const vid=document.createElement('video'); vid.src='https://cdn.example/clip.mp4';
+    Object.defineProperty(vid,'readyState',{configurable:true,get:()=>2});   // 首帧已解出（真视频播起来才到 2）
+    Object.defineProperty(vid,'videoWidth',{configurable:true,get:()=>1280});
+    Object.defineProperty(vid,'videoHeight',{configurable:true,get:()=>720});
+    const du=String(await captureModelVideoPoster(vid,p,1));
+    const again=String(await captureModelVideoPoster(vid,p,1));               // 同 path#index 会话内只回传一次
+    const nope=String(await captureModelVideoPoster(vid,p,-1));               // 认不出序号就不抓，绝不猜
+    HTMLCanvasElement.prototype.getContext=realCtx; window.pywebview={api:realApi};
+    return {du,again,nope,calls:calls.map(c=>[c[0],c[1],String(c[2]).slice(0,15),String(c[2]).length]),n:calls.length};
+  },[vidPath]);
+  assert(cap.du.startsWith('data:image/jpeg'),'抓帧没有产出 JPEG data URL：'+cap.du.slice(0,40));
+  assert.equal(cap.n,1,'一次会话同一 path#index 只该回传一次（抓不到也算试过，不能逐帧刷爆 RPC）');
+  assert.deepEqual(cap.calls[0].slice(0,2),[vidPath,1],'save_model_video_poster 收到的 path/序号不对');
+  assert(cap.calls[0][2].startsWith('data:image/jpeg'));
+  assert.equal(cap.again,'');assert.equal(cap.nope,'');
+  ok('抓帧回传：'+cap.calls[0][3]+' 字节 JPEG 交给 save_model_video_poster(path, 1, dataURL)，重复调用与未知序号都不发 RPC');
+
+  await page.evaluate(()=>{state.coverCacheMulti.set(window.fixturePaths[0],window.fixtureMultiCovers[window.fixturePaths[0]]);});
+  await page.evaluate(()=>{state.cfg.masonry_autoplay=true;});
+
   // 关掉设置里的自动轮播后，不悬停就不该再动
   await page.evaluate(()=>{state.cfg.masonry_autoplay=false;
     [...document.querySelectorAll('#mmMasonry .ms-card')].forEach(c=>_stopCarousel(c));});
@@ -178,8 +316,9 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
   await page.evaluate(()=>{state.cfg.masonry_autoplay=true;});
   ok('设置项 masonry_autoplay 关掉即停，悬停轮播不受影响');
 
+ console.log('  判别性证据：视频帧 poster 属性 = '+mounted.idl.slice(0,24)+'…（'+mounted.idl.length+' 字符），自动轮播静帧 src = '+autoPoster.src.slice(0,24)+'…');
   assert.equal(errors.length,0,JSON.stringify(errors));
   ok('全部轮播检查无前端异常');
   console.log('PASS '+passed+' masonry carousel checks');
- }finally{await browser.close();server.close();}
+ }finally{await browser.close();[...hangSockets].forEach((s)=>s.destroy());server.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;server.close();});

@@ -255,7 +255,7 @@ const state = {
   display: [],
   mmChecked: new Set(),
   coverCache: new Map(),   // 前端封面缓存（path → dataURI）：重绘时同步填充，删除/刷新不再闪屏
-  coverCacheMulti: new Map(), // 瀑布流 hover 轮播多图缓存（path → [dataURI,...]）：get_covers_multi 批量预取，不影响单图链路
+  coverCacheMulti: new Map(), // 瀑布流轮播帧缓存（path → [[src,isVideo],...]，视频帧多一格首帧静图 [mp4Src,true,posterSrc]）：get_covers_multi 批量预取，不影响单图链路
   mmSel: new Set(),
   mmSort: { col: "name", rev: false },
   mmTypeF: "", mmBaseF: "", mmStF: "", mmFolderF: "", mmAuthorF: "", mmCoverF: "",   // Metro 筛选：底模 / 更新状态 / 文件夹 / 作者 / 封面
@@ -1852,14 +1852,15 @@ async function prefetchMultiForCards(cards) {
       if (state.coverCacheMulti.size > 4000) { state.coverCacheMulti.clear(); _multiTried.clear(); }   // 两个集合必须一起清：只清缓存会让 _multiTried 把老路径永久挡在门外
       for (const [p, list] of Object.entries(multi)) {
         if (!Array.isArray(list) || !list.length) continue;
-        // 帧格式 [[src, isVideo], ...]：src 为 dataURI（本地）或 https/file URL（远程/落盘视频），原样使用
+        // 帧格式 [[src, isVideo], [mp4Src, true, posterSrc], ...]：src 为 dataURI（本地）或 https/file URL（远程/落盘视频），原样使用
         state.coverCacheMulti.set(p, list
           .filter((f) => Array.isArray(f) && f[0])
           .map((f) => {
             const src = String(f[0]), isVideo = !!f[1];
             // 视频帧的 src 只能是可播直链（后端给 mp4 URL 或本地 file URI），绝不能再套 data:image/jpeg 前缀：
             // 那会把 mp4 地址伪装成 jpeg base64，交回 <img> 又是一次白费带宽且永远解不出图。
-            if (isVideo) return [src, true];
+            // 第三格是这一帧自己的首帧静图（本地 data: 或 CDN 缩略档），起播前画面全靠它，不能在这里丢掉。
+            if (isVideo) return [src, true, String(f[2] || "")];
             return [/^data:/i.test(src) || /^https?:/i.test(src) || /^file:/i.test(src) ? src : "data:image/jpeg;base64," + src, false];
           }));
         if (typeof _startCarousel !== "function") continue;
@@ -1902,8 +1903,8 @@ function _carouselPlayer(card, path, auto) {
   _masonryCarousel.set(card, st);
   return st;
 }
-// 帧计划：正常列表第 1 张是本地静帧封面，轮播从第 2 张起；首帧就是视频说明这模型没有静帧封面
-// （老 info 连 poster 都没有），此时从第 0 帧起，否则卡片主位一直空着。
+// 帧计划：正常列表第 1 张是本地静帧封面，轮播从第 2 张起；首帧就是视频说明这模型本地没有静帧封面
+// （卡片主位只剩占位图），此时从第 0 帧起，否则主位一直空着。
 // videoOnly = 封面之后没有任何静帧：全视频模型，自动轮播也必须能播，不然整卡在瀑布流里哑火。
 function _carouselFramePlan(frames) {
   const start = frames[0] && frames[0][1] ? 0 : 1;
@@ -1914,6 +1915,72 @@ function _carouselHasFrames(frames) {
   if (!Array.isArray(frames) || !frames.length) return false;
   const plan = _carouselFramePlan(frames);
   return frames.length >= 2 || plan.videoOnly;
+}
+// ---------- 视频首帧抓帧回传（详情主视频与瀑布流 hover 共用） ----------
+// 后端是纯 stdlib + PIL，解不了 H.264，能拿出首帧像素的只有浏览器：视频真正播到 readyState>=2 时离屏 canvas
+// 抓一帧回传 save_model_video_poster，落进「模型名.images/image_XX.jpg」，之后详情与瀑布流都按本地静帧读。
+// 手法与资源库 libCapturePoster 同一条（长边 640 / JPEG q0.82 / 失败静默），只是落点与 RPC 不同。
+const _modelPosterTried = new Set();   // key = path#index：抓不到（跨域画布被污染）也算试过，绝不逐帧重试刷爆 RPC
+function captureModelVideoPoster(video, path, infoIndex) {
+  const idx = Number(infoIndex);
+  if (!video || !path || !(idx >= 0)) return Promise.resolve("");   // 序号认不出就不抓：落错 image_XX 会把首帧写进别的帧
+  const key = path + "#" + idx;
+  if (_modelPosterTried.has(key)) return Promise.resolve("");
+  if (_modelPosterTried.size > 4000) _modelPosterTried.clear();   // 与 lib.posterTried 同一把尺子，长会话不至于无限堆
+  _modelPosterTried.add(key);
+  return new Promise((resolve) => {
+    let settled = false;
+    const wantSrc = String(video.src || "");   // src 属性解析后的绝对地址，不随重定向变化，正适合判「这个元素还在播我要的那一帧吗」
+    const finish = (value, retriable) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      video.removeEventListener("loadeddata", onData);
+      video.removeEventListener("error", onErr);
+      // 被换走 src 而放弃的要退回「未试过」：详情主视频与瀑布流都会复用同一个 <video> 元素改 src
+      if (retriable) _modelPosterTried.delete(key);
+      resolve(value);
+    };
+    const grab = () => {
+      // 此刻这个元素播的已经不是这一帧了（切缩略图、换卡片）：再抓就是把别的帧的首帧写成 image_XX.jpg
+      if (String(video.src || "") !== wantSrc) { finish("", true); return; }
+      let du = "";
+      try {
+        const vw = Number(video.videoWidth || 0), vh = Number(video.videoHeight || 0);
+        if (!vw || !vh) { finish(""); return; }
+        const scale = Math.min(1, 640 / Math.max(vw, vh));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(vw * scale));
+        canvas.height = Math.max(1, Math.round(vh * scale));
+        canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+        du = canvas.toDataURL("image/jpeg", 0.82);   // 跨域视频到这里会抛 SecurityError，画布脏了就抓不到
+      } catch (e) { finish(""); return; }           // 静默：正在播的视频不受影响，下次打开也不该重试
+      if (!du || du.length * 0.75 > 2 * 1024 * 1024) { finish(""); return; }
+      api.call("save_model_video_poster", path, idx, du)
+        .then((r) => finish(r && r.ok ? du : ""))
+        .catch(() => finish(""));
+    };
+    const onData = () => grab();
+    const onErr = () => finish("");
+    const timer = setTimeout(() => finish(""), 8000);   // 解码超时：这一帧就放弃
+    video.addEventListener("loadeddata", onData);
+    video.addEventListener("error", onErr);
+    if (Number(video.readyState || 0) >= 2) grab();   // 挂监听前首帧已解好（本地 file:// 常发生）
+  });
+}
+// 瀑布流帧三元组没有 info.images 的序号，只有按约定落盘的本地名 video_XX.mp4 带着它（远程 mp4 直链不含序号）
+function _videoFrameInfoIndex(src) {
+  const m = /[\\/]video_(\d+)\.[a-z0-9]+(?:[?#].*)?$/i.exec(String(src || ""));
+  return m ? Number(m[1]) - 1 : -1;
+}
+// 详情 cover → info.images[] 序号：save_model_video_poster 按这个序号落 image_XX.jpg，错一位就把首帧写进别的帧。
+// covers 里没有这个字段，只能回认：本地已落盘的视频名字里带着序号，否则用 orig_url 对回 info.images[].url。
+function _coverVideoInfoIndex(info, c) {
+  const local = _videoFrameInfoIndex((c || {}).url);
+  if (local >= 0) return local;
+  const u = String((c || {}).orig_url || (c || {}).url || "");
+  const images = Array.isArray((info || {}).images) ? info.images : [];
+  return u ? images.findIndex((im) => String((im || {}).url || "") === u) : -1;
 }
 function _nextFrame(fn) {
   let done = false;
@@ -1955,6 +2022,37 @@ function _carouselRearm(st) {
   clearInterval(st.timer);
   st.timer = setInterval(() => { if (!st.card.isConnected) { _stopCarousel(st.card); return; } _carouselAdvance(st); }, _MM_CAROUSEL_MS);
 }
+function _carouselStillFrame(st, src, my) {
+  // 静帧挂载（含视频帧的首帧静图）：data: 立即可用；远程档先预载，失败记 dead 并继续排拍，不能停摆
+  if (/^data:/i.test(src)) {
+    const alt = document.createElement("img");
+    alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
+    alt.src = src;
+    _carouselMount(st, alt);
+    st.idx = st.idx + 1; _carouselRearm(st);
+    return;
+  }
+  const pre = new Image();
+  let done = false;
+  const finish = (ok) => {
+    if (done) return;
+    done = true;
+    if (my !== st.seq) return;   // 期间已另起一帧请求：这一份整体作废，也不去动它的 loading
+    st.loading = false;
+    if (!ok) { st.dead.add(src); st.idx = st.idx + 1; _carouselRearm(st); return; }   // 失败也要继续排拍，不能停摆
+    const alt = document.createElement("img");
+    alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
+    alt.src = src;
+    _carouselMount(st, alt);
+    st.idx = st.idx + 1;
+    _carouselRearm(st);
+  };
+  pre.onload = () => finish(true);
+  pre.onerror = () => finish(false);
+  st.loading = true;
+  pre.src = src;
+  setTimeout(() => finish(false), 6000);   // 挂起帧 6s 超时跳过
+}
 function _carouselAdvance(st) {
   if (_masonryCarousel.get(st.card) !== st || st.loading) return;
   const list = st.list;
@@ -1962,9 +2060,14 @@ function _carouselAdvance(st) {
   for (let tries = 0; tries < list.length; tries++) {
     if (st.idx >= list.length) st.idx = (Number.isFinite(st.start) ? st.start : 1);   // 主封面固定第 1 张，轮播从第 2 张起并在此回卷（全视频模型从第 0 帧起）
     const frame = list[st.idx] || [];
-    const src = String(frame[0] || ""), isVideo = !!frame[1];
-    if (isVideo && st.auto && !st.videoOnly) { st.idx = st.idx + 1; continue; }   // 自动轮播默认不播视频帧：一屏多路解码不划算，悬停时才播
+    const src = String(frame[0] || ""), isVideo = !!frame[1], poster = String(frame[2] || "");
     if (isVideo) {
+      // 自动轮播默认不播视频帧：一屏多路解码不划算，悬停时才播。但视频帧现在自带首帧静图，
+      // 有静图就以静帧身份参与轮播——否则视频多的模型在自动模式下整帧被跳过，卡片看着就是呆的。
+      if (st.auto && !st.videoOnly) {
+        if (!poster || st.dead.has(poster)) { st.idx = st.idx + 1; continue; }   // 静图也走同一份 dead 名单：拉挂过的档别再每拍重试
+        _carouselStillFrame(st, poster, my); return;
+      }
       // 视频帧只交给 <video>：src 是 mp4 直链或本地 file URI。协议不对就直接跳过这一帧，
       // 绝不落到下面的 new Image()——真实库 479 条 images[] 里 107 条（22.3%）是 .mp4，
       // 图片预载拿到的是 content-type: video/mp4 的 1.28–2.31MB 视频字节，图片永远解码不出来却已经花掉带宽。
@@ -1972,40 +2075,19 @@ function _carouselAdvance(st) {
       const v = document.createElement("video");
       v.className = "ms-img ms-img-alt"; v.muted = true; v.loop = true; v.autoplay = true;
       v.playsInline = true; v.preload = "metadata";
+      // 首帧静图写进 poster：preload="metadata" 的 <video> 在播起来之前就是一块空白（用户报的主症状），
+      // 有后端给的第一帧就先垫上，鼠标移过去才动画面也不会闪白。
+      if (poster) v.poster = poster;
       v.onerror = () => { if (st.cur === v) { try { v.pause(); } catch (_) {} v.remove(); st.cur = null; } };
       v.src = src;
       if (_carouselMount(st, v)) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); }
+      // 连首帧静图都没有的老帧：hover 真播起来时抓一帧回传落盘（认不出 info 序号的远程帧内部会自己放弃）
+      if (!poster) { captureModelVideoPoster(v, st.card.dataset.path, _videoFrameInfoIndex(src)).then((du) => { if (du) frame[2] = du; }); }
       st.idx = st.idx + 1; _carouselRearm(st); return;
     }
     if (!src) { st.idx = st.idx + 1; continue; }   // 空 src 不喂给 new Image()（空串既不发 load 也不发 error，会把这一拍拖到 6s 超时）
-    if (/^data:/i.test(src)) {
-      const alt = document.createElement("img");
-      alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
-      alt.src = src;   // 本地 b64 立即可用
-      _carouselMount(st, alt);
-      st.idx = st.idx + 1; _carouselRearm(st); return;
-    }
-    if (st.dead.has(src)) { st.idx = st.idx + 1; continue; }
-    const pre = new Image();
-    let done = false;
-    const finish = (ok) => {
-      if (done) return;
-      done = true;
-      if (my !== st.seq) return;   // 期间已另起一帧请求：这一份整体作废，也不去动它的 loading
-      st.loading = false;
-      if (!ok) { st.dead.add(src); st.idx = st.idx + 1; _carouselRearm(st); return; }   // 失败也要继续排拍，不能停摆
-      const alt = document.createElement("img");
-      alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
-      alt.src = src;
-      _carouselMount(st, alt);
-      st.idx = st.idx + 1;
-      _carouselRearm(st);
-    };
-    pre.onload = () => finish(true);
-    pre.onerror = () => finish(false);
-    st.loading = true;
-    pre.src = src;
-    setTimeout(() => finish(false), 6000);   // 挂起帧 6s 超时跳过
+    if (!/^data:/i.test(src) && st.dead.has(src)) { st.idx = st.idx + 1; continue; }
+    _carouselStillFrame(st, src, my);
     return;
   }
   st.idx = Number.isFinite(st.start) ? st.start : 1; _carouselRearm(st);   // 所有帧都不可用：继续排拍，别把这一轮卡死
@@ -3616,9 +3698,16 @@ async function showModelDetail(path, historyId = "") {
     panel.querySelector('.detail-title').insertAdjacentHTML('afterend', '<p class="history-model">历史信息缓存 · 本地文件已移走或不存在，仅供查看</p>');
     panel.querySelectorAll('#dEditInfo,#dRename,#dRenameC,#dCover,#dRp,#dSync,#dTranslate,#dLocalize,#dJson,#dAllImgs').forEach(button => button.disabled = true);
   }
-  // 自动加载所有 URL 缩略图（避免空占位）；视频项取首帧图（poster）转 b64，绝不把 mp4 直链当图片请求
+  // 自动加载所有 URL 缩略图（避免空占位）；视频项取首帧图（poster），绝不把 mp4 直链当图片请求
   covers.forEach((c, i) => {
     const thumbUrl = c.type === "video" ? (c.poster || "") : (c.url || "");
+    // poster 现在可能是 data:（磁盘已有首帧，后端直接给帧字节）。get_cover_b64 只认 http(s)、对 data: 返回空串，
+    // 走下面的 RPC 会把这张本来有图的缩略图整个 remove 掉——本地已有帧就直接当 src 用，不发 RPC。
+    if (!c.b64 && /^data:/i.test(thumbUrl)) {
+      const th = panel.querySelector('.detail-thumb[data-i="' + i + '"]');
+      if (th) th.src = thumbUrl;
+      return;
+    }
     if (!c.b64 && thumbUrl) {
       api.call("get_cover_b64", thumbUrl).then((b64) => {
         if (generation !== detailGeneration) return;
@@ -3639,6 +3728,10 @@ async function showModelDetail(path, historyId = "") {
       });
     }
   });
+  // 首帧静图缺失的老视频：主视频播起来时抓一帧回传落盘，下次打开详情/瀑布流就是本地静帧。
+  // 已有 poster（本地帧或 info 的 imageUrl）就不抓——抓一次是白烧一路解码 + 一次 RPC。
+  if (firstVideo && !firstVideo.poster) captureModelVideoPoster($("#dMain", panel), d.path, _coverVideoInfoIndex(info, firstVideo))
+    .then((du) => { if (du) firstVideo.poster = du; });
   const bindMainImage=()=>{   // 图片主图绑定“点击放大查看”（同一 img 只绑一次）；视频主图有原生控制条，不抢点击
     const m=$("#dMain",panel);if(!m||m.tagName!=="IMG"||m.dataset.mainBound)return;
     m.dataset.mainBound="1";
@@ -3669,6 +3762,7 @@ async function showModelDetail(path, historyId = "") {
       video.setAttribute('title','放大观看视频（播放器自带全屏）');video.tabIndex=0;
       if(video.onclick)video.onclick=null;
       delete video.dataset.empty;delete video.dataset.hdIndex;
+      if(!c.poster)captureModelVideoPoster(video,d.path,_coverVideoInfoIndex(info,c)).then(du=>{if(du)c.poster=du;});
       return;
     }
     // 图片项：先停掉并移除主图区的视频
@@ -3683,6 +3777,8 @@ async function showModelDetail(path, historyId = "") {
     if(!current())return;
     if(warm){image.src=warm.url;image.dataset.hdIndex=String(i);image.style.opacity='1';delete image.dataset.empty;return;}
     if(c.b64){image.src='data:image/jpeg;base64,'+c.b64;delete image.dataset.empty;}
+    // data: 直接当 src：get_cover_b64 只认 http(s)，把 data: 喂进去只会拿到空串
+    else if(/^data:/i.test(c.url||'')){image.src=c.url;delete image.dataset.empty;}
     else if(c.url){
       image.style.opacity='.5';const b64=await api.call('get_cover_b64',c.url);
       if(!current())return;
@@ -4777,7 +4873,7 @@ const SETTING_FIELDS = [
   ["界面", "ui_mode", "启动界面", "select", [["window", "软件窗口（默认；失败可浏览器兜底）"], ["browser", "浏览器启动（以后不尝试软件窗口）"]]],
   ["界面", "window_wait_seconds", "窗口模式等待秒数", "number"],
   ["界面", "browser_fallback_enabled", "软件窗口失败时自动浏览器兜底", "bool"],
-  ["界面", "cache_detail_images", "缓存详情在线缩略图", "bool"],
+  ["界面", "cache_detail_images", "缓存详情与瀑布流的在线缩略图", "bool"],
   ["界面", "pointer_effects", "鼠标交互特效", "select", [["off", "关闭"], ["click", "仅点击波纹"], ["trail", "拖尾 + 点击"]]],
   ["界面", "pointer_effect_quality", "交互特效性能档", "select", [["low", "轻量 · 少量粒子"], ["high", "精细 · 更多粒子"]]],
   ["界面", "effects_fps_limit", "动画帧率上限（0 = 跟随屏幕）", "number"],
