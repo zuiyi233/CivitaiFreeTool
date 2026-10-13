@@ -1,6 +1,8 @@
 // 自绘原生窗口栏。窗体仍保留系统缩放、最小/最大化、任务栏及键盘 Snap 样式。
 using System;
 using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
 using System.Windows.Forms;
 using System.Runtime.InteropServices;
 namespace CftNative {
@@ -58,6 +60,113 @@ namespace CftNative {
       base.WndProc(ref m);
     }
     public void RestoreFrame(){IntPtr h=Handle;int state=GetWindowLong(h,-16)&0x31000000;SetWindowLong(h,-16,(oldStyle&~0x31000000)|state);ReleaseHandle();SetWindowPos(h,IntPtr.Zero,0,0,0,0,0x27);}
+  }
+  // 视频首帧出图：借系统外壳（Explorer 同款）的缩略图工厂，让 Windows 自己的解码器出像素。
+  // 约束是不装 ffmpeg、不加第三方依赖，而 file:// 页面里 Chromium 又必然把画布标脏（toDataURL 抛
+  // SecurityError），所以首帧只能由程序自己落到磁盘上。失败一律返回 null 并把原因留在 LastError，
+  // 绝不把异常抛回 Python（上层据此安静回退到浏览器抓帧）。
+  public static class VideoThumb {
+    public static string LastError="";
+
+    [StructLayout(LayoutKind.Sequential)] struct SIZE{public int cx;public int cy;}
+
+    // IShellItemImageFactory。两个易错点：InterfaceType 必须是 InterfaceIsIUnknown（留默认值会去 QI
+    // IDispatch，实测就是 E_NOINTERFACE 的来源）；GetImage 是这个接口 vtable 的第 0 个方法，紧跟在
+    // IUnknown 三槽后面，声明顺序错一格就会调到 AddRef 上。
+    [ComImport,Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellItemImageFactory {
+      [PreserveSig] int GetImage(SIZE size,uint flags,out IntPtr phbm);
+    }
+
+    [DllImport("shell32.dll",CharSet=CharSet.Unicode)]
+    static extern int SHCreateItemFromParsingName(
+      [MarshalAs(UnmanagedType.LPWStr)] string path,IntPtr pbc,ref Guid riid,
+      [MarshalAs(UnmanagedType.Interface)] out IShellItemImageFactory factory);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr hObject);
+
+    // IIGBF_*：0=RESIZETOFIT 等比放进框内；8=THUMBNAILONLY 只认真缩略图（否则拿不到解码帧时
+    // 会返回一个通用文件图标，那种"成功"对海报毫无意义，必须当失败）。
+    const uint IIGBF_RESIZETOFIT=0x0,IIGBF_THUMBNAILONLY=0x8;
+
+    static string Normalize(string path){
+      if(string.IsNullOrEmpty(path)||path.IndexOf('\0')>=0)return null;
+      try{return Path.GetFullPath(path.Replace('/','\\'));}catch(Exception){return null;}
+    }
+
+    // 入口：返回 JPEG 字节，失败返回 null。maxSize 是长边像素上限，quality 缺省 82（与网页端海报一致）。
+    public static byte[] FirstFrameJpeg(string path,int maxSize,int quality){
+      LastError="";
+      string full=Normalize(path);
+      if(full==null){LastError="路径无效";return null;}
+      if(!File.Exists(full)){LastError="文件不存在: "+full;return null;}
+      if(maxSize<16)maxSize=16;else if(maxSize>4096)maxSize=4096;
+      IntPtr hbmp=IntPtr.Zero;
+      try{
+        Guid riid=new Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b");
+        IShellItemImageFactory factory;
+        int hr=SHCreateItemFromParsingName(full,IntPtr.Zero,ref riid,out factory);
+        if(hr!=0||factory==null){LastError="SHCreateItemFromParsingName 0x"+hr.ToString("x8");return null;}
+        SIZE box=new SIZE();box.cx=maxSize;box.cy=maxSize;
+        hr=factory.GetImage(box,IIGBF_RESIZETOFIT|IIGBF_THUMBNAILONLY,out hbmp);
+        if(hr!=0||hbmp==IntPtr.Zero){
+          hbmp=IntPtr.Zero;   // 失败时不能信 out 值，避免删到野句柄
+          LastError="GetImage 0x"+hr.ToString("x8");
+          return null;
+        }
+        using(System.Drawing.Image raw=Image.FromHbitmap(hbmp)){
+          int w=raw.Width,h=raw.Height;
+          if(w<2||h<2){LastError="缩略图尺寸异常 "+w+"x"+h;return null;}
+          // JPEG 没有 alpha 通道。直接往 24bpp 上画会按黑底做混合，透明图就整张发暗；先无损丢掉
+          // alpha 通道（Bitmap.Clone 到 Format32bppRgb 是转通道，不是合成），再缩放。
+          PixelFormat fmt=raw.PixelFormat;
+          bool alpha=fmt==PixelFormat.Format32bppArgb||fmt==PixelFormat.Format32bppPArgb||
+                     fmt==PixelFormat.Format64bppArgb||fmt==PixelFormat.Format64bppPArgb;
+          Bitmap stripped=null;
+          System.Drawing.Image source=raw;
+          try{
+            Bitmap asBitmap=raw as Bitmap;
+            if(alpha&&asBitmap!=null){stripped=asBitmap.Clone(new Rectangle(0,0,w,h),PixelFormat.Format32bppRgb);source=stripped;}
+            int tw=w,th=h;
+            if(w>maxSize||h>maxSize){
+              double k=(double)maxSize/(double)Math.Max(w,h);
+              tw=Math.Max(1,(int)Math.Round(w*k));th=Math.Max(1,(int)Math.Round(h*k));
+            }
+            using(Bitmap fit=new Bitmap(tw,th,PixelFormat.Format24bppRgb)){
+              using(Graphics g=Graphics.FromImage(fit)){
+                g.InterpolationMode=System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode=System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                g.SmoothingMode=System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                // 目标矩形不含边界膨胀，奇数尺寸/极端比例都不会裁掉边缘像素。
+                g.DrawImage(source,new Rectangle(0,0,tw,th),new Rectangle(0,0,w,h),GraphicsUnit.Pixel);
+              }
+              byte[] bytes=Encode(fit,quality);
+              LastError="";
+              return bytes;
+            }
+          }finally{if(stripped!=null)stripped.Dispose();}
+        }
+      }catch(OutOfMemoryException){LastError="GDI+ 解码失败（位图过大或格式损坏）";return null;}
+      catch(Exception e){LastError=e.GetType().Name+": "+Trim(e.Message);return null;}
+      finally{if(hbmp!=IntPtr.Zero)DeleteObject(hbmp);}
+    }
+
+    static string Trim(string s){try{return s.Length>160?s.Substring(0,160):s;}catch(Exception){return"";}}
+
+    static byte[] Encode(Image img,int quality){
+      if(quality<1||quality>100)quality=82;
+      ImageCodecInfo codec=null;
+      foreach(ImageCodecInfo c in ImageCodecInfo.GetImageEncoders()){if(c.FormatID==ImageFormat.Jpeg.Guid){codec=c;break;}}
+      using(MemoryStream ms=new MemoryStream()){
+        if(codec==null)img.Save(ms,ImageFormat.Jpeg);
+        else{
+          using(EncoderParameters p=new EncoderParameters(1)){
+            p.Param[0]=new EncoderParameter(System.Drawing.Imaging.Encoder.Quality,(long)quality);
+            img.Save(ms,codec,p);
+          }
+        }
+        return ms.ToArray();
+      }
+    }
   }
   public class PassCaption : NativeWindow {
     public PassCaption(Control c){AssignHandle(c.Handle);}
