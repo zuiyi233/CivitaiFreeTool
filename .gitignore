@@ -98,3 +98,6 @@ media_library.db
 media_library.db-wal
 media_library.db-shm
 media_posters/
+
+# 仓库内的本地工具链与夹具（playwright、chromium、基线 worktree），只用于本机跑测试，不入库
+.tools/
