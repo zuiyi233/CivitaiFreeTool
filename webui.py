@@ -279,13 +279,18 @@ def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_
         return False
 
 
-def _images_fill_targets(base, images, want_videos=True, video_limit=None):
-    """info images[] → <base>.images/ 落盘清单 [(kind, url, dest)]，kind 为 'image' 或 'video'。
+def _images_fill_targets(base, images, want_videos=True, video_limit=None, want_posters=None):
+    """info images[] → <base>.images/ 落盘清单 [(kind, url, dest)]，kind 为 'image' / 'video' / 'poster'。
 
     命名与「已存在即跳过」的幂等语义完全沿用 download_all_images：静帧 image_%02d.<ext>；
     视频首帧 poster 落 image_%02d.jpg、原片落 video_%02d.mp4（同序号，本地优先取用靠这个约定）。
     判定一律走 _is_video_entry —— 老 info 没有 type 字段，只按 type 判会把 mp4 存成 image_XX.jpg。
-    video_limit：本次最多落几个 mp4（None=不限）。自动补帧必须带上限，见调用处。"""
+    video_limit：本次最多落几个 mp4（None=不限）。自动补帧必须带上限，见调用处。
+    kind='poster' 的"url"是本地 mp4 路径：真实库 107 个视频帧的 imageUrl 实测 100% 为空，
+    首帧只能由程序自己从本地原片里取（video_thumb 走 Windows 外壳），否则详情页与轮播永远是一块空白。"""
+    import video_thumb
+    if want_posters is None:
+        want_posters = video_thumb.available()
     out_dir = base + ".images"
     targets = []
     videos_left = None if video_limit is None else max(0, int(video_limit))
@@ -294,13 +299,23 @@ def _images_fill_targets(base, images, want_videos=True, video_limit=None):
             continue
         if _is_video_entry(im):
             poster = str(im.get("imageUrl") or "").strip()
+            poster_dest = os.path.join(out_dir, "image_%02d.jpg" % (i + 1))
             if poster:
-                targets.append(("image", poster, os.path.join(out_dir, "image_%02d.jpg" % (i + 1))))
+                targets.append(("image", poster, poster_dest))
+            vdest = _local_video_file(base, i + 1)
+            try:
+                have_video = os.path.isfile(vdest) and os.path.getsize(vdest) > 1024
+            except OSError:
+                have_video = False
             mp4 = _video_source_url(im)
             if mp4 and want_videos and (videos_left is None or videos_left > 0):
                 if videos_left is not None:
                     videos_left -= 1
-                targets.append(("video", mp4, _local_video_file(base, i + 1)))
+                targets.append(("video", mp4, vdest))
+                have_video = True
+            # 排在 video 目标之后：同一批里原片刚落好就能取帧；存量已落盘没首帧的也在这里补（纯本地零网络）
+            if want_posters and have_video and not poster:
+                targets.append(("poster", vdest, poster_dest))
             continue
         u = str(im.get("url") or "").strip()
         if not u:
@@ -358,6 +373,7 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
     if deadline_s is None:
         deadline_s = _fetch_deadline_s(cfg)
     stats = {"total": len(targets or []), "downloaded": 0, "failed": 0, "skipped": 0, "msg": ""}
+    note = ""   # 最后一项的跳过/失败原因；空清单时也要有值可报
     # 磁盘余量按模型所在盘探测：<名>.images 首次补帧时还不存在，直接探它会抛错、把整批误判成「空间不足」
     probe_dir = os.path.dirname(os.path.abspath(path)) if path else None
     out_dir = None
@@ -390,6 +406,12 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
                     ok = _download_video(url, dest, timeout=min(180, max(5, int(left))), proxy=proxy,
                                          verify=verify, max_bytes=_video_cap_bytes(cfg),
                                          deadline=started + deadline_s)
+                elif kind == "poster":
+                    # url 是本地 mp4 路径：向 Windows 外壳要首帧，失败就是没有（非 Windows 时清单里根本不会有这项）
+                    import video_thumb
+                    ok = video_thumb.first_frame(url, dest, max_size=640)
+                    if not ok:
+                        note = "本机取不到视频首帧：%s" % (video_thumb.last_error() or "未知原因")
                 else:
                     ok = _download_image_limited(url, dest, timeout=min(60, max(5, int(left))), proxy=proxy,
                                                  verify=verify, max_bytes=_image_cap_bytes(cfg),
@@ -406,7 +428,9 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
             state["failed"] = stats["failed"]
             state["skipped"] = stats["skipped"]
     if not stats["msg"]:
-        stats["msg"] = note if stats["skipped"] else ("补帧完成" if stats["downloaded"] else "无需补帧")
+        # 失败原因也要能冒出来：全批一张没成时，界面不能只说"无需补帧"
+        stats["msg"] = note if (stats["skipped"] or (note and not stats["downloaded"])) \
+            else ("补帧完成" if stats["downloaded"] else "无需补帧")
     return stats
 
 
@@ -1963,7 +1987,7 @@ class Api:
                         poster_b64 = "data:image/jpeg;base64," + pb
                 local_uri = _local_video_uri(base, i + 1)
                 covers.append({"type": "video", "url": local_uri or u, "local": bool(local_uri),
-                               "poster": poster_b64 or (img.get("imageUrl") or ""),
+                               "poster": poster_b64 or self._remote_frame_thumb(img.get("imageUrl")),
                                "poster_local": bool(poster_b64),
                                "prompt": (img.get("meta") or {}).get("prompt") or "",
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
@@ -3407,16 +3431,18 @@ class Api:
         return _civitai_thumb_url(u, _WATERFALL_THUMB_W)
 
     def get_covers_multi(self, paths, size=220, n=3):
-        """批量返回轮播帧（JSON：{path: [[src, isVideo], [mp4, True, poster], ...]}）。
+        """批量返回轮播帧（JSON：{path: [[src, isVideo], [mp4, True, poster, infoIndex], ...]}）。
 
         帧顺序 = **本地优先于远程**：封面（.preview.* 或 .images 首图）→ 按 info 序号依次取帧，
         该序号本地已落盘就用本地 b64（同帧绝不重复出远程 URL），本地没有才用 .civitai.info 的
         远程 URL → 无序号的本地图片补位。远程静帧与视频 poster 都走 _remote_frame_thumb：
         磁盘上已有这一档就直接出 data:（第二次打开完全不碰网络），没有才出 CDN 缩略档并排一次后台入盘。
         视频项一律走 _is_video_entry 判定，只返回可播源（本地 video_XX.mp4 的 file URI，否则 mp4 直链）
-        并标 isVideo=True，第三个元素是它的首帧静图（本地 image_XX.jpg 的 data:，否则 info 的 imageUrl
-        缩略档，都没有才空）——以前视频帧不带任何东西，前端 <video preload="metadata"> 起播前就是一块空白，
-        只有 hover 播起来才看见画面，本地 mp4 已落盘的分支更是连 poster 都不给。
+        并标 isVideo=True；第三格是它的首帧静图（本地 image_XX.jpg 的 data:，否则 info 的 imageUrl
+        缩略档，都没有才空），第四格是该帧在 info.images[] 里的序号——抓帧回传要按这个序号落盘，
+        远程 mp4 的 URL 里推不出序号，让前端猜就会把别帧的首帧写成这个文件名。以前视频帧第三格根本没有：
+        前端 <video preload="metadata"> 起播前就是一块空白，只有 hover 播起来才看见画面，
+        本地 mp4 已落盘的分支更是连 poster 都不给。
 
         以前这里是「info 不足 n 张才用本地补位」，且只按 type 判视频 —— 真实库的 images[] 100% 没有
         type 字段，于是 22.3% 的 .mp4 被当成静帧塞给 <img>：拿到的是 content-type: video/mp4 的
@@ -3513,11 +3539,11 @@ class Api:
                             poster = self._remote_frame_thumb(img.get("imageUrl"))
                         local_uri = _local_video_uri(base_p, i + 1)
                         if local_uri:
-                            items.append([local_uri, True, poster])   # 本地落盘视频：离线可播
+                            items.append([local_uri, True, poster, i])   # 本地落盘视频：离线可播
                             continue
                         mp4 = _video_source_url(img)
                         if mp4:
-                            items.append([mp4, True, poster])         # 远程 mp4：hover 时流式播放
+                            items.append([mp4, True, poster, i])         # 远程 mp4：hover 时流式播放
                     else:
                         u = str(img.get("url") or "").strip()
                         if u:

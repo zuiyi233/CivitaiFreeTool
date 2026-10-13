@@ -376,7 +376,7 @@ class CoversMultiTests(unittest.TestCase):
             items,_=self.frames(api,d,[{'url':V1}])
             # 远程 mp4 直链 + isVideo=True + 第三格 poster（这条 info 没有 imageUrl，所以是空串）；
             # 绝不 thumb 化、绝不塞给 <img>。
-            self.assertEqual(items,[[V1,True,'']])
+            self.assertEqual(items,[[V1,True,'',0]])   # 第四格 = info.images[] 序号，抓帧回传按它落盘
             # info 带 imageUrl（新 info）→ poster 给到缩略档 URL，前端 <video poster> 与自动轮播都靠它
             items_p,_=self.frames(api,d,[{'url':V1,'imageUrl':POSTER1}])
             self.assertEqual(len(items_p),1)
@@ -405,7 +405,8 @@ class CoversMultiTests(unittest.TestCase):
         frame=items[-1]
         self.assertTrue(frame[1],'视频帧仍要标 isVideo')
         self.assertTrue(frame[0].startswith('file:///'),frame[0])
-        self.assertEqual(len(frame),3,'视频帧必须带第三格 poster')
+        self.assertEqual(len(frame),4,'视频帧必须带 poster 与 info 序号两格')
+        self.assertEqual(frame[3],0,'序号错一位就会把首帧写进别的帧的文件名')
         self.assertTrue(frame[2].startswith('data:image/jpeg;base64,'),frame[2][:60])
 
 class DetailAndBridgeTests(unittest.TestCase):
@@ -696,5 +697,65 @@ class SaveModelVideoPosterTests(unittest.TestCase):
             r=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64())
             self.assertFalse(r['ok'],r)
             self.assertEqual(list(external.iterdir()),[],'被拒时绝不能往链接指向的目录写任何东西')
+
+class VideoPosterFillTests(unittest.TestCase):
+    """真实库 107 个视频帧的 imageUrl 实测 100% 为空 —— 首帧只能由程序从本地原片里取。
+    取帧能力在 video_thumb（Windows 外壳），这里钉的是补帧管线：什么时候排、幂等、失败不炸。"""
+
+    def _targets(self,base,images,**kw):
+        return webui._images_fill_targets(base,images,**kw)
+
+    def test_poster_target_follows_video_target(self):
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m.safetensors')[:-len('.safetensors')]
+            t=self._targets(base,[{'url':V1}],want_posters=True)
+            kinds=[(k,os.path.basename(dest)) for k,_src,dest in t]
+            self.assertEqual(kinds,[('video','video_01.mp4'),('poster','image_01.jpg')],t)
+            self.assertEqual(t[1][1],t[0][2],'poster 的源就是这一批刚落盘的原片')
+
+    def test_no_poster_target_when_helper_unavailable_or_poster_exists(self):
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m')
+            self.assertEqual([k for k,_s,_dst in self._targets(base,[{'url':V1}],want_posters=False)],['video'])
+            # info 自带 imageUrl 时首帧走远程下载，不再让外壳重复出一张
+            self.assertEqual([k for k,_s,_dst in self._targets(base,[{'url':V1,'imageUrl':POSTER1}],want_posters=True)],['image','video'])
+
+    def test_existing_video_without_poster_is_queued_locally(self):
+        # 存量：原片早就在盘上、没有首帧 → 清单里要有 poster 项，且 _fill_pending_targets 认为它待办（零网络）
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m')
+            idir=Path(d)/'m.images';idir.mkdir();(idir/'video_01.mp4').write_bytes(b'f'*4096)
+            t=self._targets(base,[{'url':V1}],want_videos=False,want_posters=True)
+            self.assertEqual([k for k,_s,_dst in t],['poster'],t)
+            self.assertEqual([k for k,_s,_dst in webui._fill_pending_targets(t)],['poster'])
+            (idir/'image_01.jpg').write_bytes(b'x'*2048)
+            self.assertEqual(webui._fill_pending_targets(self._targets(base,[{'url':V1}],want_videos=False,want_posters=True)),[],
+                             '已有首帧就不再排，重复打开详情零成本')
+
+    def test_run_calls_helper_and_counts_it(self):
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m');idir=Path(d)/'m.images';idir.mkdir()
+            vdir=idir/'video_01.mp4';vdir.write_bytes(b'f'*4096)
+            poster=idir/'image_01.jpg'
+            def fake(src,dst,max_size=640):
+                Path(dst).write_bytes(b'\xff\xd8fakejpeg');return True
+            with patch.object(webui,'_fill_free_space_ok',return_value=(True,'')),\
+                 patch('video_thumb.first_frame',side_effect=fake):
+                stats=webui._images_fill_run(os.path.join(d,'m.safetensors'),
+                                             [('poster',str(vdir),str(poster))],{})
+            self.assertEqual(stats['downloaded'],1,stats);self.assertTrue(poster.is_file())
+
+    def test_run_survives_helper_failure(self):
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m');idir=Path(d)/'m.images';idir.mkdir()
+            vdir=idir/'video_01.mp4';vdir.write_bytes(b'f'*4096)
+            with patch.object(webui,'_fill_free_space_ok',return_value=(True,'')),\
+                 patch('video_thumb.first_frame',return_value=False),\
+                 patch('video_thumb.last_error',return_value='外壳没有缩略图提供程序'):
+                stats=webui._images_fill_run(os.path.join(d,'m.safetensors'),
+                                             [('poster',str(vdir),str(idir/'image_01.jpg'))],{})
+            self.assertEqual((stats['downloaded'],stats['failed']),(0,1),stats)
+            self.assertFalse((idir/'image_01.jpg').exists())
+            self.assertIn('外壳',stats['msg'],stats['msg'])
 
 if __name__=='__main__':unittest.main()

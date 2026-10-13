@@ -1860,7 +1860,7 @@ async function prefetchMultiForCards(cards) {
             // 视频帧的 src 只能是可播直链（后端给 mp4 URL 或本地 file URI），绝不能再套 data:image/jpeg 前缀：
             // 那会把 mp4 地址伪装成 jpeg base64，交回 <img> 又是一次白费带宽且永远解不出图。
             // 第三格是这一帧自己的首帧静图（本地 data: 或 CDN 缩略档），起播前画面全靠它，不能在这里丢掉。
-            if (isVideo) return [src, true, String(f[2] || "")];
+            if (isVideo) return [src, true, String(f[2] || ""), Number.isFinite(Number(f[3])) ? Number(f[3]) : -1];
             return [/^data:/i.test(src) || /^https?:/i.test(src) || /^file:/i.test(src) ? src : "data:image/jpeg;base64," + src, false];
           }));
         if (typeof _startCarousel !== "function") continue;
@@ -1968,7 +1968,14 @@ function captureModelVideoPoster(video, path, infoIndex) {
     if (Number(video.readyState || 0) >= 2) grab();   // 挂监听前首帧已解好（本地 file:// 常发生）
   });
 }
-// 瀑布流帧三元组没有 info.images 的序号，只有按约定落盘的本地名 video_XX.mp4 带着它（远程 mp4 直链不含序号）
+// 视频帧的 info.images[] 序号：后端在第四格直接给（get_covers_multi 的 [mp4, true, poster, infoIndex]）。
+// 老帧/详情 cover 没有这一格时，只能按约定落盘的本地名 video_XX.mp4 反推——远程 mp4 直链里不含序号，
+// 猜不出来就别猜：抓错序号会把别帧的首帧写成这个文件名，宁可继续空白。
+function _frameInfoIndex(frame) {
+  const n = Number(Array.isArray(frame) ? frame[3] : NaN);
+  if (Number.isInteger(n) && n >= 0) return n;
+  return _videoFrameInfoIndex(Array.isArray(frame) ? frame[0] : frame);
+}
 function _videoFrameInfoIndex(src) {
   const m = /[\\/]video_(\d+)\.[a-z0-9]+(?:[?#].*)?$/i.exec(String(src || ""));
   return m ? Number(m[1]) - 1 : -1;
@@ -2082,7 +2089,7 @@ function _carouselAdvance(st) {
       v.src = src;
       if (_carouselMount(st, v)) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); }
       // 连首帧静图都没有的老帧：hover 真播起来时抓一帧回传落盘（认不出 info 序号的远程帧内部会自己放弃）
-      if (!poster) { captureModelVideoPoster(v, st.card.dataset.path, _videoFrameInfoIndex(src)).then((du) => { if (du) frame[2] = du; }); }
+      if (!poster) { captureModelVideoPoster(v, st.card.dataset.path, _frameInfoIndex(frame)).then((du) => { if (du) frame[2] = du; }); }
       st.idx = st.idx + 1; _carouselRearm(st); return;
     }
     if (!src) { st.idx = st.idx + 1; continue; }   // 空 src 不喂给 new Image()（空串既不发 load 也不发 error，会把这一拍拖到 6s 超时）
