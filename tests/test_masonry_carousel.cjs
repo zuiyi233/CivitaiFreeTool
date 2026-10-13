@@ -224,6 +224,34 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
   ok('视频帧的 <video> 带首帧静图：三元组第三格经预取映射仍在缓存里，poster 实测 '+posterDu.length+' 字节 data URL（开头 '+mounted.attr.slice(0,22)+'…），解码前元素留在卡片上（'+whilePending.alt+' 层叠帧）');
   await page.evaluate(()=>[...document.querySelectorAll('#mmMasonry .ms-card')].forEach(c=>_stopCarousel(c)));
 
+  // 本地落盘的视频在浏览器兜底模式下必须换同源 /api/media：页面是 http origin 时 Chromium 拒绝
+  // file:/// 子资源（实测控制台 "Not allowed to load local resource"），v2.6.29 的「本地优先」
+  // 在这条模式下等于视频整个不播。窗口模式（__browserMode 不置位）里 file:/// 同源可用，不能动。
+  // 本用例的桥是 mock 的 pywebview（app.js 因此不会自己置 __browserMode），这里按两种模式分别钉。
+  const uriMap=await page.evaluate(()=>{
+    const saved=window.__browserMode;
+    window.__browserMode=true;
+    const http=_playableMediaUri('file:///D:/models/m.images/video_02.mp4');
+    const spaced=_playableMediaUri('file:///D:/m%20a/%E6%A8%A1%E5%9E%8B.images/video_01.mp4');
+    const unc=_playableMediaUri('file://server/share/m.images/video_03.mp4');
+    const remote=_playableMediaUri('https://image.civitai.com/a/h1/original=true/clip1.mp4');
+    const empty=_playableMediaUri('');
+    window.__browserMode=false;
+    const win=_playableMediaUri('file:///D:/models/m.images/video_02.mp4');
+    window.__browserMode=saved;
+    return {http,spaced,unc,remote,empty,win};
+  });
+  assert.equal(uriMap.http,'/api/media?p='+encodeURIComponent('D:/models/m.images/video_02.mp4'),
+    '浏览器模式没把本地 mp4 交给 /api/media：'+uriMap.http);
+  assert.equal(uriMap.spaced,'/api/media?p='+encodeURIComponent('D:/m a/模型.images/video_01.mp4'),
+    '百分号编码的路径没还原成真实文件系统路径：'+uriMap.spaced);
+  assert.equal(uriMap.unc,'/api/media?p='+encodeURIComponent('//server/share/m.images/video_03.mp4'),
+    'UNC 丢了前导双斜杠：'+uriMap.unc);
+  assert.equal(uriMap.remote,'https://image.civitai.com/a/h1/original=true/clip1.mp4','远程直链不该被改写');
+  assert.equal(uriMap.empty,'','空 src 不喂给 media 元素');
+  assert.equal(uriMap.win,'file:///D:/models/m.images/video_02.mp4','窗口模式必须原样交给 file:///（同源可用）');
+  ok('本地视频取用通道：浏览器模式走 /api/media（含带空格/中文与 UNC），窗口模式保持 file:///');
+
   // 自动轮播遇到视频帧：有首帧静图就以静帧身份参与（后端已不再把 poster 单独占一帧，跳过就等于卡片变呆）
   const autoPoster=await page.evaluate(([p,poster,src])=>{
     state.coverCacheMulti.set(p,[window.fixtureMultiCovers[p][0],[src,true,poster],window.fixtureMultiCovers[p][2]]);

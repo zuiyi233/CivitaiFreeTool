@@ -1980,6 +1980,21 @@ function _videoFrameInfoIndex(src) {
   const m = /[\\/]video_(\d+)\.[a-z0-9]+(?:[?#].*)?$/i.exec(String(src || ""));
   return m ? Number(m[1]) - 1 : -1;
 }
+// 本地落盘的视频/图片要交给 media 元素时用这一条：浏览器兜底模式的页面是 http origin，
+// Chromium 直接拒绝 file:/// 子资源（实测控制台 "Not allowed to load local resource"），
+// 于是 v2.6.29 的「本地优先」在这条模式下等于视频根本不播。同源 /api/media 流式端点才是
+// 本地文件的读盘通道（只放行模型根目录内的绝对路径，且支持 Range）。窗口模式（pywebview 的
+// file:// 页面）里 file:/// 同源可用，原样返回不动它。
+function _playableMediaUri(src) {
+  const s = String(src || "");
+  if (!window.__browserMode || !/^file:/i.test(s)) return s;
+  try {
+    const u = new URL(s);
+    let p = decodeURIComponent(u.pathname || "");
+    p = (u.hostname && u.hostname !== "localhost") ? "//" + u.hostname + p : p.replace(/^\/([A-Za-z]:)/, "$1");
+    return p ? "/api/media?p=" + encodeURIComponent(p) : s;
+  } catch (e) { return s; }   // 解析不了就保持原值，最多退回改前那一步，绝不静默换成空 src
+}
 // 详情 cover → info.images[] 序号：save_model_video_poster 按这个序号落 image_XX.jpg，错一位就把首帧写进别的帧。
 // covers 里没有这个字段，只能回认：本地已落盘的视频名字里带着序号，否则用 orig_url 对回 info.images[].url。
 function _coverVideoInfoIndex(info, c) {
@@ -2086,7 +2101,7 @@ function _carouselAdvance(st) {
       // 有后端给的第一帧就先垫上，鼠标移过去才动画面也不会闪白。
       if (poster) v.poster = poster;
       v.onerror = () => { if (st.cur === v) { try { v.pause(); } catch (_) {} v.remove(); st.cur = null; } };
-      v.src = src;
+      v.src = _playableMediaUri(src);
       if (_carouselMount(st, v)) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); }
       // 连首帧静图都没有的老帧：hover 真播起来时抓一帧回传落盘（认不出 info 序号的远程帧内部会自己放弃）
       if (!poster) { captureModelVideoPoster(v, st.card.dataset.path, _frameInfoIndex(frame)).then((du) => { if (du) frame[2] = du; }); }
@@ -3642,7 +3657,7 @@ async function showModelDetail(path, historyId = "") {
     '<div class="dt-body">' +
     '<div class="detail-left">' +
     (firstVideo
-      ? '<video class="detail-main-img" id="dMain" controls preload="metadata" title="放大观看视频（播放器自带全屏）" src="' + esc(firstVideo.url) + '" poster="' + esc(firstVideo.poster || "") + '"></video>'
+      ? '<video class="detail-main-img" id="dMain" controls preload="metadata" title="放大观看视频（播放器自带全屏）" src="' + esc(_playableMediaUri(firstVideo.url)) + '" poster="' + esc(firstVideo.poster || "") + '"></video>'
       : mainB64
         ? '<img class="detail-main-img" id="dMain" src="data:image/jpeg;base64,' + mainB64.b64 + '"/>'
         : covers.length?'<img class="detail-main-img" id="dMain" data-empty="true" alt="示例图片"/>':'<div class="detail-main-img dt-empty" id="dMain">' + _icon("image", "ic-lg") + '<span>暂无封面</span></div>') +
@@ -3765,7 +3780,7 @@ async function showModelDetail(path, historyId = "") {
         video=$("#dMain",panel)||video;
       }
       video.controls=true;video.preload='metadata';video.autoplay=true;
-      video.src=c.url;video.poster=c.poster||'';
+      video.src=_playableMediaUri(c.url);video.poster=c.poster||'';
       video.setAttribute('title','放大观看视频（播放器自带全屏）');video.tabIndex=0;
       if(video.onclick)video.onclick=null;
       delete video.dataset.empty;delete video.dataset.hdIndex;

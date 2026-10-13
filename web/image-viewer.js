@@ -269,7 +269,7 @@ async function loadViewerImage(index){
     video.style.display='';
     video.style.maxWidth=Math.max(240,area.clientWidth-24)+'px';
     video.style.maxHeight=Math.max(160,area.clientHeight-24)+'px';
-    video.src=c.url;video.poster=c.poster||'';
+    video.src=_playableMediaUri(c.url);video.poster=c.poster||'';
     video.load();
     v.entry=null;v.full=null;
     renderGeneration(c);
