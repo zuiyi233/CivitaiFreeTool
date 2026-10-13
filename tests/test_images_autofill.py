@@ -176,20 +176,39 @@ class FillTargetsTests(unittest.TestCase):
             self.assertTrue(t[0][2].endswith('video_01.mp4'))
             self.assertFalse(any(dest.endswith('image_01.jpg') for _,_,dest in t))
 
-    def test_poster_target_is_local_mp4_not_remote_url(self):
-        # 首帧目标与上面同图（image_01.jpg）但语义不同：kind='poster'，源是**本地 mp4 路径**，
-        # 由 video_thumb 取帧，绝不把远程 mp4 直链交给图片下载器。
-        # want_posters 默认跟 video_thumb.available() 走，测试必须显式给定，否则同一行断言
-        # 在带 native DLL 的机器上与不带它的机器上会得出不同结论（门禁曾因此在 Windows 上转红）。
+    def test_poster_source_is_local_mp4_or_small_video_tier(self):
+        # 首帧的两个源：本地已有原片就零网络直接取；没有就另取一条 width=460 的**小视频档**出帧后即删。
+        # 绝不允许 kind='image' 拿 mp4 直链（那是"把视频当静帧下载"的老病灶），也不许让首帧等整条原片
+        #（实测一条原片 8.9~19MB、小档 2.3MB；真实库 108 个模型里 19 个示例图全是视频，
+        #  等原片就等于界面长时间停在「正在补齐示例图 0/N」）。
+        # want_posters 默认跟 video_thumb.available() 走，测试必须显式给定：同一行断言在带 native
+        # DLL 的机器上与不带它的机器上会得出不同结论（门禁曾因此在 Windows 上转红）。
         with TemporaryDirectory() as d:
             base=os.path.join(d,'m');out=os.path.join(base+'.images')
+            tier='https://image.civitai.com/a/h1/width=%d/clip1.mp4'%webui._POSTER_VIDEO_TIER_W
             t=webui._images_fill_targets(base,[{'url':V1}],want_posters=True)
             self.assertEqual([k for k,_,_ in t],['video','poster'])
-            self.assertEqual(t[1][1],os.path.join(out,'video_01.mp4'))
+            self.assertEqual(t[1][1],tier,'本地没有原片时首帧取小视频档，不等整片')
             self.assertEqual(t[1][2],os.path.join(out,'image_01.jpg'))
             self.assertFalse(any(k=='image' and u==V1 for k,u,_ in t))
-            self.assertEqual(webui._images_fill_targets(base,[{'url':V1}],want_videos=False,want_posters=True),
-                             [])                                            # 本次没落原片、磁盘上也没有 → 不凭空挂首帧
+            self.assertEqual([(k,s) for k,s,_ in webui._images_fill_targets(
+                base,[{'url':V1}],want_videos=False,want_posters=True)],[('poster',tier)],
+                '首帧不依赖本次是否落原片')
+            Path(out).mkdir();(Path(out)/'video_01.mp4').write_bytes(b'f'*4096)
+            self.assertEqual([(k,s) for k,s,_ in webui._images_fill_targets(
+                base,[{'url':V1}],want_videos=False,want_posters=True)],
+                [('poster',os.path.join(out,'video_01.mp4'))],'原片已在盘上就用本地文件，零网络')
+
+    def test_pending_order_puts_pictures_before_videos(self):
+        # 画面先落盘、整片最后补：按 info 顺序排会让第一条 19MB 原片挡在所有人的首帧前面。
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m')
+            t=webui._images_fill_targets(base,[{'url':U0},{'url':V1},{'url':V2}],want_posters=True)
+            pending=webui._fill_pending_targets(t)
+            self.assertEqual([k for k,_,_ in pending],['image','poster','poster','video','video'],pending)
+            self.assertEqual([u for k,u,_ in pending if k=='poster'],
+                             [webui._civitai_thumb_url(V1,webui._POSTER_VIDEO_TIER_W),
+                              webui._civitai_thumb_url(V2,webui._POSTER_VIDEO_TIER_W)])
 
     def test_pending_targets_size_rules(self):
         with TemporaryDirectory() as d:
@@ -840,13 +859,18 @@ class VideoPosterFillTests(unittest.TestCase):
     def _targets(self,base,images,**kw):
         return webui._images_fill_targets(base,images,**kw)
 
-    def test_poster_target_follows_video_target(self):
+    def test_poster_target_is_queued_regardless_of_video_target(self):
+        # 首帧不排在它自己的原片后面：那条 19MB 的整片下不完，卡片就一直没画面。
+        # 顺序由 _fill_pending_targets 统一成 静帧→首帧→原片（见 FillTargetsTests 的排序用例）。
         with TemporaryDirectory() as d:
             base=os.path.join(d,'m.safetensors')[:-len('.safetensors')]
             t=self._targets(base,[{'url':V1}],want_posters=True)
             kinds=[(k,os.path.basename(dest)) for k,_src,dest in t]
             self.assertEqual(kinds,[('video','video_01.mp4'),('poster','image_01.jpg')],t)
-            self.assertEqual(t[1][1],t[0][2],'poster 的源就是这一批刚落盘的原片')
+            self.assertEqual(t[1][1],'https://image.civitai.com/a/h1/width=%d/clip1.mp4'%webui._POSTER_VIDEO_TIER_W,
+                             '本地没有原片时，首帧自己取小视频档，不引用这批的 video 目标')
+            self.assertEqual([k for k,_,_ in webui._fill_pending_targets(t)],['poster','video'],
+                             '补帧要先出画面再补整片')
 
     def test_no_poster_target_when_helper_unavailable_or_poster_exists(self):
         with TemporaryDirectory() as d:
@@ -892,5 +916,61 @@ class VideoPosterFillTests(unittest.TestCase):
             self.assertEqual((stats['downloaded'],stats['failed']),(0,1),stats)
             self.assertFalse((idir/'image_01.jpg').exists())
             self.assertIn('外壳',stats['msg'],stats['msg'])
+
+    def test_run_fetches_small_video_tier_then_deletes_it(self):
+        # 远程首帧三步：取 width=460 的小视频档 → 外壳出帧 → 参考片即删。
+        # 参考片必须落在我们自己的数据目录：模型目录里只该出现成品 image_XX.jpg，不该留下半个视频。
+        with TemporaryDirectory() as d:
+            idir=Path(d)/'m.images';idir.mkdir();poster=idir/'image_01.jpg'
+            appdir=Path(d)/'app';appdir.mkdir()
+            tier=webui._civitai_thumb_url(V1,webui._POSTER_VIDEO_TIER_W)
+            seen={}
+            def fake_dl(url,dest,**kw):
+                seen['url']=url;seen['dest']=dest;Path(dest).write_bytes(b'f'*2048);return True
+            def fake_frame(src,dst,max_size=640):
+                seen['src']=src
+                self.assertTrue(Path(src).is_file(),'取帧时参考片必须还在盘上')
+                self.assertFalse(str(src).startswith(str(idir)),'参考片不许写进模型目录')
+                Path(dst).write_bytes(b'\xff\xd8jpeg');return True
+            with patch.object(webui.config,'APP_DIR',str(appdir)),\
+                 patch.object(webui,'_download_video',side_effect=fake_dl),\
+                 patch.object(webui,'_fill_free_space_ok',return_value=(True,'')),\
+                 patch('video_thumb.first_frame',side_effect=fake_frame):
+                stats=webui._images_fill_run(str(Path(d)/'m.safetensors'),[('poster',tier,str(poster))],{})
+            self.assertEqual(stats['downloaded'],1,stats)
+            self.assertEqual(seen['url'],tier)
+            self.assertTrue(str(seen['dest']).startswith(str(appdir)),seen['dest'])
+            self.assertEqual([p.name for p in idir.iterdir()],['image_01.jpg'],
+                             '模型目录里只留首帧，参考片不能残留')
+            self.assertEqual(list(appdir.rglob('*.mp4')),[],'取完即删，数据目录里不留残条')
+
+    def test_run_skips_poster_when_reference_fetch_fails(self):
+        # 参考片没取到 = 这一帧留到下次，记跳过而不是失败（一次网络抖动不该说成两个坏消息）
+        with TemporaryDirectory() as d:
+            idir=Path(d)/'m.images';idir.mkdir();poster=idir/'image_01.jpg'
+            with patch.object(webui.config,'APP_DIR',str(Path(d)/'app')),\
+                 patch.object(webui,'_download_video',return_value=False) as dl,\
+                 patch.object(webui,'_fill_free_space_ok',return_value=(True,'')),\
+                 patch('video_thumb.first_frame') as ff:
+                stats=webui._images_fill_run(str(Path(d)/'m.safetensors'),[('poster',V1,str(poster))],{})
+            self.assertEqual((stats['downloaded'],stats['failed'],stats['skipped']),(0,0,1),stats)
+            dl.assert_called_once();ff.assert_not_called()
+            self.assertFalse(poster.exists())
+            self.assertIn('首帧参考片没取到',stats['msg'],stats['msg'])
+
+    def test_video_bytes_progress_reaches_the_row(self):
+        # done 只在整片落盘后才加一；一条原片实测 8.9~19MB，中途不报字节就等于"卡住"（用户报的现象）
+        with TemporaryDirectory() as d:
+            dest=str(Path(d)/'m.images/video_01.mp4');state={}
+            def feed(url,dl_dest,**kw):
+                cb=kw.get('progress')
+                self.assertTrue(callable(cb),'下载器没拿到进度回调')
+                for got in (262144,1048576,3145728):cb(got)
+                Path(dl_dest).parent.mkdir(exist_ok=True);Path(dl_dest).write_bytes(b'v'*2048);return True
+            with patch.object(webui,'_download_video',side_effect=feed),\
+                 patch.object(webui,'_fill_free_space_ok',return_value=(True,'')):
+                webui._images_fill_run(str(Path(d)/'m.safetensors'),[('video',V1,dest)],{},state=state)
+            self.assertIn('视频原片',state['msg'],state['msg'])
+            self.assertIn('已收 3.0MB',state['msg'],state['msg'])
 
 if __name__=='__main__':unittest.main()

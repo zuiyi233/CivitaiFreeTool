@@ -71,6 +71,10 @@ C 站 `modelVersions[].images` 每项：`{url, type: 'image'|'video', imageUrl(�
 
 - 真实库 107 条视频帧的 `imageUrl` 实测 **100% 为空**，纯 stdlib + PIL 又解不了 H.264，所以首帧只能由程序自己出像素：`video_thumb.first_frame()` 走 Windows 外壳（`native/CftChrome.cs` 的 `SHCreateItemFromParsingName` + `IShellItemImageFactory::GetImage`，`IIGBF_RESIZETOFIT|IIGBF_THUMBNAILONLY`）取长边 ≤640 的 JPEG，原子独占落盘、**已存在有内容就不覆盖**、目标或目录是重解析点就拒。PowerShell `Add-Type` 拿这个接口实测返回 `E_NOINTERFACE`，必须由 csc 编译的程序集声明 `InterfaceType(ComInterfaceType.InterfaceIsIUnknown)` 且 `GetImage` 排在接口首方法。
 - 落点是既有补帧管线的新 kind：`<模型名>.images/image_XX.jpg`，与 `video_XX.mp4` **同序号**——本地优先取用全靠这个约定，`info` 里没有字段可查。
+- **首帧不许等整条原片**（真实库 108 个模型里 19 个「示例图全是视频」，等原片就等于长时间停在「正在补齐示例图 0/N」）。`kind='poster'` 的源有两种：本地已有 `video_XX.mp4` 就零网络直接取帧；本地没有就另取一条 `width=460` 的**小视频档**当参考片（实测同一条 8,921,366 → 2,314,133 字节），出帧后即删。参考片只落在 `APP_DIR/video_probe`（纯 scratch，不进 `data_storage` 迁移白名单），**模型目录里只会出现 `image_XX.jpg`**，绝不落下半个视频或临时文件；字节封 `_POSTER_VIDEO_MAX_BYTES=12MB`、单条封 `_POSTER_VIDEO_DEADLINE_S=90s`，取不到就记**跳过**（"这一帧留到下次"），不记失败。
+- CDN **不可能**直接给视频首帧 JPEG：`width=460`、`width=460,format=jpeg`、`resize=thumbnail` 三种写法实测全部返回 `content-type: video/mp4`（`format=`/`resize=` 被忽略，与 §1b 的静帧结论一致）。所以首帧必须由程序从视频字节里解，别再去试"要一张现成的图"。
+- 补帧清单的顺序是 **静帧 → 首帧 → 原片**（`_fill_pending_targets` 内稳定排序），画面先出现、整片最后补。按 `info` 顺序排会让第一条 19MB 原片挡在所有人的首帧前面。
+- 下载中的字节进度写进 `state["msg"]`（`_fill_progress_cb`，每 256KB 一次）：`done` 只在整片落盘后才加一，中途不报字节就等于"卡住"。
 - **`image_XX.jpg` 只要序号落在视频项上，它就归那条视频自己当 poster，不是一张独立图帧**：不占 `local_img_slots`、不被选成详情封面、也不在 `get_covers_multi` 里以静帧身份出第二次。这条是三处判定（占位 / 跳过 / 首帧认领）统一到 `_frame_slot` 一份实现之后的唯一口径；`fn[6:8].isdigit()` 那种旧写法遇三位数序号会静默落空。曾经的 P0 就是"补帧刚落盘 → 位置猜测把视频序号也认领 → 第二次打开详情视频整个消失"，而触发它的是默认开启的首次打开补帧。
 - 首帧依赖原片：`kind='poster'` 的源是**本地 mp4 路径**，原片没落成（`_download_video` 原子替换，失败即不留文件）时记"跳过"而不是再记一次"失败"——一次下载故障被计成两个坏消息，文案还会把根因说成"本机取不到首帧"。
 - 浏览器 canvas 抓帧回传（`captureModelVideoPoster` → `save_model_video_poster`）**降级为兜底**：服务非 Windows（外壳不可用）与原片尚未落盘的远程视频。窗口模式下 `file://` 页面加载 `file://` 视频会污染画布、`toDataURL` 抛 SecurityError，远程 mp4 无 ACAO 同样污染，所以它不能作为主路径。

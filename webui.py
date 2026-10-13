@@ -13,7 +13,7 @@ import time
 
 import webview
 
-APP_VERSION = "2.6.29"
+APP_VERSION = "2.6.30"
 
 from functools import wraps
 
@@ -67,9 +67,16 @@ def _pick_cover_url(imgs):
 
 
 _VIDEO_LIMIT_PER_MODEL = 3  # 每模型自动/批量落盘的视频数上限（防止单模型拉爆带宽）
+# 取首帧用的视频档：只为出像素，出完即删，绝不冒充模型的原片。
+# 实测同一条视频 original 档 8,921,366 字节、width=460 档 2,314,133 字节（CDN 对 .mp4 也按 width 转码，
+# 但返回的仍是 content-type: video/mp4——它不会给首帧 JPEG，format=/resize= 一律被忽略）。
+_POSTER_VIDEO_TIER_W = 460
+_POSTER_VIDEO_MAX_BYTES = 12 * 1024 * 1024   # 小档兜顶：万一某条没 params 段退回原片，也别把带宽吃掉
+_POSTER_VIDEO_DEADLINE_S = 90                # 单条取帧预算：超了就跳过这一帧，不能拖住整批
 
 
-def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=100 * 1024 * 1024, deadline=None):
+def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=100 * 1024 * 1024, deadline=None,
+                    progress=None):
     """流式下载视频到本地（.tmp + 原子替换；过大/过小/失败返回 False）。与 _download_image（PIL 校验版）不同，
     视频无法用图片 magic bytes 校验，以体积下限兜底。
     max_bytes 的默认值与 config.video_max_mb 同口径（100MB）——不留一个比设置更大的暗档。
@@ -100,6 +107,12 @@ def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=1
                 if got > max_bytes:
                     raise ValueError("video too large")
                 f.write(chunk)
+                if progress is not None:
+                    # 每 256KB 报一次：补帧的行不能整片下完才动一下，用户看到的"卡住"多半是没在动
+                    try:
+                        progress(got)
+                    except Exception:
+                        pass
         if got < 1024:
             os.unlink(tmp)
             return False
@@ -303,8 +316,10 @@ def _images_fill_targets(base, images, want_videos=True, video_limit=None, want_
     视频首帧 poster 落 image_%02d.jpg、原片落 video_%02d.mp4（同序号，本地优先取用靠这个约定）。
     判定一律走 _is_video_entry —— 老 info 没有 type 字段，只按 type 判会把 mp4 存成 image_XX.jpg。
     video_limit：本次最多落几个 mp4（None=不限）。自动补帧必须带上限，见调用处。
-    kind='poster' 的"url"是本地 mp4 路径：真实库 107 个视频帧的 imageUrl 实测 100% 为空，
-    首帧只能由程序自己从本地原片里取（video_thumb 走 Windows 外壳），否则详情页与轮播永远是一块空白。"""
+    kind='poster' 的"url"有两种：本地 mp4 路径（零网络直接取帧），或 C 站的
+    `width=460` **小视频档直链**（本地还没有原片时，取一小条到临时目录出帧后即删）。
+    真实库 107 个视频帧的 imageUrl 实测 100% 为空，CDN 又不肯直接给首帧 JPEG，
+    首帧只能由程序从视频字节里取（video_thumb 走 Windows 外壳）——但不能为此等一整条原片。"""
     import video_thumb
     if want_posters is None:
         want_posters = video_thumb.available()
@@ -329,10 +344,16 @@ def _images_fill_targets(base, images, want_videos=True, video_limit=None, want_
                 if videos_left is not None:
                     videos_left -= 1
                 targets.append(("video", mp4, vdest))
-                have_video = True
-            # 排在 video 目标之后：同一批里原片刚落好就能取帧；存量已落盘没首帧的也在这里补（纯本地零网络）
-            if want_posters and have_video and not poster:
-                targets.append(("poster", vdest, poster_dest))
+            # 首帧不排队等原片。本地已有原片就零网络直接取帧；没有就**另取一条 width=460 的小视频档**
+            # 到临时目录取帧后即删。实测一条视频原片 8.9~19MB、同一条的 460 档 2.3MB，而 CDN
+            # 不肯直接给首帧 JPEG（width=/format=jpeg/resize= 三种写法返回的全是 content-type: video/mp4）。
+            # 把 poster 排在它自己的 video 之后，纯视频模型就要先等完整片才有一张画面——
+            # 真实库 108 个模型里 19 个是「示例图全是视频」，界面因此长时间停在「正在补齐示例图 0/N」。
+            if want_posters and not poster:
+                if have_video:
+                    targets.append(("poster", vdest, poster_dest))
+                elif mp4:
+                    targets.append(("poster", _civitai_thumb_url(mp4, _POSTER_VIDEO_TIER_W), poster_dest))
             continue
         u = str(im.get("url") or "").strip()
         if not u:
@@ -347,7 +368,10 @@ def _fill_pending_targets(targets):
     """过滤出真正要下的项 —— 补帧因此是幂等的。
 
     静帧：目标存在且有内容即算已落盘（半张图不可能出现：写盘走 .tmp + 原子替换，且有 magic bytes 校验）。
-    视频：还要求 >1KB，历史实现就是按这个阈值认定「已下载」，避免把截断的 mp4 当成品。"""
+    视频：还要求 >1KB，历史实现就是按这个阈值认定「已下载」，避免把截断的 mp4 当成品。
+
+    出来的顺序是 静帧 → 首帧 → 原片（同档内保持 info 序号顺序）：画面要先出现，整片视频最后再补。
+    按 info 顺序排会让第一条 19MB 的原片挡在所有人的首帧前面，界面看起来就是卡死。"""
     pending = []
     for kind, url, dest in targets or []:
         try:
@@ -362,6 +386,7 @@ def _fill_pending_targets(targets):
                 continue
         except OSError:
             continue
+    pending.sort(key=lambda t: {"image": 0, "poster": 1, "video": 2}.get(t[0], 3))
     return pending
 
 
@@ -380,6 +405,75 @@ def _fill_free_space_ok(probe_dir, cfg, kind):
     return True, ""
 
 
+def _poster_probe_dir(cfg=None):
+    """首帧参考片的临时目录：放在我们自己的数据目录，不放模型目录（模型目录里只该出现成品帧）。
+    这是纯 scratch，不进 data_storage 的迁移白名单——换数据目录时没必要把它搬走。"""
+    d = os.path.join(config.APP_DIR, "video_probe")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+
+def _fill_progress_cb(idx, targets, state, label):
+    """把"正在下什么、已经收了多少字节"写进任务状态。纯视频模型一条原片实测 8.9~19MB，
+    而 done 只在整片落盘后才加一，行里长时间一动不动就等于"卡住"——那正是用户报的现象。"""
+    def cb(got):
+        if state is None:
+            return
+        try:
+            state["msg"] = "正在下%s（第 %d/%d 项），已收 %.1fMB" % (
+                label, idx + 1, len(targets or []), (got or 0) / 1048576.0)
+        except Exception:
+            pass
+    return cb
+
+
+def _poster_probe_fetch(src, cfg, proxy, verify, left, started, deadline_s, idx, targets, state):
+    """取一小条视频档当首帧的参考片，成功返回临时路径，失败返回 None（调用方据此跳过这一帧）。
+
+    字节与时间都单独封顶：`_POSTER_VIDEO_MAX_BYTES` 防它退回原片，
+    `_POSTER_VIDEO_DEADLINE_S` 防一条慢流拖住整批（否则"补齐示例图"又要挂几分钟）。"""
+    d = _poster_probe_dir(cfg)
+    if not d:
+        return None
+    import uuid
+    probe = os.path.join(d, "%s.mp4" % uuid.uuid4().hex)
+    until = min(started + (deadline_s or _POSTER_VIDEO_DEADLINE_S),
+                time.monotonic() + min(_POSTER_VIDEO_DEADLINE_S, max(1, int(left))))
+    ok = _download_video(src, probe, timeout=min(60, max(5, int(left))), proxy=proxy, verify=verify,
+                         max_bytes=_POSTER_VIDEO_MAX_BYTES, deadline=until,
+                         progress=_fill_progress_cb(idx, targets, state, "首帧参考片"))
+    if not ok:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return None
+    return probe
+
+
+def _poster_probe_sweep(cfg):
+    """清掉上次进程被杀时留下的参考片（正常路径每条取完即删，这里只兜崩溃残留）。"""
+    d = _poster_probe_dir(cfg)
+    if not d:
+        return
+    try:
+        cutoff = time.time() - 3600
+        for fn in os.listdir(d):
+            if not fn.lower().endswith(".mp4") and not fn.lower().endswith(".mp4.tmp"):
+                continue
+            fp = os.path.join(d, fn)
+            try:
+                if os.path.getmtime(fp) < cutoff:
+                    os.unlink(fp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=None):
     """串行执行补帧清单（同时只 1 张在写），进度写进 state，任何失败只记账不抛异常。
 
@@ -394,7 +488,8 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
     # 磁盘余量按模型所在盘探测：<名>.images 首次补帧时还不存在，直接探它会抛错、把整批误判成「空间不足」
     probe_dir = os.path.dirname(os.path.abspath(path)) if path else None
     out_dir = None
-    for kind, url, dest in targets or []:
+
+    for idx, (kind, url, dest) in enumerate(targets or []):
         if cancel is not None and cancel.is_set():
             stats["msg"] = "已取消，剩余帧未下载"
             break
@@ -423,21 +518,40 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
                 elif kind == "video":
                     ok = _download_video(url, dest, timeout=min(180, max(5, int(left))), proxy=proxy,
                                          verify=verify, max_bytes=_video_cap_bytes(cfg),
-                                         deadline=started + deadline_s)
+                                         deadline=started + deadline_s,
+                                         progress=_fill_progress_cb(idx, targets, state, "视频原片"))
                     if not ok:
                         note = "视频原片下载失败"
                 elif kind == "poster":
-                    # url 是本地 mp4 路径：向 Windows 外壳要首帧，失败就是没有（非 Windows 时清单里根本不会有这项）
-                    if not os.path.isfile(url):
-                        # 首帧依赖原片。原片本批没落成（_download_video 走原子替换，失败即不留文件）
-                        # 或从没下过，都算跳过——把一次下载故障记成两个坏消息是假信息。
+                    # url 有两种：本地 mp4 路径（零网络取帧），或 C 站 width=460 的小视频档直链。
+                    import video_thumb
+                    src = str(url or "")
+                    probe = None
+                    if state is not None:
+                        state["msg"] = "正在取视频首帧（第 %d/%d 项）" % (idx + 1, len(targets or []))
+                    if src.lower().startswith(("http://", "https://")):
+                        # 本地还没有原片：只为出这一帧取一小条视频档，落在我们自己的数据目录、取完即删。
+                        # 模型目录里因此只会出现 image_XX.jpg，不会落下半个视频或临时文件。
+                        probe = _poster_probe_fetch(src, cfg, proxy, verify, left, started, deadline_s,
+                                                    idx, targets, state)
+                        if probe is None:
+                            note = "首帧参考片没取到，这一帧留到下次"
+                            dep_skip = True
+                    elif not os.path.isfile(src):
+                        # 首帧依赖原片。原片没落成（_download_video 走原子替换，失败即不留文件）算跳过，
+                        # 不再记一次"失败"——一次下载故障被计成两个坏消息，还会把根因说成取不到首帧。
                         note = "视频原片没落成，首帧跳过"
                         dep_skip = True
-                    else:
-                        import video_thumb
-                        ok = video_thumb.first_frame(url, dest, max_size=640)
+                    if not dep_skip:
+                        ok = video_thumb.first_frame(probe or src, dest, max_size=640)
                         if not ok:
                             note = "本机取不到视频首帧：%s" % (video_thumb.last_error() or "未知原因")
+                    if probe:
+                        try:
+                            os.unlink(probe)
+                        except OSError:
+                            pass
+                        _poster_probe_sweep(cfg)
                 else:
                     ok = _download_image_limited(url, dest, timeout=min(60, max(5, int(left))), proxy=proxy,
                                                  verify=verify, max_bytes=_image_cap_bytes(cfg),
