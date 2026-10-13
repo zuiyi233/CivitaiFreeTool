@@ -1921,6 +1921,27 @@ function _carouselHasFrames(frames) {
 // 抓一帧回传 save_model_video_poster，落进「模型名.images/image_XX.jpg」，之后详情与瀑布流都按本地静帧读。
 // 手法与资源库 libCapturePoster 同一条（长边 640 / JPEG q0.82 / 失败静默），只是落点与 RPC 不同。
 const _modelPosterTried = new Set();   // key = path#index：抓不到（跨域画布被污染）也算试过，绝不逐帧重试刷爆 RPC
+function _canvasFlat(ctx, w, h) {
+  // 画布还没解出画面时 drawImage 不报错，端出来是一张纯黑：这种图既不该回传也不该落盘。
+  // 判据与后端 image_gallery.is_flat_image 同一条（≤4 色或三通道标准差都 <3），两边改动都要同步另一侧。
+  let d;
+  try { d = ctx.getImageData(0, 0, w, h).data; } catch (e) { return false; }   // 跨域取样被拒：不判，交给 toDataURL 那条路走
+  const uniq = new Set(); const s = [0, 0, 0], sq = [0, 0, 0]; let n = 0;
+  const step = 4 * Math.max(1, Math.floor(w * h / 4096));   // 最多取 4096 点，大帧不必逐像素
+  for (let i = 0; i + 2 < d.length; i += step) {
+    uniq.add((d[i] << 16) | (d[i + 1] << 8) | d[i + 2]);
+    s[0] += d[i]; s[1] += d[i + 1]; s[2] += d[i + 2];
+    sq[0] += d[i] * d[i]; sq[1] += d[i + 1] * d[i + 1]; sq[2] += d[i + 2] * d[i + 2];
+    n++;
+  }
+  if (uniq.size <= 4) return true;    // 采样点凑不出几种颜色：没有画面
+  let maxStd = 0;
+  for (let k = 0; k < 3; k++) {
+    const m = s[k] / n;
+    maxStd = Math.max(maxStd, Math.sqrt(Math.max(0, sq[k] / n - m * m)));
+  }
+  return maxStd < 3;
+}
 function captureModelVideoPoster(video, path, infoIndex) {
   const idx = Number(infoIndex);
   if (!video || !path || !(idx >= 0)) return Promise.resolve("");   // 序号认不出就不抓：落错 image_XX 会把首帧写进别的帧
@@ -1952,7 +1973,11 @@ function captureModelVideoPoster(video, path, infoIndex) {
         const canvas = document.createElement("canvas");
         canvas.width = Math.max(1, Math.round(vw * scale));
         canvas.height = Math.max(1, Math.round(vh * scale));
-        canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        if (_canvasFlat(ctx, canvas.width, canvas.height)) { finish("", true); return; }
+        // 解出画面之前 drawImage 给的是一张纯黑：回传它等于把「首帧空白」换成「首帧一块黑」，
+        // 还会被后端当成「本地已有首帧」而不再让外壳取帧。退回「未试过」，播起来之后还有机会抓对的。
         du = canvas.toDataURL("image/jpeg", 0.82);   // 跨域视频到这里会抛 SecurityError，画布脏了就抓不到
       } catch (e) { finish(""); return; }           // 静默：正在播的视频不受影响，下次打开也不该重试
       if (!du || du.length * 0.75 > 2 * 1024 * 1024) { finish(""); return; }
@@ -3603,6 +3628,16 @@ function startAutofillWatch(d, generation, panel) {
       if (row) _autofillText(row, "补帧结束 " + done + "/" + total +
         (downloaded ? "，新增 " + downloaded : "") + (failed ? "，失败 " + failed : "") +
         (skipped ? "，跳过 " + skipped : "") + (msg ? "：" + msg : ""), false);
+      // 刚落地的首帧要立刻出现在当前详情里：以前得关掉重开才有画面，而"打开就是空白"正是用户报的现象。
+      // 只在"本来就没东西可看"时重渲染——主图已有内容、或用户已经选过某一帧，都不打扰他正在看的东西。
+      if (downloaded > 0 && detailRow === d && generation === detailGeneration &&
+          $("#detailMask") && $("#detailMask").style.display === "flex") {
+        const main = panel.querySelector("#dMain");
+        const blankish = main && (main.tagName === "VIDEO"
+          ? !String(main.getAttribute("poster") || "")
+          : main.dataset && main.dataset.empty === "true");
+        if (blankish) showModelDetail(path);
+      }
       _autofillStop();
       return;
     }
@@ -6867,7 +6902,10 @@ function libCapturePoster(video, item) {
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.round(vw * scale));
       canvas.height = Math.max(1, Math.round(vh * scale));
-      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      if (_canvasFlat(ctx, canvas.width, canvas.height)) { lib.posterTried.delete(item.path); return; }
+      // 与模型库抓帧同一判据：解出画面之前的纯黑画布不回传，退回「未试过」等播起来再抓
       const du = canvas.toDataURL("image/jpeg", 0.82);               // §7：JPEG q=0.82
       const b64 = du.slice(du.indexOf(",") + 1);
       if (!b64 || b64.length * 0.75 > 2 * 1024 * 1024) return;       // §7：≤2MB

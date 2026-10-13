@@ -691,7 +691,12 @@ class AccessorTests(LibRPCTestBase):
                  patch.object(config, "TASKS_PATH", os.path.join(d, "download_tasks.json")), \
                  patch.object(config, "HISTORY_PATH", os.path.join(d, "download_history.json")):
                 api = webui.Api()
-            self.assertEqual(api._media_roots_for_bridge(), [])
+            # 白名单 = 资源库根 + 模型库根：浏览器兜底模式要把 <名>.images/video_XX.mp4 的 file URI
+            # 换成同源 /api/media?p=（Chromium 拒收 file:/// 子资源）。只给资源库根时它 403，
+            # 症状与「没修」一模一样却不被「没有 file:/// 被拒载」那条断言看见。
+            self.assertEqual([os.path.normcase(r) for r in api._media_roots_for_bridge()],
+                             [os.path.normcase(r) for r in api._models_roots()],
+                             "没配资源库根时 /api/media 仍要认模型库根")
             self.assertFalse(api.lib_scan()["started"])  # 未配置根 → 不起线程
 
 

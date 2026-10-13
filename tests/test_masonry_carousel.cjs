@@ -249,6 +249,35 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
     'UNC 丢了前导双斜杠：'+uriMap.unc);
   assert.equal(uriMap.remote,'https://image.civitai.com/a/h1/original=true/clip1.mp4','远程直链不该被改写');
   assert.equal(uriMap.empty,'','空 src 不喂给 media 元素');
+  // 抓帧回传前必须验一次像素：画布在解码出画面之前 drawImage 不报错，端出来是一张纯黑。
+  // 那张图一旦落盘就把「首帧空白」换成「首帧一块黑」，还会让后端外壳取帧被「已有首帧不覆盖」挡死。
+  const flatCheck=await page.evaluate(()=>{
+    const mk=(paint)=>{const c=document.createElement('canvas');c.width=64;c.height=64;
+      const g=c.getContext('2d',{willReadFrequently:true});paint(g,c);return g;};
+    const black=mk((g,c)=>{g.fillStyle='#000';g.fillRect(0,0,c.width,c.height);});
+    const white=mk((g,c)=>{g.fillStyle='#fff';g.fillRect(0,0,c.width,c.height);});
+    const grad=mk((g,c)=>{const lg=g.createLinearGradient(0,0,c.width,c.height);
+      lg.addColorStop(0,'#02060c');lg.addColorStop(0.5,'#7fb2ff');lg.addColorStop(1,'#ffd9a0');
+      g.fillStyle=lg;g.fillRect(0,0,c.width,c.height);});
+    const noisy=mk((g,c)=>{const d=g.createImageData(c.width,c.height);
+      for(let i=0;i<d.data.length;i+=4){d.data[i]=(i*7)%256;d.data[i+1]=(i*13)%256;d.data[i+2]=(i*29)%256;d.data[i+3]=256-(i%7);}
+      g.putImageData(d,0,0);});
+    const darkGrad=mk((g,c)=>{const lg=g.createLinearGradient(0,0,c.width,0);
+      lg.addColorStop(0,'#000000');lg.addColorStop(1,'#404040');
+      g.fillStyle=lg;g.fillRect(0,0,c.width,c.height);});   // 暗但连续：夜视画面这类得放行
+    const twoTone=mk((g,c)=>{g.fillStyle='#000';g.fillRect(0,0,c.width,c.height);
+      g.fillStyle='#3a3a3a';g.fillRect(0,0,2,2);});         // 只有两个颜色：按设计判「没有画面」
+    return {black:_canvasFlat(black,64,64),white:_canvasFlat(white,64,64),
+      grad:_canvasFlat(grad,64,64),noisy:_canvasFlat(noisy,64,64),
+      darkGrad:_canvasFlat(darkGrad,64,64),twoTone:_canvasFlat(twoTone,64,64)};
+  });
+  assert.equal(flatCheck.black,true,'纯黑画布必须判成「没有画面」：'+JSON.stringify(flatCheck));
+  assert.equal(flatCheck.white,true,'纯白画布同样不是画面');
+  assert.equal(flatCheck.grad,false,'有内容的帧不能误判成纯色，否则首帧永远补不上');
+  assert.equal(flatCheck.noisy,false);
+  assert.equal(flatCheck.darkGrad,false,'暗但连续的画面对（夜视/淡入中）不该被拒');
+  assert.equal(flatCheck.twoTone,true,'凑不出五个颜色的帧按「没有画面」处理，两侧同一判据');
+  ok('抓帧的纯色判据：纯黑/纯白/两色拒回传，渐变/噪点/暗场连续画面放行（与后端 image_gallery.is_flat_image 同判据）');
   assert.equal(uriMap.win,'file:///D:/models/m.images/video_02.mp4','窗口模式必须原样交给 file:///（同源可用）');
   ok('本地视频取用通道：浏览器模式走 /api/media（含带空格/中文与 UNC），窗口模式保持 file:///');
 

@@ -129,6 +129,27 @@ def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=1
         return False
 
 
+def _still_poster_url(img):
+    """info 条目里可以当首帧静图用的 imageUrl；指向视频的一律返回 ''。
+
+    CDN 对 .mp4 的任何档位都回吐 content-type: video/mp4（实测 width=/format=jpeg/resize= 三种写法），
+    把这种串当图片交下去就是一场必败的下载，而且 poster 非空会让「没有首帧才去取帧」那条分支
+    永远进不去——这一帧就此永久空白。三处读 imageUrl 的地方（补帧清单、详情、瀑布流）共用这一份判定。"""
+    import image_gallery
+    u = str((img or {}).get("imageUrl") or "").strip()
+    return "" if not u or image_gallery.is_video_source(u) else u
+
+
+def _frame_slot(fp):
+    """本地文件名 → info images[] 的 0 基序号，认不出返回 -1。
+
+    序号是「详情 / 瀑布流 / 补帧 / 抓帧回传」四条链路共用的帧身份（image_XX.jpg 归第 XX-1 帧，
+    video_XX.mp4 归同一条视频），判定必须只有一份：三处各写一遍 `image_(\\d+)[.]` 迟早漂——
+    少个尾点就会把 image_02.jpg.bak 认成 2 号帧，多个前缀就会把首帧错认成静帧。"""
+    m = re.match(r"image_(\d+)[.]", os.path.basename(str(fp or "")), re.I)
+    return -1 if not m else int(m.group(1)) - 1
+
+
 def _local_video_file(base, idx):
     """第 idx 个视频项的本地落盘路径（<base>.images/video_XX.mp4，与 image_XX 首帧同索引）"""
     return os.path.join(base + ".images", "video_%02d.mp4" % idx)
@@ -330,7 +351,7 @@ def _images_fill_targets(base, images, want_videos=True, video_limit=None, want_
         if not isinstance(im, dict):
             continue
         if _is_video_entry(im):
-            poster = str(im.get("imageUrl") or "").strip()
+            poster = _still_poster_url(im)
             poster_dest = os.path.join(out_dir, "image_%02d.jpg" % (i + 1))
             if poster:
                 targets.append(("image", poster, poster_dest))
@@ -364,6 +385,34 @@ def _images_fill_targets(base, images, want_videos=True, video_limit=None, want_
     return targets
 
 
+def _flat_poster_needs_repair(dest):
+    """盘上这张 image_XX.jpg 是不是「整帧只有一个颜色」的伪首帧、需不需要重取。
+
+    浏览器在解出画面之前 drawImage 会端出一张纯黑画布，抓帧回传把它写进了模型目录；而
+    「本地已有首帧不覆盖」随后把后端外壳取帧这条真出路挡死——用户报的「首帧空白」于是换成
+    「首帧一块黑」，并且再也修不好。纯色因此当成「还没落盘」，让外壳再取一次
+    （写入侧 image_gallery.is_flat_image 已拦住新的黑图，这里只负责修历史留下的）。
+    每个 dest 一个进程只重取一次：首帧本来就是黑场的视频（淡入开场）不然每次打开详情都要
+    重下一条约 1.6MB 的参考片，把「第二次打开零 CDN」打成回归。代价是这一轮如果取帧失败
+    （断网/外壳不可用），同一进程内不再重试，下次启动才会再排——纯色图本来就只是旧数据的兜底修复，
+    不值得为它把参考片反复拉下来。
+    repair_seen 挂在函数属性上，测试可以直接清空。"""
+    seen = _flat_poster_needs_repair.repair_seen
+    key = os.path.normcase(os.path.abspath(dest))
+    if key in seen:
+        return False
+    import image_gallery
+    if not image_gallery.is_flat_image_file(dest):
+        return False
+    if len(seen) > 4096:
+        seen.clear()
+    seen.add(key)
+    return True
+
+
+_flat_poster_needs_repair.repair_seen = set()
+
+
 def _fill_pending_targets(targets):
     """过滤出真正要下的项 —— 补帧因此是幂等的。
 
@@ -382,6 +431,9 @@ def _fill_pending_targets(targets):
                 continue
             size = os.path.getsize(dest)
             if size <= 0 or (kind == "video" and size <= 1024):
+                pending.append((kind, url, dest))
+                continue
+            if kind == "poster" and _flat_poster_needs_repair(dest):
                 pending.append((kind, url, dest))
                 continue
         except OSError:
@@ -484,6 +536,9 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
     if deadline_s is None:
         deadline_s = _fetch_deadline_s(cfg)
     stats = {"total": len(targets or []), "downloaded": 0, "failed": 0, "skipped": 0, "msg": ""}
+    # 开工先扫一次上一轮被杀/超时留下的参考片：sweep 原本只挂在「取帧成功」之后，进程一被终止
+    # 就再也没机会跑（video_probe 里的残留因此能堆到 12MB × 崩溃次数）。
+    _poster_probe_sweep(cfg)
     note = ""   # 最后一项的跳过/失败原因；空清单时也要有值可报
     # 磁盘余量按模型所在盘探测：<名>.images 首次补帧时还不存在，直接探它会抛错、把整批误判成「空间不足」
     probe_dir = os.path.dirname(os.path.abspath(path)) if path else None
@@ -543,9 +598,17 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
                         note = "视频原片没落成，首帧跳过"
                         dep_skip = True
                     if not dep_skip:
-                        ok = video_thumb.first_frame(probe or src, dest, max_size=640)
-                        if not ok:
-                            note = "本机取不到视频首帧：%s" % (video_thumb.last_error() or "未知原因")
+                        # 盘上已有的是纯色伪首帧就覆盖重取（见 _flat_poster_needs_repair）；
+                        # 已经有画面才守住「不覆盖」——排队和执行之间前端可能刚抓回一张好图。
+                        import image_gallery
+                        flat = (image_gallery.is_flat_image_file(dest)
+                                if os.path.isfile(dest) else False)
+                        if os.path.isfile(dest) and not flat:
+                            ok, dep_skip, note = False, True, "首帧已有画面，未覆盖"
+                        else:
+                            ok = video_thumb.first_frame(probe or src, dest, max_size=640, overwrite=flat)
+                            if not ok:
+                                note = "本机取不到视频首帧：%s" % (video_thumb.last_error() or "未知原因")
                     if probe:
                         try:
                             os.unlink(probe)
@@ -2048,13 +2111,9 @@ class Api:
         cover = model_manager.find_cover(path)
         video_idx = {i for i, img in enumerate(images) if _is_video_entry(img)}
 
-        def _frame_slot(fp):
-            m = re.match(r"image_(\d+)[.]", os.path.basename(fp), re.I)
-            return -1 if not m else int(m.group(1)) - 1
-
         # 视频项的 image_XX.jpg 只是该视频自己的首帧静图（补帧落的 imageUrl 首帧、前端抓帧回传都写这个名），
         # 不是一张独立图帧：既不占本地序号、也不选成封面，只喂给它自己的 poster。
-        # 三处判定曾各写一份且口径不一（fn[6:8] 遇三位数序号就落空），统一收进 _frame_slot。
+        # 三处判定曾各写一份且口径不一（fn[6:8] 遇三位数序号就落空），现在统一收进模块级 _frame_slot。
         still_files, local_poster = [], {}
         for fp in img_files:
             k = _frame_slot(fp)
@@ -2134,8 +2193,9 @@ class Api:
                     if pb:
                         poster_b64 = "data:image/jpeg;base64," + pb
                 local_uri = _local_video_uri(base, i + 1)
+                remote_poster = self._remote_frame_thumb(_still_poster_url(img) or None, _DETAIL_THUMB_W)
                 covers.append({"type": "video", "url": local_uri or u, "local": bool(local_uri),
-                               "poster": poster_b64 or self._remote_frame_thumb(img.get("imageUrl"), _DETAIL_THUMB_W),
+                               "poster": poster_b64 or remote_poster,
                                "prompt": (img.get("meta") or {}).get("prompt") or "",
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
                                "orig_url": u})
@@ -2519,6 +2579,11 @@ class Api:
                 return {"ok": False, "msg": "首帧数据不是合法 base64"}
             if not raw or len(raw) > 4 * 1024 * 1024:
                 return {"ok": False, "msg": "首帧为空或超过 4MB"}
+            import image_gallery
+            if image_gallery.is_flat_image(raw):
+                # 画布还没解出画面时 drawImage 端出来的是纯黑：这张图落盘就等于把「首帧空白」换成
+                # 「首帧一块黑」，还会用「本地已有首帧不覆盖」把后端外壳取帧那条真出路永久挡死。
+                return {"ok": False, "msg": "抓到的首帧是纯色（画布尚未解出画面），已丢弃"}
             import io
             from PIL import Image
             with Image.open(io.BytesIO(raw)) as im:
@@ -2537,9 +2602,11 @@ class Api:
             if _is_reparse_path(dest) or os.path.islink(dest):
                 return {"ok": False, "msg": "首帧目标是指向别处的链接，已拒绝"}
             if os.path.isfile(dest) and os.path.getsize(dest) > 0:
-                return {"ok": True, "msg": "本地已有首帧，未覆盖", "path": dest}
+                if not image_gallery.is_flat_image_file(dest):
+                    return {"ok": True, "msg": "本地已有首帧，未覆盖", "path": dest}
+                # 盘上这张是旧版留下的纯色图：来的是真像素就覆盖它，否则「不覆盖」这条幂等守卫
+                # 会把用户永远锁在一块黑上——那正是本功能要修的症状。
             os.makedirs(out_dir, exist_ok=True)
-            import image_gallery
             tmp = dest + ".tmp"
             created = False
             try:
@@ -3264,10 +3331,22 @@ class Api:
             if self.cfg.get("proxy_enabled") and self.cfg.get("proxy_address"):
                 proxy = self.cfg["proxy_address"]
                 handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            # 墙钟斩断（与 _download_video 同一条理由）：socket timeout 只在两次 read 之间生效，
+            # 一条每次吐一点的慢流能永远不触发它——而这里是**唯一的入盘 worker**，被钉住就等于
+            # pending 攒满 256 后整条磁盘缓存链路哑掉，界面上表现为「第二次打开还是要回源」。
+            acc = bytearray()
+            floor = time.monotonic() + max(20, int(timeout) * 4)
             with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as resp:
-                data = resp.read(cap + 1)
-            if len(data) > cap:
-                return ""
+                while True:
+                    if time.monotonic() > floor:
+                        return ""
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    acc += chunk
+                    if len(acc) > cap:
+                        return ""
+            data = bytes(acc)
             from PIL import Image
             with Image.open(io.BytesIO(data)) as image:
                 image = image.convert("RGB")
@@ -3656,9 +3735,9 @@ class Api:
                 local_by_idx = {}
                 unnumbered = []
                 for fp in self._images_dir_files(p):
-                    m = re.match(r"image_(\d+)[.]", os.path.basename(fp), re.I)
-                    if m:
-                        local_by_idx.setdefault(int(m.group(1)) - 1, fp)
+                    k = _frame_slot(fp)
+                    if k >= 0:
+                        local_by_idx.setdefault(k, fp)
                     else:
                         unnumbered.append(fp)
                 video_idx = {i for i, im in remote.items() if _is_video_entry(im)}
@@ -3675,11 +3754,7 @@ class Api:
                 # 只按 normcase 路径去重不够：封面常是 image_02.jpg（字典序首图或具名封面），
                 # 此时 local_by_idx[1] 命中「已出过」被跳过，循环却继续走远程分支，同一帧出两层。
                 # 认不出序号的封面（具名 .preview.png 之类）仍按老约定视作占第 1 帧。
-                cover_slot = 0
-                if cover:
-                    _mc = re.match(r"image_(\d+)[.]", os.path.basename(cover), re.I)
-                    if _mc:
-                        cover_slot = int(_mc.group(1)) - 1
+                cover_slot = max(0, _frame_slot(cover)) if cover else 0
                 seq = 1
                 for i in sorted(set(local_by_idx) | set(remote)):
                     if len(items) >= n:
@@ -3708,7 +3783,7 @@ class Api:
                             if b:
                                 poster = _data(b)
                         if not poster:
-                            poster = self._remote_frame_thumb(img.get("imageUrl"))
+                            poster = self._remote_frame_thumb(_still_poster_url(img) or None)
                         local_uri = _local_video_uri(base_p, i + 1)
                         if local_uri:
                             items.append([local_uri, True, poster, i])   # 本地落盘视频：离线可播
@@ -5743,11 +5818,23 @@ class Api:
         return [s for s in (str(r).strip() for r in roots) if s]
 
     def _media_roots_for_bridge(self):
-        """注入给 browser_bridge（A6 的 /api/media 允许目录校验用）；返回列表而非迭代器，桥侧线程独立读取"""
+        """注入给 browser_bridge（A6 的 /api/media 允许目录校验用）；返回列表而非迭代器，桥侧线程独立读取。
+
+        资源库根之外必须并入模型库根：本地视频项交给前端的是 <名>.images/video_XX.mp4 的 file URI，
+        浏览器兜底模式要把它换成同源 /api/media?p=（Chromium 拒收 file:/// 子资源）。只放资源库根时
+        这一换反而 403——症状与没修一样，只是错从「被拒载」变成「服务端无权访问」，而验收只看前者的话
+        就会绿着漏掉（实测：用户配置 models_dirs 四个根、media_roots 为空）。
+        两边都是用户自己配置的目录，扩展名白名单、越界与重解析点校验仍由桥层把最后一道。"""
+        roots = []
         try:
-            return list(self._media_roots())
+            roots += list(self._media_roots())
         except Exception:
-            return []
+            pass
+        try:
+            roots += [r for r in self._models_roots() if r]
+        except Exception:
+            pass
+        return roots
 
     def _lib_exts(self):
         try:

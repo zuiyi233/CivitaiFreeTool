@@ -108,7 +108,11 @@ class StorageTests(unittest.TestCase):
         api.mm_progress={};api.mm_scan_state={};api._rp_state={}
         buf=io.BytesIO();Image.new('RGB',(80,80),'red').save(buf,'PNG')
         response=Mock();response.__enter__=Mock(return_value=response);response.__exit__=Mock(return_value=False)
+        given=[False]
         def payload(*args):
+            if given[0]:
+                return b''    # EOF：真实连接第二次就读不出字节了；入盘改成 256KB 分块读后靠这个收尾
+            given[0]=True
             self.assertTrue(api.migrate_data_storage(str(self.target))['ok'])
             return buf.getvalue()
         response.read.side_effect=payload;opener=Mock();opener.open.return_value=response

@@ -51,7 +51,9 @@ class ModelHistoryTests(unittest.TestCase):
         with patch.object(webui.threading,'Thread') as thread:self.api._on_dl_update(self.task);thread.assert_not_called()
     def test_detail_thumbnail_reuses_cache_and_never_saves_original(self):
         buf=io.BytesIO();Image.new('RGB',(2400,1800),'blue').save(buf,'PNG');payload=buf.getvalue()
-        response=Mock();response.__enter__=Mock(return_value=response);response.__exit__=Mock(return_value=False);response.read.return_value=payload
+        response=Mock();response.__enter__=Mock(return_value=response);response.__exit__=Mock(return_value=False)
+        # 流读到 EOF 要回空字节：入盘侧现在是 256KB 分块读，一个「永远有字节」的 Mock 会被读爆上限
+        response.read.side_effect=iter([payload,b''])
         opener=Mock();opener.open.return_value=response
         with patch('urllib.request.build_opener',return_value=opener):
             first=self.api.get_cover_b64(self.info['images'][0]['url']);second=self.api.get_cover_b64(self.info['images'][0]['url'])
@@ -63,7 +65,8 @@ class ModelHistoryTests(unittest.TestCase):
         self.api.cfg['cache_detail_images']=False
         url='https://example.invalid/image.png';cache=Path(self.api._detail_cache_path(url));cache.parent.mkdir();cache.write_bytes(b'stale')
         response=Mock();response.__enter__=Mock(return_value=response);response.__exit__=Mock(return_value=False)
-        buf=io.BytesIO();Image.new('RGB',(100,100),'blue').save(buf,'PNG');response.read.return_value=buf.getvalue()
+        buf=io.BytesIO();Image.new('RGB',(100,100),'blue').save(buf,'PNG')
+        response.read.side_effect=iter([buf.getvalue(),b''])
         opener=Mock();opener.open.return_value=response
         with patch('urllib.request.build_opener',return_value=opener):self.assertTrue(self.api.get_cover_b64(url))
         opener.open.assert_called_once();self.assertEqual(cache.read_bytes(),b'stale')

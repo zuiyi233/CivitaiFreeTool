@@ -3,7 +3,8 @@
 
 钉住任务清单第 1、6、8 条及第 3、4、7、9 条的 webui 接线。全部临时目录 + Mock，
 不触网、不写用户配置、不碰真实模型库；api_key 一律 fixture 假值。"""
-import inspect,json,os,shutil,sys,threading,time,unittest
+import inspect,json,os,shutil,sys,tempfile,threading,time,unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock,patch
@@ -25,6 +26,17 @@ class FakeResp:
 def fake_opener(data,headers=None):
     opener=Mock();opener.open=Mock(return_value=FakeResp(data,headers));return opener
 
+@contextmanager
+def loose_appdir():
+    """后台入盘线程会往 APP_DIR 补写字节，TemporaryDirectory 的严格清理因此偶发
+    OSError WinError 145「目录不为空」（实测同一用例 40 遍红 3 遍，且与断言无关）。
+    这里换成「删不干净也不报错」的目录：用例关心的是缓存内容，不是临时目录一定被回收。"""
+    d=tempfile.mkdtemp()
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d,ignore_errors=True)
+
 MB=1024*1024
 U0='https://image.civitai.com/a/h0/original=true/f0.png'
 U1='https://image.civitai.com/a/h1/original=true/f1.png'
@@ -42,6 +54,14 @@ def make_api(cfg=None):
 def jpeg(color='blue',size=(60,40)):
     import io
     out=io.BytesIO();Image.new('RGB',size,color).save(out,format='JPEG');return out.getvalue()
+
+def textured_jpeg(size=(80,50)):
+    """「有画面」的样本帧：纯色图在这条链路上是畸形输入（画布没解出画面时的产物），
+    不能拿它当正常样本，否则测试会把 bug 本身钉成期望行为。"""
+    import io
+    im=Image.new('RGB',size)
+    im.putdata([((x*3)%256,(y*5)%256,(x*y*2)%256) for y in range(size[1]) for x in range(size[0])])
+    out=io.BytesIO();im.save(out,'JPEG');return out.getvalue()
 
 def write_model(d,name='m',images=()):
     """temp 下的假模型 + .civitai.info（find_info_file 的真实查找顺序）。"""
@@ -199,6 +219,19 @@ class FillTargetsTests(unittest.TestCase):
                 base,[{'url':V1}],want_videos=False,want_posters=True)],
                 [('poster',os.path.join(out,'video_01.mp4'))],'原片已在盘上就用本地文件，零网络')
 
+    def test_imageurl_pointing_at_mp4_is_never_a_picture_target(self):
+        """info 里 imageUrl 也指 .mp4 的条目：它不是首帧静图。
+
+        以前 poster 非空就直接排 ('image', mp4, image_XX.jpg)：PIL 校验必然失败、字节已经花掉，
+        而且 poster 非空让「没有首帧才去取帧」那条分支永远进不去——这一帧就此永久空白。"""
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m')
+            t=webui._images_fill_targets(base,[{'url':V1,'imageUrl':V2}],want_posters=True)
+            self.assertFalse([x for x in t if x[0]=='image'],t)
+            self.assertEqual([k for k,_,_ in t],['video','poster'],t)
+            self.assertTrue(t[1][1].endswith('.mp4') and 'width=' in t[1][1],
+                            '要走小视频档取帧，而不是把 mp4 当图片下')
+
     def test_pending_order_puts_pictures_before_videos(self):
         # 画面先落盘、整片最后补：按 info 顺序排会让第一条 19MB 原片挡在所有人的首帧前面。
         with TemporaryDirectory() as d:
@@ -219,6 +252,24 @@ class FillTargetsTests(unittest.TestCase):
             targets=[('image',U0,str(img_ok)),('image',U1,str(img_zero)),('video',V1,str(vid_small)),('video',V2,str(vid_ok))]
             pending=webui._fill_pending_targets(targets)
             self.assertEqual([(k,u) for k,u,_ in pending],[('image',U1),('video',V1)])
+
+    def test_pending_requeues_solid_color_poster_exactly_once(self):
+        # 旧版抓帧回传把画布没解出画面时的纯黑图写成了 image_XX.jpg，补帧随后按「已有首帧」跳过它，
+        # 用户看到的「首帧空白」因此永远修不好。纯色必须当成缺口重取——但一个进程只重取一次：
+        # 首帧本来就是黑场的视频（淡入开场）不该每次打开详情都重下一条约 1.6MB 的参考片。
+        webui._flat_poster_needs_repair.repair_seen.clear()
+        with TemporaryDirectory() as d:
+            bad=Path(d)/'image_01.jpg';bad.write_bytes(jpeg())
+            t=[('poster',V1,str(bad))]
+            self.assertEqual([k for k,_,_ in webui._fill_pending_targets(t)],['poster'],'纯色首帧要重取')
+            self.assertEqual(webui._fill_pending_targets(t),[],'同一个 dest 一个进程只重取一次')
+            good=Path(d)/'image_02.jpg';good.write_bytes(textured_jpeg())
+            self.assertEqual(webui._fill_pending_targets([('poster',V1,str(good))]),[],
+                             '有画面的首帧不许被覆盖重取')
+            junk=Path(d)/'image_03.jpg';junk.write_bytes(b'not-an-image')
+            self.assertEqual(webui._fill_pending_targets([('poster',V1,str(junk))]),[],
+                             '读不出内容的文件不判纯色（宁可跳过，别把补帧拖进反复重取）')
+        webui._flat_poster_needs_repair.repair_seen.clear()
 
 class FillRunTests(unittest.TestCase):
     def test_downloads_and_state(self):
@@ -700,12 +751,17 @@ class RemoteThumbCacheTests(unittest.TestCase):
     现在同一档字节要永久落盘，第二次由 get_covers_multi 直接出 data:，且完全不再发请求。"""
 
     def _opener(self,data=None):
-        resp=FakeResp(data if data is not None else jpeg())
-        opener=Mock();opener.open=Mock(return_value=resp);return opener
+        """每次 .open() 现造一份响应。
+
+        真实网络是每个连接一份字节；共享游标的 FakeResp 会被「后台入盘线程先读一遍」掏空，
+        于是同一次测试里后一次 fetch 拿到 b''，结果就只看时序吃饭（入盘改成 256KB 分块读之后
+        这条偶发变成常发，实测基线 6 遍全绿、改动后 4 遍红 1 遍）。"""
+        body=data if data is not None else jpeg()
+        opener=Mock();opener.open=Mock(side_effect=lambda *a,**k: FakeResp(body));return opener
 
     def test_second_read_is_pure_disk(self):
         api=make_api()
-        with TemporaryDirectory() as d,patch.object(webui.config,'APP_DIR',d),\
+        with loose_appdir() as d,patch.object(webui.config,'APP_DIR',d),\
              patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None),\
              patch('urllib.request.build_opener',return_value=self._opener()):
             model=write_model(d,'m',[{'url':U0}])
@@ -810,9 +866,19 @@ class RemoteThumbCacheTests(unittest.TestCase):
 class SaveModelVideoPosterTests(unittest.TestCase):
     """缺陷 2 的落盘入口：老 info 没有 imageUrl，纯 stdlib 又解不了 H.264，首帧只能由浏览器抓了回传。"""
 
-    def _b64(self,color=(20,40,60)):
-        import io,base64
-        buf=io.BytesIO();Image.new('RGB',(80,50),color).save(buf,'JPEG');return base64.b64encode(buf.getvalue()).decode()
+    def _b64(self, flat=False):
+        """默认给「有画面」的帧：真照片必然多色高方差。纯色图是这条链路最主要的畸形输入，
+        单独用 flat=True 造，别让所有用例都拿一张纯色图当正常样本（曾经就是这样的）。"""
+        import io, base64
+        buf = io.BytesIO()
+        if flat:
+            Image.new('RGB', (80, 50), (20, 40, 60)).save(buf, 'JPEG')
+        else:
+            im = Image.new('RGB', (80, 50))
+            im.putdata([((x * 3) % 256, (y * 5) % 256, (x * y * 2) % 256)
+                        for y in range(50) for x in range(80)])
+            im.save(buf, 'JPEG')
+        return base64.b64encode(buf.getvalue()).decode()
 
     def test_saves_under_agreed_name_and_is_read_back(self):
         api=make_api()
@@ -827,8 +893,32 @@ class SaveModelVideoPosterTests(unittest.TestCase):
             self.assertTrue(video[2].startswith('data:image/jpeg;base64,'),'回传一次后详情/瀑布流就该出本地首帧')
             # 幂等：已有本地首帧就不覆盖
             before=dest.read_bytes()
-            r2=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64((200,10,10)))
+            r2=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64())
             self.assertTrue(r2['ok'],r2);self.assertEqual(dest.read_bytes(),before)
+
+    def test_solid_color_capture_is_rejected(self):
+        # 画布在解码出画面之前 drawImage 不报错，端出来是一张纯黑（实测 4307B 单色图）。
+        # 这张图一旦落盘：用户看到的「首帧空白」变成「首帧一块黑」，并且「已有首帧不覆盖」
+        # 会把后端外壳取帧这条真出路永久挡死——所以必须在写盘前就拒掉。
+        api=make_api()
+        with TemporaryDirectory() as d:
+            model=write_model(d,'m',[{'url':V1}])
+            r=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64(flat=True))
+            self.assertFalse(r['ok'],r)
+            self.assertIn('纯色',r['msg'])
+            self.assertFalse((Path(d)/'m.images'/'image_01.jpg').exists(),'纯色帧一个字节都不该写进模型目录')
+
+    def test_solid_color_left_by_older_build_is_replaced(self):
+        # 已经写坏的历史文件：来一张真像素就该覆盖，否则「不覆盖」这条幂等守卫把用户锁死在黑图上。
+        api=make_api()
+        with TemporaryDirectory() as d:
+            model=write_model(d,'m',[{'url':V1}])
+            dest=Path(d)/'m.images';dest.mkdir()
+            dest.joinpath('image_01.jpg').write_bytes(jpeg())   # jpeg() 是纯色图：正是旧版留下的那种坏文件
+            before=(dest/'image_01.jpg').read_bytes()
+            r=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64())
+            self.assertTrue(r['ok'],r)
+            self.assertNotEqual((dest/'image_01.jpg').read_bytes(),before,'纯色旧图必须被真像素换掉')
 
     def test_rejects_non_video_index_and_bad_bytes(self):
         api=make_api()
@@ -896,7 +986,7 @@ class VideoPosterFillTests(unittest.TestCase):
             base=os.path.join(d,'m');idir=Path(d)/'m.images';idir.mkdir()
             vdir=idir/'video_01.mp4';vdir.write_bytes(b'f'*4096)
             poster=idir/'image_01.jpg'
-            def fake(src,dst,max_size=640):
+            def fake(src,dst,max_size=640,**kw):
                 Path(dst).write_bytes(b'\xff\xd8fakejpeg');return True
             with patch.object(webui,'_fill_free_space_ok',return_value=(True,'')),\
                  patch('video_thumb.first_frame',side_effect=fake):
@@ -927,7 +1017,7 @@ class VideoPosterFillTests(unittest.TestCase):
             seen={}
             def fake_dl(url,dest,**kw):
                 seen['url']=url;seen['dest']=dest;Path(dest).write_bytes(b'f'*2048);return True
-            def fake_frame(src,dst,max_size=640):
+            def fake_frame(src,dst,max_size=640,**kw):
                 seen['src']=src
                 self.assertTrue(Path(src).is_file(),'取帧时参考片必须还在盘上')
                 self.assertFalse(str(src).startswith(str(idir)),'参考片不许写进模型目录')
@@ -943,6 +1033,28 @@ class VideoPosterFillTests(unittest.TestCase):
             self.assertEqual([p.name for p in idir.iterdir()],['image_01.jpg'],
                              '模型目录里只留首帧，参考片不能残留')
             self.assertEqual(list(appdir.rglob('*.mp4')),[],'取完即删，数据目录里不留残条')
+
+    def test_run_overwrites_solid_color_poster_but_keeps_a_good_one(self):
+        # 盘上是纯色（旧版留下的坏首帧）→ first_frame(overwrite=True) 重取；盘上已有画面 → 一帧都不碰，
+        # 记跳过而不是失败：排队之后、执行之前前端可能刚抓回一张好图，这时候覆盖就是抢走用户已经看到的画面。
+        webui._flat_poster_needs_repair.repair_seen.clear()
+        with TemporaryDirectory() as d:
+            idir=Path(d)/'m.images';idir.mkdir()
+            clip=Path(d)/'clip.mp4';clip.write_bytes(b'f'*2048)
+            bad=idir/'image_01.jpg';bad.write_bytes(jpeg())
+            good=idir/'image_02.jpg';good.write_bytes(textured_jpeg())
+            before=good.read_bytes()
+            seen=[]
+            def fake_frame(src,dst,max_size=640,overwrite=False):
+                seen.append(bool(overwrite));Path(dst).write_bytes(textured_jpeg());return True
+            with patch.object(webui,'_fill_free_space_ok',return_value=(True,'')), \
+                 patch('video_thumb.first_frame',side_effect=fake_frame):
+                stats=webui._images_fill_run(str(Path(d)/'m.safetensors'),
+                        [('poster',str(clip),str(bad)),('poster',str(clip),str(good))],{})
+            self.assertEqual(seen,[True],'只有纯色那张允许覆盖重取')
+            self.assertEqual(good.read_bytes(),before,'有画面的首帧一个字节都不许动')
+            self.assertEqual((stats['downloaded'],stats['skipped'],stats['failed']),(1,1,0),stats)
+        webui._flat_poster_needs_repair.repair_seen.clear()
 
     def test_run_skips_poster_when_reference_fetch_fails(self):
         # 参考片没取到 = 这一帧留到下次，记跳过而不是失败（一次网络抖动不该说成两个坏消息）
@@ -972,5 +1084,68 @@ class VideoPosterFillTests(unittest.TestCase):
                 webui._images_fill_run(str(Path(d)/'m.safetensors'),[('video',V1,dest)],{},state=state)
             self.assertIn('视频原片',state['msg'],state['msg'])
             self.assertIn('已收 3.0MB',state['msg'],state['msg'])
+
+class MediaRootsForBridgeTests(unittest.TestCase):
+    """/api/media 的允许目录必须含模型库根——浏览器兜底模式的本地视频全靠它。
+
+    实测配置：media_roots 为空、models_dirs 四个根。白名单只给资源库根时，
+    <名>.images/video_XX.mp4 一律 403：症状与「file:/// 被 Chromium 拒载」一模一样，
+    只是错从浏览器侧挪到服务端侧，只看前者的验收会绿着漏掉这一条。"""
+
+    def test_model_roots_are_merged(self):
+        with TemporaryDirectory() as d:
+            api=make_api({'images_dir_autofill':True,'media_roots':[],'models_dirs':[d]})
+            roots=api._media_roots_for_bridge()
+            self.assertTrue(any(os.path.realpath(r)==os.path.realpath(d) for r in roots),roots)
+
+    def test_library_roots_still_pass_through(self):
+        with TemporaryDirectory() as d:
+            lib=Path(d)/'lib';lib.mkdir();models=Path(d)/'models';models.mkdir()
+            api=make_api({'images_dir_autofill':True,'media_roots':[str(lib)],'models_dirs':[str(models)]})
+            roots=[os.path.realpath(r) for r in api._media_roots_for_bridge()]
+            self.assertIn(os.path.realpath(lib),roots,'资源库根不能被合并挤掉')
+            self.assertIn(os.path.realpath(models),roots)
+
+    def test_unreachable_root_doesnt_break_the_list(self):
+        with TemporaryDirectory() as d:
+            api=make_api({'images_dir_autofill':True,'media_roots':[],
+                          'models_dirs':[str(Path(d)/'gone'),str(d)]})
+            roots=api._media_roots_for_bridge()
+            self.assertTrue(any(os.path.realpath(r)==os.path.realpath(d) for r in roots),roots)
+            self.assertFalse(any('gone' in r for r in roots),'不可达的根不进白名单')
+
+
+class FlatFrameTests(unittest.TestCase):
+    """纯色判据本身：后端读的是 JPEG 字节、前端读的是画布，阈值一致但像素来源不同，
+    所以这里只钉后端这一侧在真实编码结果上的结论。"""
+
+    def _bytes(self,paint,w=64,h=64):
+        import io
+        im=Image.new('RGB',(w,h));paint(im)
+        buf=io.BytesIO();im.save(buf,'JPEG',quality=82);return buf.getvalue()
+
+    def test_solid_black_and_white_are_flat(self):
+        # 实测形状就是这张：浏览器在解出画面之前回传了一张 4307 字节的纯黑 JPEG。
+        black=self._bytes(lambda im:im.paste((0,0,0),(0,0,im.width,im.height)))
+        white=self._bytes(lambda im:im.paste((255,255,255),(0,0,im.width,im.height)))
+        self.assertTrue(image_gallery.is_flat_image(black),'纯黑 JPEG 必须判成没有画面')
+        self.assertTrue(image_gallery.is_flat_image(white))
+
+    def test_real_frame_is_not_flat(self):
+        def grad(im):
+            for y in range(im.height):
+                for x in range(im.width):
+                    im.putpixel((x,y),((x*7)%256,(y*11)%256,(x*y)%256))
+        self.assertFalse(image_gallery.is_flat_image(self._bytes(grad)),'有画面的帧不许判成空白')
+
+    def test_unreadable_bytes_are_not_flat(self):
+        # 「读不出」不等于「纯色」：判错会让整批补帧跳过，等于又造一处静默的功能缺失。
+        self.assertFalse(image_gallery.is_flat_image(b'not an image'))
+        self.assertFalse(image_gallery.is_flat_image(b''))
+        self.assertFalse(image_gallery.is_flat_image_file(''))
+        with TemporaryDirectory() as d:
+            p=Path(d)/'x.jpg';p.write_bytes(b'garbage')
+            self.assertFalse(image_gallery.is_flat_image_file(str(p)))
+
 
 if __name__=='__main__':unittest.main()

@@ -141,6 +141,51 @@ def cache_load(item, cfg, kind, tier=''):
         return data if kind=='original' else json.loads(data.decode(),parse_constant=lambda _:None)
     except (OSError,ValueError,UnicodeError):return None
 
+FLAT_MAX_COLORS=4      # 缩略到 64px 后仍只有这几个不同颜色 = 没有画面
+FLAT_STDDEV_FLOOR=3.0  # 三通道标准差都低于这个数 = 纯色（黑场/白场）
+
+def is_flat_image(data):
+    """整帧只有一个颜色的「伪首帧」判定；输入是图片字节，不是路径。
+
+    浏览器在解码出画面之前 drawImage(video) 不会报错，而是端出一张纯黑画布——抓帧回传照写就把
+    用户看到的「首帧空白」从空白换成了一块黑，还因为「本地已有首帧不覆盖」把后端外壳取帧这条
+    真出路永久挡在门外（实测一条：4307B 纯色图 vs 同帧外壳出的 32045B/60829 色）。
+    判据按 64px 缩略算，代价恒定；直方图算标准差而不是 import ImageStat——PyInstaller 的
+    hiddenimports 没收了那个子模块，冻结产物里 import 失败会静默放行，等于修复没进包。
+    认不出来（无 PIL/坏字节）一律返回 False：宁可放行一张可疑图，也不要把功能判死。"""
+    try:
+        from PIL import Image
+    except Exception:
+        return False
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im=im.convert("RGB")
+            im.thumbnail((64,64))
+            colors=im.getcolors(maxcolors=64*64+1)
+            if colors is None:
+                return False          # 颜色多到超上限，明显不是纯色
+            hist=im.histogram()
+            stds=[]
+            for k in range(3):
+                band=hist[k*256:(k+1)*256]
+                n=float(sum(band)) or 1.0
+                mean=sum(i*c for i,c in enumerate(band))/n
+                stds.append((max(0.0,sum((i-mean)**2*c for i,c in enumerate(band))/n))**0.5)
+            return len(colors)<=FLAT_MAX_COLORS or max(stds)<FLAT_STDDEV_FLOOR
+    except Exception:
+        return False
+
+def is_flat_image_file(path):
+    """按文件走 is_flat_image；读不到/太大都不判死（返回 False）。"""
+    try:
+        if not path or not os.path.isfile(path) or os.path.getsize(path)>8*1024*1024:
+            return False
+        with open(path,"rb") as f:
+            return is_flat_image(f.read())
+    except OSError:
+        return False
+
+
 def is_reparse_path(path):
     """Windows 重解析点（符号链接 / junction / mount point）检测。
 
