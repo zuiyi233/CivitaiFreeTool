@@ -153,6 +153,23 @@ def _video_cap_bytes(cfg):
     return image_gallery.video_limit_bytes(cfg or {})
 
 
+_THUMB_SIZE_MIN, _THUMB_SIZE_MAX = 64, 1024
+
+
+def _thumb_size(size):
+    """缩略图边长的唯一口径：读缓存键与写缓存键、发 CDN 的 width= 都用它，不留第二份夹取。"""
+    try:
+        return max(_THUMB_SIZE_MIN, min(_THUMB_SIZE_MAX, int(size)))
+    except (TypeError, ValueError):
+        return _THUMB_SIZE_MAX
+
+
+# 缩略图响应的字节闸：与 config.image_max_mb **无关**。那个键管的是原图归档预算（可低至 1MB），
+# 拿它当缩略图上限，设置一低瀑布流与详情的缩略图就会整片空白（`len(data) > cap` 直接返回 ''）。
+# 请求的是 width<=1024 的转码档，正常回字节几十到几百 KB，8MB 只是「别把失控的响应读进内存」的兜顶。
+_THUMB_FETCH_CAP = 8 * 1024 * 1024
+
+
 def _fetch_deadline_s(cfg):
     """单帧在线读取总时限（秒，config.fetch_deadline_s，默认 120）——与 image_gallery 同一实现"""
     import image_gallery
@@ -386,6 +403,7 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
             stats["msg"] = "超出总时限 %ds，剩余帧未下载" % int(deadline_s)
             break
         ok = False
+        dep_skip = False
         note = ""
         try:
             target_dir = os.path.dirname(dest)
@@ -406,12 +424,20 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
                     ok = _download_video(url, dest, timeout=min(180, max(5, int(left))), proxy=proxy,
                                          verify=verify, max_bytes=_video_cap_bytes(cfg),
                                          deadline=started + deadline_s)
+                    if not ok:
+                        note = "视频原片下载失败"
                 elif kind == "poster":
                     # url 是本地 mp4 路径：向 Windows 外壳要首帧，失败就是没有（非 Windows 时清单里根本不会有这项）
-                    import video_thumb
-                    ok = video_thumb.first_frame(url, dest, max_size=640)
-                    if not ok:
-                        note = "本机取不到视频首帧：%s" % (video_thumb.last_error() or "未知原因")
+                    if not os.path.isfile(url):
+                        # 首帧依赖原片。原片本批没落成（_download_video 走原子替换，失败即不留文件）
+                        # 或从没下过，都算跳过——把一次下载故障记成两个坏消息是假信息。
+                        note = "视频原片没落成，首帧跳过"
+                        dep_skip = True
+                    else:
+                        import video_thumb
+                        ok = video_thumb.first_frame(url, dest, max_size=640)
+                        if not ok:
+                            note = "本机取不到视频首帧：%s" % (video_thumb.last_error() or "未知原因")
                 else:
                     ok = _download_image_limited(url, dest, timeout=min(60, max(5, int(left))), proxy=proxy,
                                                  verify=verify, max_bytes=_image_cap_bytes(cfg),
@@ -420,6 +446,8 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
             ok = False
         if ok:
             stats["downloaded"] += 1
+        elif dep_skip:
+            stats["skipped"] += 1
         else:
             stats["failed"] += 1
         if state is not None:
@@ -429,8 +457,12 @@ def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=Non
             state["skipped"] = stats["skipped"]
     if not stats["msg"]:
         # 失败原因也要能冒出来：全批一张没成时，界面不能只说"无需补帧"
-        stats["msg"] = note if (stats["skipped"] or (note and not stats["downloaded"])) \
-            else ("补帧完成" if stats["downloaded"] else "无需补帧")
+        reason = note if (stats["skipped"] or (note and not stats["downloaded"])) \
+            else ("补帧完成" if stats["downloaded"]
+                  else ("补帧失败 %d 帧" % stats["failed"] if stats["failed"] else "无需补帧"))
+        if stats["failed"] and stats["downloaded"] and "失败" not in reason:
+            reason += "（另有 %d 帧失败）" % stats["failed"]
+        stats["msg"] = reason
     return stats
 
 
@@ -510,6 +542,9 @@ def _civitai_thumb_url(u, width=460):
 # 瀑布流帧的缩略档宽度：_civitai_thumb_url 的默认档、磁盘缓存键与后台入盘必须同一个值，
 # 否则「浏览器拿的那一档」和「我们存进盘的那一档」会错开，第二次照样不命中。
 _WATERFALL_THUMB_W = 460
+# 详情缩略条的档位：与 get_cover_b64 的默认 size、详情本地帧的 thumbnail((512,512)) 同数。
+# 后端出帧与前端补图分属两个数时，同一帧会被取两次、落盘两份，第二次打开详情还要再跑一趟网络。
+_DETAIL_THUMB_W = 512
 
 
 def _todo_label(url):
@@ -1897,22 +1932,33 @@ class Api:
                 if fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                     img_files.append(os.path.join(imgs_dir, fn))
         cover = model_manager.find_cover(path)
-        if img_files:
-            cover = img_files[0]
-        # 本地优先：本地 .images/ 已落盘的帧先出，同序号 info 的远程 URL 不再出现（避免同帧重复）。
-        # 按 image_%02d 精确匹配而不是按张数计数 —— 视频项落的是 video_XX.mp4（不进 img_files），
-        # 只数张数会把序号算歪；视频项的 image_XX.jpg 只是 poster，由视频帧本身代表，不另立图帧。
         video_idx = {i for i, img in enumerate(images) if _is_video_entry(img)}
-        local_img_slots = set()
-        for fp in img_files:
+
+        def _frame_slot(fp):
             m = re.match(r"image_(\d+)[.]", os.path.basename(fp), re.I)
-            if m:
-                k = int(m.group(1)) - 1
-                if k not in video_idx:
-                    local_img_slots.add(k)
+            return -1 if not m else int(m.group(1)) - 1
+
+        # 视频项的 image_XX.jpg 只是该视频自己的首帧静图（补帧落的 imageUrl 首帧、前端抓帧回传都写这个名），
+        # 不是一张独立图帧：既不占本地序号、也不选成封面，只喂给它自己的 poster。
+        # 三处判定曾各写一份且口径不一（fn[6:8] 遇三位数序号就落空），统一收进 _frame_slot。
+        still_files, local_poster = [], {}
+        for fp in img_files:
+            k = _frame_slot(fp)
+            if k in video_idx:
+                local_poster.setdefault(k, fp)
+            else:
+                still_files.append(fp)
+        if still_files:
+            cover = still_files[0]
+        # 本地优先：本地 .images/ 已落盘的帧先出，同序号 info 的远程 URL 不再出现（避免同帧重复）。
+        # 按 image_%02d 精确匹配而不是按张数计数；一个编号名都对不上才退回按位置猜。
+        local_img_slots = {k for k in map(_frame_slot, still_files) if k >= 0}
         if not local_img_slots:
-            local_img_slots = (set(range(len(img_files))) if img_files
-                               else ({0} if (cover and os.path.exists(cover)) else set()))
+            fb = (set(range(len(still_files))) if still_files
+                  else ({0} if (cover and os.path.exists(cover)) else set()))
+            # 按位置猜出来的槽位不许认领视频帧，否则补帧刚落盘（默认开启的首次打开就会落）
+            # 就把视频从 covers 里挤掉——第二次打开详情看不到视频，正是这个改动要修的空白反面。
+            local_img_slots = {k for k in fb if k not in video_idx}
         if cover and os.path.exists(cover):
             try:
                 from PIL import Image
@@ -1931,12 +1977,9 @@ class Api:
             except Exception:
                 pass
         # 本地 images 目录其余图补入（文件名 image_%02d → 序号匹配 prompt；视频首帧不重复出图）
-        for fp in img_files[1:]:
+        for fp in still_files[1:]:
             try:
                 if os.path.realpath(fp) == os.path.realpath(cover):
-                    continue
-                fn = os.path.basename(fp)
-                if fn.lower().startswith("image_") and fn[6:8].isdigit() and int(fn[6:8]) - 1 in video_idx:
                     continue
                 from PIL import Image
                 import io as _io
@@ -1945,9 +1988,7 @@ class Api:
                 im.thumbnail((512, 512))
                 buf = _io.BytesIO()
                 im.save(buf, "JPEG", quality=82)
-                idx = -1
-                if fn.lower().startswith("image_") and fn[6:8].isdigit():
-                    idx = int(fn[6:8]) - 1
+                idx = _frame_slot(fp)
                 _p, _n = _local_img_prompt(fp)
                 if _p is None:
                     _p, _n = _img_prompt(idx)
@@ -1956,13 +1997,6 @@ class Api:
                                "prompt": _p, "negative": _n})
             except Exception:
                 pass
-        # 视频项的首帧静图：<名>.images/image_XX.jpg 按约定就是该视频自己的 poster（补帧落的 imageUrl
-        # 首帧、前端抓帧回传的首帧都写这个名）。老 info 根本没有 imageUrl 字段，不靠本地这张就只能空白。
-        local_poster = {}
-        for fp in img_files:
-            mp = re.match(r"image_(\d+)[.]", os.path.basename(fp), re.I)
-            if mp:
-                local_poster.setdefault(int(mp.group(1)) - 1, fp)
         # 追加 C 站 URL 图（跳过本地已占的序号 + url 去重）
         for i, img in enumerate(images[:20]):
             if i in local_img_slots:
@@ -1982,13 +2016,12 @@ class Api:
                 poster_b64 = ""
                 pfp = local_poster.get(i)
                 if pfp:
-                    pb = self._cover_thumb(path, pfp, 512, 0, None)
+                    pb = self._cover_thumb(path, pfp, _DETAIL_THUMB_W, 0, None)
                     if pb:
                         poster_b64 = "data:image/jpeg;base64," + pb
                 local_uri = _local_video_uri(base, i + 1)
                 covers.append({"type": "video", "url": local_uri or u, "local": bool(local_uri),
-                               "poster": poster_b64 or self._remote_frame_thumb(img.get("imageUrl")),
-                               "poster_local": bool(poster_b64),
+                               "poster": poster_b64 or self._remote_frame_thumb(img.get("imageUrl"), _DETAIL_THUMB_W),
                                "prompt": (img.get("meta") or {}).get("prompt") or "",
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
                                "orig_url": u})
@@ -3009,7 +3042,18 @@ class Api:
 
     def _detail_cache_path(self, url, size=512):
         import hashlib
-        key = hashlib.sha256((str(size) + ":" + url).encode()).hexdigest()
+        # 档位在这一句里夹一次：读（_url_thumb_b64）与写（get_cover_b64）必须算出同一个键。
+        # 以前只有写侧夹过 64..1024，读侧原样拼键，越界的 size 会永远读不到自己刚写下的那张。
+        size = _thumb_size(size)
+        # 键取「源图 URL + 档位」而不是那一串 params：同一帧的 original=true 与 width=512 是同一张图。
+        # 详情前端补图时传给 get_cover_b64 的已经是后端改写过的缩略档，与后台入盘用的原链不同串，
+        # 各算各的键等于同一帧取两次、落两份，第二次打开详情还多跑一趟网络。
+        try:
+            import image_gallery
+            src = image_gallery.original_url(str(url))
+        except Exception:
+            src = str(url)
+        key = hashlib.sha256((str(size) + ":" + src).encode()).hexdigest()
         return os.path.join(config.APP_DIR, "detail_thumb_cache", key + ".jpg")
 
     def _url_thumb_b64(self, url, size):
@@ -3047,7 +3091,8 @@ class Api:
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             return
         reg = self._thumb_warm_registry()
-        key = "%d:%s" % (int(size), url)
+        size = _thumb_size(size)
+        key = "%d:%s" % (size, url)
         with reg["lock"]:
             if key in reg["pending"] or len(reg["pending"]) >= 256:
                 return
@@ -3055,7 +3100,10 @@ class Api:
             if reg["thread"] is None:
                 reg["thread"] = threading.Thread(target=self._thumb_warm_worker, args=(reg,), daemon=True)
                 reg["thread"].start()
-        reg["queue"].put((url, size, key))
+            # put 必须在锁内：worker 的收工判定是「取锁后再看队列是否还空」，
+            # 落在锁外就出现「worker 刚置 None 收工、这一单才被挂上」的孤儿——没人取，键也永久留在
+            # pending 里，同一个 URL 以后再也排不进去（曾实测到 256 键攒满后整条入盘链路哑掉）。
+            reg["queue"].put((url, size, key))
 
     def _thumb_warm_worker(self, reg):
         """串行入盘：取字节 + 校验 + 落盘全复用 get_cover_b64，失败只返回 '' 不抛。"""
@@ -3064,6 +3112,8 @@ class Api:
                 url, size, key = reg["queue"].get(timeout=5)
             except Exception:
                 with reg["lock"]:
+                    if not reg["queue"].empty():
+                        continue
                     reg["thread"] = None
                 return
             try:
@@ -3080,8 +3130,8 @@ class Api:
         import base64
         import urllib.request
         from urllib.parse import urlsplit, urlunsplit
-        size = max(64, min(1024, int(size)))
-        cap = _image_cap_bytes(self.cfg)   # 与查看器/补帧同一档（config.image_max_mb），不留第二个上限数字
+        size = _thumb_size(size)
+        cap = _THUMB_FETCH_CAP   # 缩略图专用闸，不跟 config.image_max_mb（那是原图归档预算，可低至 1MB）
         try:
             parsed = urlsplit(str(url))
             if parsed.scheme not in ("http", "https"):
@@ -3415,27 +3465,32 @@ class Api:
                 out[p] = thumb
         return json.dumps(out, ensure_ascii=False)
 
-    def _remote_frame_thumb(self, url):
+    def _remote_frame_thumb(self, url, size=_WATERFALL_THUMB_W):
         """远程帧的显示 src：磁盘上已有这一档就直接出本地 b64（第二次打开零网络），
         否则出 CDN 缩略档 URL 交给浏览器并行加载，同时排一次后台入盘。
 
-        档位固定用 _WATERFALL_THUMB_W（也是 _civitai_thumb_url 的默认档）：浏览器拿的那一档
-        与我们落盘/查键的那一档必须是同一个数，否则第二次永远不命中。"""
+        档位由调用方给定且默认就是瀑布流那一档（_WATERFALL_THUMB_W，也是 _civitai_thumb_url 的默认档）：
+        浏览器拿的那一档与我们落盘/查键的那一档必须是同一个数，否则第二次永远不命中。
+        详情缩略条传 _DETAIL_THUMB_W —— 它随后会替每张帧调一次 get_cover_b64（默认 512），
+        两边同档才能命中同一份磁盘缓存；异档等于同一帧取两次，第二次打开也白跑一趟网络。"""
         u = str(url or "").strip()
         if not u:
             return ""
-        cached = self._url_thumb_b64(u, _WATERFALL_THUMB_W)
+        size = _thumb_size(size)
+        cached = self._url_thumb_b64(u, size)
         if cached:
             return cached if cached.startswith("data:") else "data:image/jpeg;base64," + cached
-        self._warm_url_thumb(u, _WATERFALL_THUMB_W)
-        return _civitai_thumb_url(u, _WATERFALL_THUMB_W)
+        self._warm_url_thumb(u, size)
+        return _civitai_thumb_url(u, size)
 
     def get_covers_multi(self, paths, size=220, n=3):
         """批量返回轮播帧（JSON：{path: [[src, isVideo], [mp4, True, poster, infoIndex], ...]}）。
 
-        帧顺序 = **本地优先于远程**：封面（.preview.* 或 .images 首图）→ 按 info 序号依次取帧，
+        帧顺序 = **本地优先于远程**：封面（.preview.* 或 .images 里第一张**静帧**）→ 按 info 序号依次取帧，
         该序号本地已落盘就用本地 b64（同帧绝不重复出远程 URL），本地没有才用 .civitai.info 的
-        远程 URL → 无序号的本地图片补位。远程静帧与视频 poster 都走 _remote_frame_thumb：
+        远程 URL → 无序号的本地图片补位。视频项的 image_XX.jpg 归它自己当 poster，不另立一张静帧
+        （否则同一份字节出两次，卡片载荷翻倍，还把视频伪装成照片）。
+        远程静帧与视频 poster 都走 _remote_frame_thumb：
         磁盘上已有这一档就直接出 data:（第二次打开完全不碰网络），没有才出 CDN 缩略档并排一次后台入盘。
         视频项一律走 _is_video_entry 判定，只返回可播源（本地 video_XX.mp4 的 file URI，否则 mp4 直链）
         并标 isVideo=True；第三格是它的首帧静图（本地 image_XX.jpg 的 data:，否则 info 的 imageUrl
@@ -3469,15 +3524,9 @@ class Api:
                 def _data(b):
                     return b if b.startswith("data:") else "data:image/jpeg;base64," + b
 
-                cover = model_manager.find_cover(p)
-                if not cover or not os.path.exists(cover):
-                    cover = self._images_dir_first(p)
-                if cover and os.path.exists(cover):
-                    b = self._cover_thumb(p, cover, size, 0, thumb_dir)
-                    if b:
-                        items.append([_data(b), False])
-                        emitted.add(os.path.normcase(os.path.abspath(cover)))
-                # .civitai.info 的 images（含视频项）
+                # 先读 info 再挑封面：视频项的 image_XX.jpg 只是那条视频自己的首帧，不许再当一张独立
+                # 静帧出一次。以前封面按字典序抓到它就以「静帧」身份出一份，循环里又作为 poster 出第二份
+                # ——同一份字节挂两次，瀑布流载荷翻倍，还把一段视频伪装成一帧照片。
                 info = {}
                 try:
                     fp_info = model_manager.find_info_file(p)
@@ -3499,6 +3548,15 @@ class Api:
                     else:
                         unnumbered.append(fp)
                 video_idx = {i for i, im in remote.items() if _is_video_entry(im)}
+                cover = model_manager.find_cover(p)
+                if not cover or not os.path.exists(cover):
+                    stills = [local_by_idx[k] for k in sorted(local_by_idx) if k not in video_idx]
+                    cover = (stills or unnumbered or [""])[0]
+                if cover and os.path.exists(cover):
+                    b = self._cover_thumb(p, cover, size, 0, thumb_dir)
+                    if b:
+                        items.append([_data(b), False])
+                        emitted.add(os.path.normcase(os.path.abspath(cover)))
                 # 封面占了哪个序号，那个序号的远程 URL 就不能再出一次。
                 # 只按 normcase 路径去重不够：封面常是 image_02.jpg（字典序首图或具名封面），
                 # 此时 local_by_idx[1] 命中「已出过」被跳过，循环却继续走远程分支，同一帧出两层。

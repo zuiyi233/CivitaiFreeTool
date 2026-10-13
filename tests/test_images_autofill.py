@@ -171,10 +171,25 @@ class FillTargetsTests(unittest.TestCase):
     def test_mp4_without_type_never_stored_as_jpg(self):
         # 旧实现只按 type=='video' 判 → mp4 原片会被存成 image_XX.jpg，这是本次修复的核心回归点
         with TemporaryDirectory() as d:
-            t=webui._images_fill_targets(os.path.join(d,'m'),[{'url':V1}])
+            t=webui._images_fill_targets(os.path.join(d,'m'),[{'url':V1}],want_posters=False)
             self.assertEqual([k for k,_,_ in t],['video'])
             self.assertTrue(t[0][2].endswith('video_01.mp4'))
             self.assertFalse(any(dest.endswith('image_01.jpg') for _,_,dest in t))
+
+    def test_poster_target_is_local_mp4_not_remote_url(self):
+        # 首帧目标与上面同图（image_01.jpg）但语义不同：kind='poster'，源是**本地 mp4 路径**，
+        # 由 video_thumb 取帧，绝不把远程 mp4 直链交给图片下载器。
+        # want_posters 默认跟 video_thumb.available() 走，测试必须显式给定，否则同一行断言
+        # 在带 native DLL 的机器上与不带它的机器上会得出不同结论（门禁曾因此在 Windows 上转红）。
+        with TemporaryDirectory() as d:
+            base=os.path.join(d,'m');out=os.path.join(base+'.images')
+            t=webui._images_fill_targets(base,[{'url':V1}],want_posters=True)
+            self.assertEqual([k for k,_,_ in t],['video','poster'])
+            self.assertEqual(t[1][1],os.path.join(out,'video_01.mp4'))
+            self.assertEqual(t[1][2],os.path.join(out,'image_01.jpg'))
+            self.assertFalse(any(k=='image' and u==V1 for k,u,_ in t))
+            self.assertEqual(webui._images_fill_targets(base,[{'url':V1}],want_videos=False,want_posters=True),
+                             [])                                            # 本次没落原片、磁盘上也没有 → 不凭空挂首帧
 
     def test_pending_targets_size_rules(self):
         with TemporaryDirectory() as d:
@@ -220,6 +235,35 @@ class FillRunTests(unittest.TestCase):
             with patch.object(webui,'_download_image_limited',Mock()) as dl:
                 stats=webui._images_fill_run(model,[('image',U0,os.path.join(d,'m.images','image_01.png'))],{},deadline_s=0)
             self.assertIn('超出总时限',stats['msg']);dl.assert_not_called()
+
+    def test_poster_skipped_when_its_video_never_landed(self):
+        # 首帧依赖原片：_download_video 走 .tmp + 原子替换，失败即不留文件。这时 poster 记「跳过」，
+        # 绝不能再记一次「失败」——一次下载故障被计成两个坏消息，界面还会把它说成"本机取不到首帧"。
+        with TemporaryDirectory() as d:
+            model=write_model(d); base=os.path.splitext(model)[0]
+            mp4=os.path.join(base+'.images','video_01.mp4')
+            targets=[('video',V1,mp4),('poster',mp4,os.path.join(base+'.images','image_01.jpg'))]
+            with patch.object(webui,'_download_video',return_value=False) as dv,\
+                 patch('video_thumb.first_frame',return_value=False) as ff,\
+                 patch.object(webui.shutil,'disk_usage',return_value=Mock(free=10**12)):
+                stats=webui._images_fill_run(model,targets,{'video_max_mb':100})
+            self.assertEqual((stats['downloaded'],stats['failed'],stats['skipped']),(0,1,1),stats)
+            dv.assert_called_once(); ff.assert_not_called()
+            self.assertIn('视频原片没落成',stats['msg'],stats['msg'])
+
+    def test_partial_run_does_not_hide_failures(self):
+        # 有帧成、有帧没成：只报「补帧完成」等于把没落成的瞒下来，界面得能把坏消息说全。
+        with TemporaryDirectory() as d:
+            model=write_model(d); base=os.path.splitext(model)[0]
+            targets=[('image',U0,os.path.join(base+'.images','image_01.png')),
+                     ('image',U1,os.path.join(base+'.images','image_02.png'))]
+            def half(url,dest,**kw):
+                Path(dest).parent.mkdir(exist_ok=True);Path(dest).write_bytes(b'img');return url==U0
+            with patch.object(webui,'_download_image_limited',side_effect=half),\
+                 patch.object(webui.shutil,'disk_usage',return_value=Mock(free=10**12)):
+                stats=webui._images_fill_run(model,targets,{})
+            self.assertEqual((stats['downloaded'],stats['failed']),(1,1),stats)
+            self.assertIn('1 帧失败',stats['msg'],stats['msg'])
 
     def test_free_space_math_and_skip(self):
         with patch.object(webui.shutil,'disk_usage',return_value=Mock(free=60*MB)):
@@ -399,15 +443,32 @@ class CoversMultiTests(unittest.TestCase):
             (idir/'video_01.mp4').write_bytes(b'f'*4096)
             Image.new('RGB',(60,40),'red').save(idir/'image_01.jpg')
             items=json.loads(api.get_covers_multi([model],size=220,n=3))[model]
-        # 首帧文件同时是这张卡的封面（find_cover 回落 <名>.images 首图），所以第 1 帧是静帧封面、
-        # 第 2 帧才是视频；关键是视频帧自己也得带 poster，否则 hover 起播前就是空白。
-        self.assertEqual(len(items),2,items)
-        frame=items[-1]
+        # 视频项的首帧静图只归它自己：同一份字节不再以「独立静帧」身份出第二次。曾按字典序把
+        # image_01.jpg 抓成封面挂在第 1 帧、视频帧再挂一份 poster —— 载荷翻倍，还把一段视频
+        # 伪装成一帧照片（卡片主位已由 get_covers 出这张图，轮播里再叠一次纯属重复）。
+        self.assertEqual(len(items),1,items)
+        frame=items[0]
         self.assertTrue(frame[1],'视频帧仍要标 isVideo')
         self.assertTrue(frame[0].startswith('file:///'),frame[0])
         self.assertEqual(len(frame),4,'视频帧必须带 poster 与 info 序号两格')
         self.assertEqual(frame[3],0,'序号错一位就会把首帧写进别的帧的文件名')
         self.assertTrue(frame[2].startswith('data:image/jpeg;base64,'),frame[2][:60])
+
+    def test_still_frames_still_lead_the_carousel(self):
+        # 反面对照：视频在 info 里排第 2 帧时，第 1 帧的本地静帧照旧先出，首帧静图不会抢它的位。
+        api=make_api()
+        with TemporaryDirectory() as d,patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None):
+            model=write_model(d,'m',[{'url':U0},{'url':V1}])
+            idir=Path(d)/'m.images';idir.mkdir()
+            (idir/'video_02.mp4').write_bytes(b'f'*4096)
+            Image.new('RGB',(60,40),'red').save(idir/'image_02.jpg')
+            Image.new('RGB',(60,40),'blue').save(idir/'image_01.png')
+            items=json.loads(api.get_covers_multi([model],size=220,n=3))[model]
+        self.assertEqual(len(items),2,items)
+        self.assertFalse(items[0][1],items[0])                          # 第 1 帧是静帧封面
+        self.assertTrue(items[1][1],items[1])                           # 第 2 帧是视频
+        self.assertEqual(items[1][3],1,'视频帧序号按 image_02 认，不是按张数')
+        self.assertTrue(items[1][2].startswith('data:image/jpeg;base64,'))
 
 class DetailAndBridgeTests(unittest.TestCase):
     def test_get_model_detail_video_entry_and_autofill_hook(self):
@@ -422,6 +483,25 @@ class DetailAndBridgeTests(unittest.TestCase):
         self.assertEqual(by_url[V1]['type'],'video')                    # mp4 出 video 条目，不进 PIL 缩略管线
         self.assertEqual(by_url[V1]['orig_url'],V1)
         api._start_images_autofill.assert_called_once_with(model,'detail')  # 打开详情顺带排队补帧
+
+    def test_video_stays_in_covers_after_its_poster_lands(self):
+        # 补帧把首帧落成 image_01.jpg 之后，第二次打开详情绝不能因此把视频从 covers 里挤掉。
+        # 曾按「本地图片张数」倒推占位序号，视频项的首帧静图也被算成一个静帧槽位，于是远程循环
+        # `if i in local_img_slots: continue` 正好跳过那条视频——首帧刚落盘，视频反倒整个消失，
+        # 而触发它的正是默认开启的首次打开补帧（等于本改动自己把自己要修的画面删了）。
+        api=make_api();api.cfg={}
+        with TemporaryDirectory() as d:
+            model=write_model(d,'m',[{'url':V1}])
+            idir=Path(d)/'m.images';idir.mkdir()
+            (idir/'video_01.mp4').write_bytes(b'f'*4096)
+            Image.new('RGB',(60,40),'red').save(idir/'image_01.jpg')
+            api._start_images_autofill=Mock(return_value={'started':False,'reason':'fixture'})
+            covers=json.loads(api.get_model_detail(model))['covers']
+        vids=[c for c in covers if c.get('type')=='video']
+        self.assertEqual(len(vids),1,covers)
+        self.assertTrue(vids[0]['url'].startswith('file:///'),vids[0]['url'])
+        self.assertTrue(vids[0]['poster'].startswith('data:image/jpeg;base64,'),'首帧静图要跟着视频项一起出')
+        self.assertEqual(len(covers),1,'首帧静图不许再立一张独立静帧封面（同一份字节出两次）')
 
     def test_gallery_preview_forwards_display_tier(self):
         self.assertEqual(webui._gallery_display_tier({}),(1440,80))
@@ -630,6 +710,61 @@ class RemoteThumbCacheTests(unittest.TestCase):
             self.assertTrue(hit)
             self.assertEqual(miss,'','换一档就不该命中间一条缓存')
             self.assertTrue(os.path.isfile(api._detail_cache_path(U0,webui._WATERFALL_THUMB_W)))
+
+    def test_oversize_tier_clamps_to_the_same_key_on_both_sides(self):
+        # 夹取只在 _detail_cache_path 里做一次：读侧以前原样拼键、写侧先夹到 64..1024，
+        # 越界的 size 于是永远读不到自己刚写下的那张（第二次打开照样跑网络）。
+        api=make_api()
+        self.assertEqual(api._detail_cache_path(U0,5000),api._detail_cache_path(U0,webui._THUMB_SIZE_MAX))
+        self.assertEqual(api._detail_cache_path(U0,1),api._detail_cache_path(U0,webui._THUMB_SIZE_MIN))
+        self.assertEqual(webui._thumb_size('脏'),webui._THUMB_SIZE_MAX)
+        self.assertEqual(webui._thumb_size(None),webui._THUMB_SIZE_MAX)
+
+    def test_detail_tier_is_what_the_front_end_asks_for(self):
+        # 详情缩略条：后端出帧档位 == get_cover_b64 的默认 size == 前端补图那一档。
+        # 三个数分叉时同一帧会被取两次、落盘两份，第二次打开详情还得再跑一趟网络。
+        import inspect
+        self.assertEqual(webui._DETAIL_THUMB_W,
+                         inspect.signature(webui.Api.get_cover_b64).parameters['size'].default)
+        self.assertEqual(webui._DETAIL_THUMB_W,webui._thumb_size(webui._DETAIL_THUMB_W))
+
+    def test_image_max_mb_does_not_gate_the_thumbnail_fetch(self):
+        # config.image_max_mb 管的是原图归档预算，能被设到 1MB。曾拿它当缩略图上限，
+        # 设置一低就 `len(data) > cap` 直接返回 ''，瀑布流与详情的缩略图整片空白（静默的功能缺失）。
+        big=Image.frombytes('RGB',(1200,1200),os.urandom(1200*1200*3))
+        buf=__import__('io').BytesIO();big.save(buf,format='JPEG',quality=95);blob=buf.getvalue()
+        self.assertGreater(len(blob),1024*1024,'夹具得真过 1MB 才钉得住这条')
+        api=make_api({'image_max_mb':1})
+        with TemporaryDirectory() as d,patch.object(webui.config,'APP_DIR',d),\
+             patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None),\
+             patch('urllib.request.build_opener',return_value=self._opener(blob)):
+            b64=api.get_cover_b64(U0,webui._WATERFALL_THUMB_W)
+            self.assertTrue(b64,'原图上限压不到缩略图')
+            self.assertEqual(api._url_thumb_b64(U0,webui._WATERFALL_THUMB_W),b64)
+
+    def test_warm_requeues_after_the_queue_drains(self):
+        # pending 必须在处理完后清掉：只加不减会让 256 键攒满，之后整条入盘链路永久哑掉。
+        # 顺带钉住收工判定的锁顺序——put 挪进锁内、worker 取锁后再看队列，
+        # 否则「worker 刚置 None 收工、这一单才被挂上」会让键留在 pending 里永远没人取。
+        api=make_api()
+        calls=[]
+        with TemporaryDirectory() as d,patch.object(webui.config,'APP_DIR',d),\
+             patch.object(api,'get_cover_b64',side_effect=lambda u,size: calls.append((u,size)) or 'x'):
+            api._warm_url_thumb(U0,460)
+            for _ in range(100):
+                if calls:break
+                time.sleep(0.05)
+            reg=api._thumb_warm_registry()
+            self.assertEqual(calls,[(U0,460)],calls)
+            for _ in range(100):
+                if not reg['pending']:break
+                time.sleep(0.05)
+            self.assertEqual(reg['pending'],set(),'取完就还，队列才排得进下一次')
+            api._warm_url_thumb(U0,460)               # 同一个 URL 第二次仍要排得进去
+            for _ in range(100):
+                if len(calls)>=2:break
+                time.sleep(0.05)
+        self.assertEqual(calls,[(U0,460),(U0,460)],calls)
 
     def test_warm_queue_dedups_and_persists(self):
         api=make_api()
