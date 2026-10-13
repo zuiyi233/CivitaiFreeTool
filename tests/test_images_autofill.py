@@ -3,7 +3,7 @@
 
 钉住任务清单第 1、6、8 条及第 3、4、7、9 条的 webui 接线。全部临时目录 + Mock，
 不触网、不写用户配置、不碰真实模型库；api_key 一律 fixture 假值。"""
-import inspect,json,os,shutil,sys,threading,unittest
+import inspect,json,os,shutil,sys,threading,time,unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock,patch
@@ -374,12 +374,39 @@ class CoversMultiTests(unittest.TestCase):
         api=make_api()
         with TemporaryDirectory() as d,patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None):
             items,_=self.frames(api,d,[{'url':V1}])
-            self.assertEqual(items,[[V1,True]])                        # 远程 mp4 直链 + isVideo=True，绝不 thumb 化/绝不塞给 <img>
+            # 远程 mp4 直链 + isVideo=True + 第三格 poster（这条 info 没有 imageUrl，所以是空串）；
+            # 绝不 thumb 化、绝不塞给 <img>。
+            self.assertEqual(items,[[V1,True,'']])
+            # info 带 imageUrl（新 info）→ poster 给到缩略档 URL，前端 <video poster> 与自动轮播都靠它
+            items_p,_=self.frames(api,d,[{'url':V1,'imageUrl':POSTER1}])
+            self.assertEqual(len(items_p),1)
+            self.assertTrue(items_p[0][1])
+            self.assertIn('width=%d'%webui._WATERFALL_THUMB_W,items_p[0][2],items_p[0][2])
+            self.assertIn('poster1',items_p[0][2])
             model2=write_model(d,'m2',[{'url':V2}])
             vdir=Path(d)/'m2.images';vdir.mkdir();(vdir/'video_01.mp4').write_bytes(b'f'*4096)
             items2=json.loads(api.get_covers_multi([model2],size=220,n=3))[model2]
         self.assertEqual(len(items2),1)
         self.assertTrue(items2[0][0].startswith('file:///'),items2);self.assertTrue(items2[0][1])
+
+    def test_local_first_frame_file_becomes_video_poster(self):
+        # 缺陷 2 的本地侧：<名>.images/image_01.jpg 就是 video_01.mp4 的首帧（补帧/前端抓帧落的约定名）。
+        # 以前本地 mp4 分支直接 return，连 poster 都不给 → 起播前一片空白。
+        api=make_api()
+        with TemporaryDirectory() as d,patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None):
+            model=write_model(d,'m',[{'url':V1}])
+            idir=Path(d)/'m.images';idir.mkdir()
+            (idir/'video_01.mp4').write_bytes(b'f'*4096)
+            Image.new('RGB',(60,40),'red').save(idir/'image_01.jpg')
+            items=json.loads(api.get_covers_multi([model],size=220,n=3))[model]
+        # 首帧文件同时是这张卡的封面（find_cover 回落 <名>.images 首图），所以第 1 帧是静帧封面、
+        # 第 2 帧才是视频；关键是视频帧自己也得带 poster，否则 hover 起播前就是空白。
+        self.assertEqual(len(items),2,items)
+        frame=items[-1]
+        self.assertTrue(frame[1],'视频帧仍要标 isVideo')
+        self.assertTrue(frame[0].startswith('file:///'),frame[0])
+        self.assertEqual(len(frame),3,'视频帧必须带第三格 poster')
+        self.assertTrue(frame[2].startswith('data:image/jpeg;base64,'),frame[2][:60])
 
 class DetailAndBridgeTests(unittest.TestCase):
     def test_get_model_detail_video_entry_and_autofill_hook(self):
@@ -567,5 +594,107 @@ class DownloadAllImagesHonestCountsTests(unittest.TestCase):
                 r2=json.loads(api.download_all_images(model))
             self.assertTrue(r2['ok'])
             self.assertEqual((r2['downloaded'],r2['existing']),(0,3),'已存在必须单独计，不得混进新下载')
+
+class RemoteThumbCacheTests(unittest.TestCase):
+    """缺陷 1：瀑布流的远程帧以前只把 CDN 直链交给浏览器，软件侧零持久化 —— 第二次打开照样从头拉。
+    现在同一档字节要永久落盘，第二次由 get_covers_multi 直接出 data:，且完全不再发请求。"""
+
+    def _opener(self,data=None):
+        resp=FakeResp(data if data is not None else jpeg())
+        opener=Mock();opener.open=Mock(return_value=resp);return opener
+
+    def test_second_read_is_pure_disk(self):
+        api=make_api()
+        with TemporaryDirectory() as d,patch.object(webui.config,'APP_DIR',d),\
+             patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None),\
+             patch('urllib.request.build_opener',return_value=self._opener()):
+            model=write_model(d,'m',[{'url':U0}])
+            first=json.loads(api.get_covers_multi([model],size=220,n=3))[model]
+            self.assertTrue(first[0][0].startswith('https://'),first)     # 未入盘：仍给 CDN 缩略档，别拖慢首屏
+            self.assertIn('width=%d'%webui._WATERFALL_THUMB_W,first[0][0])
+            api.get_cover_b64(U0,webui._WATERFALL_THUMB_W)                # 浏览器/后台入盘队列做的同一件事
+            with patch('urllib.request.build_opener',side_effect=AssertionError('命中磁盘缓存后不得再发请求')):
+                second=json.loads(api.get_covers_multi([model],size=220,n=3))[model]
+        self.assertTrue(second[0][0].startswith('data:image/jpeg;base64,'),second[0][0][:40])
+
+    def test_cache_key_size_is_the_served_width(self):
+        # 浏览器拿的那一档必须与我们落盘/查键的那一档同一个数，否则第二次永远不命中
+        api=make_api()
+        with TemporaryDirectory() as d,patch.object(webui.config,'APP_DIR',d),\
+             patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None),\
+             patch('urllib.request.build_opener',return_value=self._opener()):
+            api.get_cover_b64(U0,webui._WATERFALL_THUMB_W)
+            hit=api._url_thumb_b64(U0,webui._WATERFALL_THUMB_W)
+            miss=api._url_thumb_b64(U0,512)
+            self.assertTrue(hit)
+            self.assertEqual(miss,'','换一档就不该命中间一条缓存')
+            self.assertTrue(os.path.isfile(api._detail_cache_path(U0,webui._WATERFALL_THUMB_W)))
+
+    def test_warm_queue_dedups_and_persists(self):
+        api=make_api()
+        calls=[]
+        with TemporaryDirectory() as d,patch.object(webui.config,'APP_DIR',d),\
+             patch.object(api,'get_cover_b64',side_effect=lambda u,size: calls.append((u,size)) or 'x'):
+            api._warm_url_thumb(U0,460)
+            api._warm_url_thumb(U0,460)          # 同一 URL 只排一次
+            api._warm_url_thumb(U1,460)
+            for _ in range(100):
+                if len(calls)>=2:break
+                time.sleep(0.05)
+        self.assertEqual(sorted(calls),[(U0,460),(U1,460)],calls)
+
+    def test_switch_off_disables_read_and_warm(self):
+        api=make_api({'images_dir_autofill':False,'cache_detail_images':False})
+        with TemporaryDirectory() as d,patch.object(webui.config,'APP_DIR',d),\
+             patch.object(api,'get_cover_b64',return_value='ignored'):
+            api._warm_url_thumb(U0,460)
+            time.sleep(0.2)
+            self.assertEqual(list(Path(d).rglob('*.jpg')),[])
+            self.assertEqual(api._url_thumb_b64(U0,460),'','关掉开关后既不写也不读')
+
+class SaveModelVideoPosterTests(unittest.TestCase):
+    """缺陷 2 的落盘入口：老 info 没有 imageUrl，纯 stdlib 又解不了 H.264，首帧只能由浏览器抓了回传。"""
+
+    def _b64(self,color=(20,40,60)):
+        import io,base64
+        buf=io.BytesIO();Image.new('RGB',(80,50),color).save(buf,'JPEG');return base64.b64encode(buf.getvalue()).decode()
+
+    def test_saves_under_agreed_name_and_is_read_back(self):
+        api=make_api()
+        with TemporaryDirectory() as d,patch.object(webui.posix_compat,'thumb_cache_dir',return_value=None):
+            model=write_model(d,'m',[{'url':V1}])
+            r=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64())
+            self.assertTrue(r['ok'],r)
+            dest=Path(d)/'m.images'/'image_01.jpg'
+            self.assertTrue(dest.is_file(),'必须落在与补帧同名的约定路径上')
+            items=json.loads(api.get_covers_multi([model],size=220,n=3))[model]
+            video=[f for f in items if len(f)>1 and f[1]][-1]
+            self.assertTrue(video[2].startswith('data:image/jpeg;base64,'),'回传一次后详情/瀑布流就该出本地首帧')
+            # 幂等：已有本地首帧就不覆盖
+            before=dest.read_bytes()
+            r2=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64((200,10,10)))
+            self.assertTrue(r2['ok'],r2);self.assertEqual(dest.read_bytes(),before)
+
+    def test_rejects_non_video_index_and_bad_bytes(self):
+        api=make_api()
+        with TemporaryDirectory() as d:
+            model=write_model(d,'m',[{'url':U0},{'url':V1}])
+            self.assertFalse(api.save_model_video_poster(model,0,self._b64())['ok'],'静帧序号不收')
+            self.assertFalse(api.save_model_video_poster(model,9,self._b64())['ok'],'越界序号不收')
+            self.assertFalse(api.save_model_video_poster(model,1,'@@not-base64@@')['ok'])
+            self.assertFalse(api.save_model_video_poster(model,1,'')['ok'])
+            self.assertFalse(api.save_model_video_poster(os.path.join(d,'nope.safetensors'),1,self._b64())['ok'])
+            self.assertFalse((Path(d)/'m.images').exists(),'静帧/越界/坏数据都不该建出目录')
+
+    def test_junction_images_dir_rejected_with_zero_external_writes(self):
+        api=make_api()
+        with TemporaryDirectory() as d:
+            external=Path(d)/'external';external.mkdir()
+            model=write_model(d,'m',[{'url':V1}])
+            link=Path(d)/'m.images'
+            if not make_dir_link(str(link),str(external)):self.skipTest('本机无法创建符号链接/junction')
+            r=api.save_model_video_poster(model,0,'data:image/jpeg;base64,'+self._b64())
+            self.assertFalse(r['ok'],r)
+            self.assertEqual(list(external.iterdir()),[],'被拒时绝不能往链接指向的目录写任何东西')
 
 if __name__=='__main__':unittest.main()

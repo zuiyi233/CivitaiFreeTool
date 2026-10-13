@@ -483,6 +483,11 @@ def _civitai_thumb_url(u, width=460):
     return u
 
 
+# 瀑布流帧的缩略档宽度：_civitai_thumb_url 的默认档、磁盘缓存键与后台入盘必须同一个值，
+# 否则「浏览器拿的那一档」和「我们存进盘的那一档」会错开，第二次照样不命中。
+_WATERFALL_THUMB_W = 460
+
+
 def _todo_label(url):
     """从模型链接里取个可读名字（没存 label 的老条目用）：优先 slug，退化为「模型 ID」"""
     m = re.search(r"/models/(\d+)(?:/([^/?#]+))?", url or "")
@@ -1927,6 +1932,13 @@ class Api:
                                "prompt": _p, "negative": _n})
             except Exception:
                 pass
+        # 视频项的首帧静图：<名>.images/image_XX.jpg 按约定就是该视频自己的 poster（补帧落的 imageUrl
+        # 首帧、前端抓帧回传的首帧都写这个名）。老 info 根本没有 imageUrl 字段，不靠本地这张就只能空白。
+        local_poster = {}
+        for fp in img_files:
+            mp = re.match(r"image_(\d+)[.]", os.path.basename(fp), re.I)
+            if mp:
+                local_poster.setdefault(int(mp.group(1)) - 1, fp)
         # 追加 C 站 URL 图（跳过本地已占的序号 + url 去重）
         for i, img in enumerate(images[:20]):
             if i in local_img_slots:
@@ -1940,10 +1952,19 @@ class Api:
             if is_video:
                 # 视频项：url 优先本地落盘的 video_XX.mp4（file:/// 离线可播），否则远程 mp4 直链；
                 # 绝不进 PIL/缩略图管线，也绝不把 mp4 当图片 URL 交出去（<img> 收到 video/mp4 字节永不解码）。
-                # poster 只有新 info 的 imageUrl 才有；老 info 没有 → 留空，由前端 <video preload="metadata"> 自己出首帧。
+                # poster 三级：本地 image_XX.jpg（补帧/前端抓帧落的首帧）→ info 的 imageUrl → 空。
+                # 以前只认 imageUrl，而真实库的老 info 根本没有这个字段，于是详情主图与缩略图双双空白，
+                # 只有 hover 把视频播起来才看得见画面。抓帧回传（save_model_video_poster）补的就是这一级。
+                poster_b64 = ""
+                pfp = local_poster.get(i)
+                if pfp:
+                    pb = self._cover_thumb(path, pfp, 512, 0, None)
+                    if pb:
+                        poster_b64 = "data:image/jpeg;base64," + pb
                 local_uri = _local_video_uri(base, i + 1)
                 covers.append({"type": "video", "url": local_uri or u, "local": bool(local_uri),
-                               "poster": img.get("imageUrl") or "",
+                               "poster": poster_b64 or (img.get("imageUrl") or ""),
+                               "poster_local": bool(poster_b64),
                                "prompt": (img.get("meta") or {}).get("prompt") or "",
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
                                "orig_url": u})
@@ -2299,6 +2320,72 @@ class Api:
         state["existing"] = existing
         return json.dumps({"ok": True, "downloaded": stats["downloaded"], "existing": existing, "dir": out_dir,
                            "failed": stats["failed"], "skipped": stats["skipped"], "msg": stats["msg"]})
+
+    def save_model_video_poster(self, path, index, data_b64):
+        """前端 canvas 抓到的视频首帧 → 落盘成 <名>.images/image_XX.jpg（与补帧同一命名约定）。
+
+        老 info 没有 imageUrl 字段，而纯 stdlib 解不了 H.264 —— 能拿出首帧像素的只有浏览器。抓一次回传，
+        之后详情与瀑布流都按本地静帧读，不再"只有播起来才看得见画面"。守卫与补帧同一条：目录必须是模型
+        同层的 <名>.images、绝不跟随符号链接/junction、已有本地首帧不覆盖、统一重编码成 ≤640px 的 JPEG。"""
+        try:
+            path = (path or "").strip()
+            if not path or not os.path.isfile(path):
+                return {"ok": False, "msg": "模型文件不存在"}
+            try:
+                idx = int(index)
+            except (TypeError, ValueError):
+                return {"ok": False, "msg": "序号无效"}
+            images = self._info_images(path)
+            if idx < 0 or idx >= len(images) or not _is_video_entry(images[idx]):
+                return {"ok": False, "msg": "该序号不是视频示例图，已拒绝"}
+            b = str(data_b64 or "")
+            if b.strip().lower().startswith("data:") and "," in b[:256]:
+                b = b.split(",", 1)[1]
+            import base64
+            try:
+                raw = base64.b64decode(b, validate=True)
+            except Exception:
+                return {"ok": False, "msg": "首帧数据不是合法 base64"}
+            if not raw or len(raw) > 4 * 1024 * 1024:
+                return {"ok": False, "msg": "首帧为空或超过 4MB"}
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(raw)) as im:
+                if im.format not in ("JPEG", "PNG", "WEBP"):
+                    return {"ok": False, "msg": "首帧格式不支持"}
+                im = im.convert("RGB")
+                im.thumbnail((640, 640))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=82)
+            out = buf.getvalue()
+            base = os.path.splitext(path)[0]
+            out_dir = base + ".images"
+            if not _fill_dir_writable(out_dir, path):
+                return {"ok": False, "msg": "图片目录不可写，或会写到模型目录之外，已拒绝"}
+            dest = os.path.join(out_dir, "image_%02d.jpg" % (idx + 1))
+            if _is_reparse_path(dest) or os.path.islink(dest):
+                return {"ok": False, "msg": "首帧目标是指向别处的链接，已拒绝"}
+            if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                return {"ok": True, "msg": "本地已有首帧，未覆盖", "path": dest}
+            os.makedirs(out_dir, exist_ok=True)
+            import image_gallery
+            tmp = dest + ".tmp"
+            created = False
+            try:
+                with os.fdopen(image_gallery.open_exclusive_tmp(tmp), "wb") as f:
+                    created = True
+                    f.write(out)
+                os.replace(tmp, dest)
+            except Exception:
+                if created:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                raise
+            return {"ok": True, "msg": "首帧已保存到模型目录", "path": dest}
+        except Exception as e:
+            return {"ok": False, "msg": "保存首帧失败：%s" % str(e)[:80]}
 
     def _autofill_registry(self):
         """补帧任务表：全局同时只允许 1 个任务（reg['current'] 是它的 key）。
@@ -2901,6 +2988,68 @@ class Api:
         key = hashlib.sha256((str(size) + ":" + url).encode()).hexdigest()
         return os.path.join(config.APP_DIR, "detail_thumb_cache", key + ".jpg")
 
+    def _url_thumb_b64(self, url, size):
+        """只读在线缩略图的磁盘缓存：命中返回 b64，绝不在这里发网络请求。
+
+        瀑布流首屏 RPC 必须保持快，所以未命中时不"顺手补一张"——由调用方把远程 URL 交给浏览器并行加载，
+        另外排一次后台入盘（_warm_url_thumb），下次就是纯本地。"""
+        if self.cfg.get("cache_detail_images", True) is False:
+            return ""
+        try:
+            import base64
+            p = self._detail_cache_path(url, size)
+            if not os.path.isfile(p) or _is_reparse_path(p):
+                return ""
+            with open(p, "rb") as f:
+                data = f.read()
+            return base64.b64encode(data).decode() if data else ""
+        except OSError:
+            return ""
+
+    def _thumb_warm_registry(self):
+        reg = getattr(self, "_thumb_warm", None)
+        if reg is None:
+            import queue
+            reg = {"lock": threading.Lock(), "queue": queue.Queue(), "pending": set(), "thread": None}
+            self._thumb_warm = reg
+        return reg
+
+    def _warm_url_thumb(self, url, size):
+        """把一张远程缩略图排进后台入盘队列（同一 URL 只排一次、队列有界、单线程串行）。
+
+        不抢首屏带宽：浏览器已经会去拉这一帧，我们只是同时留一份磁盘副本。"""
+        if self.cfg.get("cache_detail_images", True) is False:
+            return
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            return
+        reg = self._thumb_warm_registry()
+        key = "%d:%s" % (int(size), url)
+        with reg["lock"]:
+            if key in reg["pending"] or len(reg["pending"]) >= 256:
+                return
+            reg["pending"].add(key)
+            if reg["thread"] is None:
+                reg["thread"] = threading.Thread(target=self._thumb_warm_worker, args=(reg,), daemon=True)
+                reg["thread"].start()
+        reg["queue"].put((url, size, key))
+
+    def _thumb_warm_worker(self, reg):
+        """串行入盘：取字节 + 校验 + 落盘全复用 get_cover_b64，失败只返回 '' 不抛。"""
+        while True:
+            try:
+                url, size, key = reg["queue"].get(timeout=5)
+            except Exception:
+                with reg["lock"]:
+                    reg["thread"] = None
+                return
+            try:
+                self.get_cover_b64(url, size)
+            except Exception:
+                pass
+            finally:
+                with reg["lock"]:
+                    reg["pending"].discard(key)
+
     def get_cover_b64(self, url, size=512, timeout=15):
         """详情只缓存缩略图，关闭选项后不读写缓存，不自动保存原图。"""
         import io
@@ -2908,13 +3057,14 @@ class Api:
         import urllib.request
         from urllib.parse import urlsplit, urlunsplit
         size = max(64, min(1024, int(size)))
+        cap = _image_cap_bytes(self.cfg)   # 与查看器/补帧同一档（config.image_max_mb），不留第二个上限数字
         try:
             parsed = urlsplit(str(url))
             if parsed.scheme not in ("http", "https"):
                 return ""
             cache = self._detail_cache_path(url, size)
             enabled = self.cfg.get("cache_detail_images", True)
-            if enabled and os.path.isfile(cache):
+            if enabled and os.path.isfile(cache) and not _is_reparse_path(cache):
                 with open(cache, "rb") as f:
                     return base64.b64encode(f.read()).decode()
             # C 站 CDN 直接请求缩略版本，其他图片也只落盘压缩后的 512px 图。
@@ -2927,8 +3077,8 @@ class Api:
                 proxy = self.cfg["proxy_address"]
                 handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
             with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as resp:
-                data = resp.read(25 * 1024 * 1024 + 1)
-            if len(data) > 25 * 1024 * 1024:
+                data = resp.read(cap + 1)
+            if len(data) > cap:
                 return ""
             from PIL import Image
             with Image.open(io.BytesIO(data)) as image:
@@ -3241,14 +3391,32 @@ class Api:
                 out[p] = thumb
         return json.dumps(out, ensure_ascii=False)
 
+    def _remote_frame_thumb(self, url):
+        """远程帧的显示 src：磁盘上已有这一档就直接出本地 b64（第二次打开零网络），
+        否则出 CDN 缩略档 URL 交给浏览器并行加载，同时排一次后台入盘。
+
+        档位固定用 _WATERFALL_THUMB_W（也是 _civitai_thumb_url 的默认档）：浏览器拿的那一档
+        与我们落盘/查键的那一档必须是同一个数，否则第二次永远不命中。"""
+        u = str(url or "").strip()
+        if not u:
+            return ""
+        cached = self._url_thumb_b64(u, _WATERFALL_THUMB_W)
+        if cached:
+            return cached if cached.startswith("data:") else "data:image/jpeg;base64," + cached
+        self._warm_url_thumb(u, _WATERFALL_THUMB_W)
+        return _civitai_thumb_url(u, _WATERFALL_THUMB_W)
+
     def get_covers_multi(self, paths, size=220, n=3):
-        """批量返回轮播帧（JSON：{path: [[src, isVideo], ...]}）。
+        """批量返回轮播帧（JSON：{path: [[src, isVideo], [mp4, True, poster], ...]}）。
 
         帧顺序 = **本地优先于远程**：封面（.preview.* 或 .images 首图）→ 按 info 序号依次取帧，
         该序号本地已落盘就用本地 b64（同帧绝不重复出远程 URL），本地没有才用 .civitai.info 的
-        远程 URL（image 项转 C 站 width=460 缩略，hover 才加载，预取零流量）→ 无序号的本地图片补位。
+        远程 URL → 无序号的本地图片补位。远程静帧与视频 poster 都走 _remote_frame_thumb：
+        磁盘上已有这一档就直接出 data:（第二次打开完全不碰网络），没有才出 CDN 缩略档并排一次后台入盘。
         视频项一律走 _is_video_entry 判定，只返回可播源（本地 video_XX.mp4 的 file URI，否则 mp4 直链）
-        并标 isVideo=True，由前端 <video preload="metadata"> 出首帧。
+        并标 isVideo=True，第三个元素是它的首帧静图（本地 image_XX.jpg 的 data:，否则 info 的 imageUrl
+        缩略档，都没有才空）——以前视频帧不带任何东西，前端 <video preload="metadata"> 起播前就是一块空白，
+        只有 hover 播起来才看见画面，本地 mp4 已落盘的分支更是连 poster 都不给。
 
         以前这里是「info 不足 n 张才用本地补位」，且只按 type 判视频 —— 真实库的 images[] 100% 没有
         type 字段，于是 22.3% 的 .mp4 被当成静帧塞给 <img>：拿到的是 content-type: video/mp4 的
@@ -3332,28 +3500,28 @@ class Api:
                     if img is None:
                         continue
                     if _is_video_entry(img):
+                        # 帧三元组 [src, isVideo, poster]：视频帧自带首帧静图，起播前不再是一片空白。
+                        # poster 优先本地 <名>.images/image_XX.jpg（补帧与前端抓帧都写这个名），
+                        # 没有才回落到 info 的 imageUrl（老 info 连这个字段都没有 → 空，由前端抓帧补上）。
+                        poster = ""
+                        poster_fp = local_by_idx.get(i)
+                        if poster_fp:
+                            b = self._cover_thumb(p, poster_fp, size, seq, None)
+                            if b:
+                                poster = _data(b)
+                        if not poster:
+                            poster = self._remote_frame_thumb(img.get("imageUrl"))
                         local_uri = _local_video_uri(base_p, i + 1)
                         if local_uri:
-                            items.append([local_uri, True])   # 本地落盘视频：离线可播
+                            items.append([local_uri, True, poster])   # 本地落盘视频：离线可播
                             continue
-                        poster = local_by_idx.get(i) if i in video_idx else None
-                        if poster and os.path.normcase(os.path.abspath(poster)) not in emitted:
-                            b = self._cover_thumb(p, poster, size, seq, None)
-                            if b and len(items) < max(1, n - 1):
-                                items.append([_data(b), False])
-                                seq += 1
-                                emitted.add(os.path.normcase(os.path.abspath(poster)))
-                        else:
-                            poster_u = str(img.get("imageUrl") or "").strip()
-                            if poster_u and len(items) < max(1, n - 1):
-                                items.append([_civitai_thumb_url(poster_u), False])
                         mp4 = _video_source_url(img)
                         if mp4:
-                            items.append([mp4, True])         # 远程 mp4：hover 时流式播放
+                            items.append([mp4, True, poster])         # 远程 mp4：hover 时流式播放
                     else:
                         u = str(img.get("url") or "").strip()
                         if u:
-                            items.append([_civitai_thumb_url(u), False])
+                            items.append([self._remote_frame_thumb(u), False])
                 # 无序号对应的本地图片最后补位（自定义文件名，例如 image_cover.png）
                 if len(items) < n:
                     for fimg in unnumbered:
