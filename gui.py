@@ -442,7 +442,8 @@ class CivitaiFreeGUI(tk.Tk):
             cover_url = reverse_parse.pick_cover_url(images)
             if cover_url:
                 threading.Thread(target=_download_image,
-                                 args=(cover_url, base + ".preview.png"), daemon=True).start()
+                                 args=(cover_url, base + ".preview.png"),
+                                 kwargs={"cfg": self.cfg}, daemon=True).start()
         # 2. 询问移动位置
         if not self.cfg.get("ask_move_after_download", True):
             return
@@ -1616,7 +1617,8 @@ class CivitaiFreeGUI(tk.Tk):
                         for attempt in range(3):
                             if _download_image(u, dest, timeout=60,
                                                proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
-                                               verify=self.cfg.get("ssl_verify", True)):
+                                               verify=self.cfg.get("ssl_verify", True),
+                                               cfg=self.cfg):
                                 with lock:
                                     ok_count[0] += 1
                                 break
@@ -2301,18 +2303,42 @@ def _is_image_bytes(data):
             or data.startswith(b"II*\x00"))
 
 
-def _download_image(url, dest, timeout=60, proxy=None, verify=True):
+def _download_image(url, dest, timeout=60, proxy=None, verify=True, cfg=None):
     """下载图片到本地文件（先验证内容为图片格式再写 .tmp + 原子替换；非图片/失败返回 False）
-    proxy: 代理地址（如 127.0.0.1:7897），None 直连；verify: TLS 证书验证"""
+    proxy: 代理地址（如 127.0.0.1:7897），None 直连；verify: TLS 证书验证。
+    体积上限与墙钟截止必须走 image_gallery 的共享档位（与 webui/查看器同口径）：
+    这里是设为封面/封面下载的落点，直连 r.read() 会把伪装的 mp4 慢流整段读进内存并挂死后台线程。"""
     try:
         import urllib.request
+        import image_gallery
+        max_bytes = image_gallery.static_limit_bytes(cfg or {})
+        deadline = time.monotonic() + image_gallery.fetch_deadline_seconds(cfg or {})
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         opener = civitai_api.build_opener(proxy, verify)
+        got = 0
+        buf = bytearray()
         with opener.open(req, timeout=timeout) as r:
-            data = r.read()
+            try:
+                if int(r.headers.get("Content-Length") or 0) > max_bytes:
+                    return False
+            except (TypeError, ValueError):
+                pass
+            while True:
+                if time.monotonic() > deadline:
+                    return False
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > max_bytes:
+                    return False
+                buf.extend(chunk)
+        data = bytes(buf)
         if data and len(data) > 100 and _is_image_bytes(data):
             tmp = dest + ".tmp"
-            with open(tmp, "wb") as f:
+            # 独占创建：预先存在的 .tmp（symlink 或残留文件）一律拒绝，绝不静默跟随/覆盖
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(tmp, dest)
             return True

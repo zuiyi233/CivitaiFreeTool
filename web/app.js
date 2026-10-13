@@ -3796,7 +3796,7 @@ async function showModelDetail(path, historyId = "") {
     }, 400);
     const r = JSON.parse((await api.call("download_all_images", d.path)) || "{}");
     clearInterval(timer);
-    setStatus(r.ok ? "已下载 " + r.downloaded + " 张图片" : "失败: " + (r.msg || ""));
+    setStatus(r.ok ? ("示例图：新下载 " + (r.downloaded || 0) + " 张" + (r.existing ? "，已存在 " + r.existing + " 张" : "")) : "失败: " + (r.msg || ""));
     if (r.ok) { closeDetail(); showModelDetail(d.path); }
   });
   $("#dRenameC", panel).addEventListener("click", () => renameDetailToCivitai(d));

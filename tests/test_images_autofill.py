@@ -11,6 +11,20 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from PIL import Image
 import config,image_gallery,webui
 
+
+class FakeResp:
+    """可控假响应：同时支持 r.read() 与 r.read(size)，这样 pre-fix(整读)与 post-fix(流式)都能喂。"""
+    def __init__(self,data,headers=None):self.data=data;self.pos=0;self.headers=headers or {}
+    def read(self,size=None):
+        if size is None:
+            piece=self.data[self.pos:];self.pos=len(self.data);return piece
+        piece=self.data[self.pos:self.pos+size];self.pos+=len(piece);return piece
+    def __enter__(self):return self
+    def __exit__(self,*a):return False
+
+def fake_opener(data,headers=None):
+    opener=Mock();opener.open=Mock(return_value=FakeResp(data,headers));return opener
+
 MB=1024*1024
 U0='https://image.civitai.com/a/h0/original=true/f0.png'
 U1='https://image.civitai.com/a/h1/original=true/f1.png'
@@ -316,7 +330,7 @@ class DownloadAllImagesTests(unittest.TestCase):
             with patch.object(webui,'_download_image_limited',side_effect=fake_img),patch.object(webui,'_download_video',side_effect=fake_vid),\
                  patch.object(webui.shutil,'disk_usage',return_value=Mock(free=10**12)):
                 r=json.loads(api.download_all_images(model))
-            self.assertTrue(r['ok']);self.assertEqual(r['downloaded'],3)
+            self.assertTrue(r['ok']);self.assertEqual((r['downloaded'],r['existing']),(3,0))
             self.assertEqual(sorted(calls),sorted([('image',20*MB),('image',20*MB),('video',100*MB)]))
             for name in ('image_01.png','image_02.jpg','video_02.mp4'):
                 self.assertTrue((Path(d)/'m.images'/name).is_file(),name)
@@ -324,7 +338,7 @@ class DownloadAllImagesTests(unittest.TestCase):
             with patch.object(webui,'_download_image_limited',side_effect=AssertionError('已存在不得重下')),\
                  patch.object(webui,'_download_video',side_effect=AssertionError('已存在不得重下')):
                 r2=json.loads(api.download_all_images(model))
-            self.assertTrue(r2['ok']);self.assertEqual(r2['downloaded'],3)
+            self.assertTrue(r2['ok']);self.assertEqual((r2['downloaded'],r2['existing']),(0,3))  # 已存在单独计，不虚报新下载
 
 class CoversMultiTests(unittest.TestCase):
     def frames(self,api,d,images,size=220,n=3,name='m'):
@@ -430,5 +444,101 @@ class ConfigDefaultsTests(unittest.TestCase):
         config.normalize_ui_preferences(cfg2)
         self.assertEqual((cfg2['gallery_display_width'],cfg2['gallery_display_quality'],cfg2['fetch_deadline_s']),(1440,80,120))
         self.assertTrue(cfg2['images_dir_autofill'])   # 只有显式 false 才关
+
+class GuiDownloadCapTests(unittest.TestCase):
+    # finding #1：gui 下载链路（设为封面 / 封面下载）必须与 webui/image_gallery 共用同一档上限与时限
+    def test_consults_shared_cap_and_deadline(self):
+        import gui
+        with TemporaryDirectory() as d:
+            dest=os.path.join(d,'cover.png')
+            resp=FakeResp(b'\x89PNG'+b'x'*400)
+            opener=Mock();opener.open=Mock(return_value=resp)
+            cap=Mock(return_value=20*MB);dl=Mock(return_value=120.0)
+            with patch('civitai_api.build_opener',return_value=opener),\
+                 patch.object(image_gallery,'static_limit_bytes',cap),\
+                 patch.object(image_gallery,'fetch_deadline_seconds',dl):
+                ok=gui._download_image(U0,dest,cfg={'image_max_mb':20,'fetch_deadline_s':120})
+            self.assertTrue(ok)
+            cap.assert_called()   # 复用共享上限实现，不再自己 r.read() 无限读
+            dl.assert_called()    # wall-clock 截止时间也来自同一处
+
+    def test_respects_size_cap(self):
+        import gui
+        with TemporaryDirectory() as d:
+            dest=os.path.join(d,'cover.png')
+            # 2MB 的 PNG-magic 流，但 image_max_mb=1 → 必须中止、绝不落盘
+            resp=FakeResp(b'\x89PNG'+b'x'*(2*MB))
+            opener=Mock();opener.open=Mock(return_value=resp)
+            with patch('civitai_api.build_opener',return_value=opener):
+                ok=gui._download_image(U0,dest,cfg={'image_max_mb':1})
+            self.assertFalse(ok)
+            self.assertFalse(os.path.exists(dest),'超上限不得写出文件')
+
+class SetModelCoverGuardTests(unittest.TestCase):
+    # finding #2：设为封面写进用户模型目录，必须走补帧引入的 可写/重解析点 守卫
+    def test_rejects_junction_images_dir(self):
+        api=make_api();api.cfg={}
+        with TemporaryDirectory() as d,TemporaryDirectory() as out:
+            model=write_model(d)
+            external=Path(out)/'archive';external.mkdir();(external/'marker.txt').write_text('keep',encoding='utf-8')
+            idir=os.path.join(d,'m.images')
+            if not make_dir_link(idir,str(external)):self.skipTest('本机无法创建符号链接/junction')
+            def fake_dl(url,dest,**kw):Path(dest).write_bytes(b'cover');return True
+            # 本地无图 + 在线 URL → 旧实现会顺着 junction 把封面写到模型目录之外
+            with patch.object(webui,'_download_image',side_effect=fake_dl):
+                r=api.set_model_cover(model,'',img_url=U0)
+            self.assertFalse(r['ok'])
+            self.assertEqual([p.name for p in external.iterdir()],['marker.txt'],'守卫必须在下载前拦住，外部目录零写入')
+
+    def test_normal_local_cover_still_succeeds(self):
+        api=make_api();api.cfg={}
+        with TemporaryDirectory() as d:
+            model=write_model(d)
+            base=os.path.splitext(model)[0]
+            local=Path(d)/'pick.png';Image.new('RGB',(50,50),'red').save(local)
+            r=api.set_model_cover(model,str(local))
+            self.assertTrue(r['ok'],r)
+            self.assertTrue(os.path.isfile(base+'.preview.png'))
+
+class ExclusiveTmpTests(unittest.TestCase):
+    # finding #3：临时文件必须独占创建，预置的 .tmp（symlink/残留文件）不得被静默覆盖
+    def _assert_refused(self,fn,dest,data,headers=None):
+        tmp=Path(dest+'.tmp');tmp.write_bytes(b'SENTINEL-DO-NOT-CLOBBER')
+        opener=Mock();opener.open=Mock(return_value=FakeResp(data,headers))
+        with patch('civitai_api.build_opener',return_value=opener):
+            ok=fn(U0,dest,proxy=None,verify=True)
+        self.assertFalse(ok,'.tmp 已存在时必须拒绝，不能覆盖')
+        self.assertFalse(os.path.exists(dest),'被拒时绝不能产出目标文件')
+
+    def test_gui_download_image_refuses_existing_tmp(self):
+        import gui
+        with TemporaryDirectory() as d:
+            self._assert_refused(gui._download_image,os.path.join(d,'c.png'),b'\x89PNG'+b'x'*400)
+
+    def test_download_image_limited_refuses_existing_tmp(self):
+        with TemporaryDirectory() as d:
+            self._assert_refused(webui._download_image_limited,os.path.join(d,'c.png'),b'\x89PNG'+b'x'*400)
+
+    def test_download_video_refuses_existing_tmp(self):
+        with TemporaryDirectory() as d:
+            self._assert_refused(webui._download_video,os.path.join(d,'c.mp4'),b'v'*4096)
+
+class DownloadAllImagesHonestCountsTests(unittest.TestCase):
+    # finding #4：download_all_images 不得把「已存在」计入「新下载」
+    def test_new_and_existing_reported_separately(self):
+        api=make_api()
+        with TemporaryDirectory() as d:
+            model=write_model(d,images=[{'url':U0},{'url':U1},{'url':U2}])
+            def fake_img(url,dest,**kw):Path(dest).write_bytes(b'img');return True
+            with patch.object(webui,'_download_image_limited',side_effect=fake_img),\
+                 patch.object(webui.shutil,'disk_usage',return_value=Mock(free=10**12)):
+                r=json.loads(api.download_all_images(model))
+            self.assertTrue(r['ok'])
+            self.assertEqual((r['downloaded'],r['existing']),(3,0),'首轮全是新下载')
+            # 幂等第二轮：0 新下载、3 已存在
+            with patch.object(webui,'_download_image_limited',side_effect=AssertionError('已存在不得重下')):
+                r2=json.loads(api.download_all_images(model))
+            self.assertTrue(r2['ok'])
+            self.assertEqual((r2['downloaded'],r2['existing']),(0,3),'已存在必须单独计，不得混进新下载')
 
 if __name__=='__main__':unittest.main()

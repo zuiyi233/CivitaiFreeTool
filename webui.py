@@ -84,7 +84,9 @@ def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=1
         })
         opener = civitai_api.build_opener(proxy, verify)
         got = 0
-        with opener.open(req, timeout=timeout) as r, open(tmp, "wb") as f:
+        # 独占创建临时文件：预置的 .tmp（symlink/残留）一律拒绝，绝不静默跟随或覆盖
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with opener.open(req, timeout=timeout) as r, os.fdopen(fd, "wb") as f:
             while True:
                 if deadline is not None and time.monotonic() > deadline:
                     raise TimeoutError("video download deadline exceeded")
@@ -241,7 +243,9 @@ def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_
                     return False
             except (TypeError, ValueError):
                 pass
-            with open(tmp, "wb") as f:
+            # 独占创建临时文件：预置的 .tmp（symlink/残留）一律拒绝，绝不静默跟随或覆盖
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(fd, "wb") as f:
                 while True:
                     if deadline is not None and time.monotonic() > deadline:
                         raise TimeoutError("image download deadline exceeded")
@@ -611,7 +615,7 @@ class Api:
                 if cover_url:
                     try:
                         _download_image(cover_url, base + ".preview.png",
-                                        proxy=proxy_cfg, verify=verify_cfg)
+                                        proxy=proxy_cfg, verify=verify_cfg, cfg=self.cfg)
                     except Exception:
                         pass
                 has_video = any(_is_video_entry(im) and _video_source_url(im) for im in imgs)
@@ -2144,14 +2148,18 @@ class Api:
             mdir = _os.path.dirname(_os.path.abspath(path))
             if (not img_path or not _os.path.exists(img_path)) and img_url:
                 idir = _os.path.join(mdir, _os.path.basename(base) + ".images")
+                # 在线取图会往模型目录写文件：必须先过补帧那套 重解析点/可写 守卫，
+                # 否则 <名>.images 做成 junction 时，封面就顺着链接写到模型目录之外。
+                if not _fill_dir_writable(idir, path):
+                    return {"ok": False, "msg": "封面目录是符号链接/junction 或会写到模型目录之外，已拒绝"}
                 try:
                     _os.makedirs(idir, exist_ok=True)
                 except Exception:
-                    pass
+                    return {"ok": False, "msg": "封面目录不可写，已拒绝"}
                 dl = _os.path.join(idir, "image_cover.png")
                 okd = _download_image(img_url, dl,
                                       proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
-                                      verify=self.cfg.get("ssl_verify", True))
+                                      verify=self.cfg.get("ssl_verify", True), cfg=self.cfg)
                 if not okd:
                     return {"ok": False, "msg": "在线获取这张图失败（网络/代理问题），稍后再试"}
                 img_path = dl
@@ -2164,6 +2172,10 @@ class Api:
             if not (same_dir or in_imgs):
                 return {"ok": False, "msg": "图片不在该模型目录内，已拒绝"}
             target = model_manager.find_cover(path) or (base + ".preview.png")
+            # 落点同样要过守卫：目标文件本身或所在目录是重解析点就拒绝（os.path.islink 认不出 junction）。
+            tdir = _os.path.dirname(_os.path.abspath(target))
+            if _is_reparse_path(target) or not _fill_dir_writable(tdir):
+                return {"ok": False, "msg": "封面目标位置是符号链接/junction 或目录不可写，已拒绝"}
             ext = _os.path.splitext(target)[1].lower()
             fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}.get(ext, "PNG")
             im = Image.open(img_path)
@@ -2274,12 +2286,14 @@ class Api:
         targets = _images_fill_targets(base, images)
         pending = _fill_pending_targets(targets)
         existing = len(targets) - len(pending)
-        state = {"total": len(targets), "done": existing, "downloaded": existing, "failed": 0}
+        # downloaded 只计本次真正新下的字节；已存在的单列 existing，绝不计入新下载（前端据此如实报数）
+        state = {"total": len(targets), "done": existing, "downloaded": 0, "failed": 0}
         self._img_dl_state = state
         stats = _images_fill_run(path, pending, self.cfg, state=state,
                                  deadline_s=_fetch_deadline_s(self.cfg) * max(1, len(targets)))
         state["done"] = len(targets)
-        return json.dumps({"ok": True, "downloaded": existing + stats["downloaded"], "dir": out_dir,
+        state["existing"] = existing
+        return json.dumps({"ok": True, "downloaded": stats["downloaded"], "existing": existing, "dir": out_dir,
                            "failed": stats["failed"], "skipped": stats["skipped"], "msg": stats["msg"]})
 
     def _autofill_registry(self):
@@ -4600,7 +4614,7 @@ class Api:
                         for _ in range(3):
                             if _download_image(cover_url, dest,
                                                proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
-                                               verify=self.cfg.get("ssl_verify", True)):
+                                               verify=self.cfg.get("ssl_verify", True), cfg=self.cfg):
                                 ok += 1
                                 break
                 # 视频项 mp4 一并落盘（跳过已存在；与「下载封面」同批，进度不细分）
