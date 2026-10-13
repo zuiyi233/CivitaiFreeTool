@@ -1,4 +1,4 @@
-# CivitaiFreeTool 更新日志（v1.5.1 → v2.6.28）
+# CivitaiFreeTool 更新日志（v1.5.1 → v2.6.29）
 
 ## 🌐 局域网无头服务器资产接入（本 fork 新增）
 
@@ -15,6 +15,18 @@
 - 仅限局域网使用，不要把 445 端口暴露到公网；建议账号密码登录而非免密 guest
 
 ---
+
+## v2.6.29：模型示例图加载性能（视频误判修复 + 显示档降级 + 缓存扩容 + 按需落盘）
+
+「有些模型的图要 1 分钟甚至 5 分钟」排查到的主因不是网络，是**视频被当图片处理**：真实库 114 个模型 / 479 个 `info.json` 图片条目里 `type` 字段 **100% 缺失**（条目只有 `url/width/height/nsfw`），而判定只认 `type=='video'`，于是 **107 条（22.3%）`.mp4` 被当静帧**——瀑布流拿到 `.../width=460/x.mp4`，CDN 回 `content-type: video/mp4` 的 1,283,945~2,314,133 字节，`<img>` 永远解不出来但带宽已花掉；查看器更糟，视频 `original` 档实测均值 **19,429KB**，下完交给 PIL 必然报错，个别还撞「超过 25 MB」。判定改成「`type` 或 URL 尾缀」并收敛成 `reverse_parse.is_video_image_entry` 一份（`gui` 的封面下载链路此前也在用只认 type 的那份，会把 mp4 直链当封面）。实测同一张 1920px 图：原图档 1,450,825 字节 / 2.75s，显示档 `width=1440,quality=80` **94,168 字节 / 3.74s**——单轮计时没赢（链路吞吐实测在 8.2KB/s~1760KB/s 之间抖），但字节少 15.4 倍，收益在尾部延迟、缓存容量与重复查看上，不在「这一次更快」。视频帧现在 **0.016s、0 字节**返回明确文案，不再先下 19.4MB 再失败。
+
+显示档降级有个必须防的坑：全库 479 条 `width` 都在（median 1080），**328 条（68%）本来就 ≤1440px**，无脑请求 `width=1440` 会上采样——实测一张 682KB 的窄图被顶成 1,218,800 字节，比不降级还大。规则改为按实际宽度收口，且 CDN 实测**忽略** `format=` 与 `resize=`（返回体字节数与不带时一致），只用 `width=`/`quality=`。`width=/quality=` 转码会剥掉 EXIF 与 UserComment，所以显示档字节绝不用于提取生成参数，取不到就退回 info 的 meta 并在查看器如实标注「生成参数未从原图读取」；**保存图片与复制图片仍走原图档**。
+
+缓存：`gallery_cache_mb` 默认 **1024→8192**、可配上限 **8192→65536**（全库原图约 3.3GB = 静帧 1.19GB + 视频 2.08GB，1GB 预算必然把「看过一次」的档淘汰掉，这才是「加载一次之后很久都不会变」不成立的原因）；新增分档上限 `image_max_mb=20` / `video_max_mb=100`，并让 `webui` 与 `image_gallery` 共用同一实现（此前同一配置键两处各钳一套：负值一处回默认、另一处钳 1MB；`normalize` 允许 2000/4096 而运行时钳到 1024，用户调大被静默截断）；`fetch_deadline_s=120` 补上 wall-clock 总时限（原 `timeout=25` 是 socket 级，慢流能挂几分钟）。**已知代价**：静帧上限从旧的 25MB 收到 20MB，本地 20–25MB 的原图会改判「图片超过 20 MB」，可调 `image_max_mb` 恢复。
+
+按你要求把图拉进模型目录：打开详情后按需把缺的帧补到 `<名>.images/`（同时只 1 个任务、任务内串行 1 张、已存在即跳过、可取消、磁盘余量不足就跳过并写明原因），轮播与详情的帧来源由「远程优先」改为**本地优先**；此前 161 个模型 0 个有该目录，读盘通道一直空转。落盘守卫必须查 `FILE_ATTRIBUTE_REPARSE_POINT`——实测 `os.path.islink()` 对 Windows junction 返回 False 且 `mklink /J` 无需管理员权限，只查 islink + realpath 同层会被同层 junction 绕过。自动补帧每个模型最多落 3 个 mp4（与既有 `_ensure_local_videos` 同口径），要全量视频用详情里的「下载全部图片」。独立复核提出的「covers 没带 width、防上采样是死代码」经实测**驳回**：`width` 由 `image_gallery.generation()` 提供，删掉重复赋值后接线照旧成立；但据此补了一条从 `get_model_detail` 一路打到真实请求 URL 的守卫，并修掉它报的三条真问题（`get_gallery_cached` 读缓存不带档位导致快路径永不命中、复制图片被降级成显示档、视频判定两份实现分叉）。
+
+把轮播用例真正跑起来之后又抓到两处**只在实机才会现形**的缺陷（`tests/test_masonry_carousel.cjs` 因 `index.html` 默认标签是「批量下载」而 `#page-models` 处于 `display:none`，从写下那天起就没跑到后半段，`532915c` 上以同样方式失败，已逐项与基线对拍确认）：一是**关掉「瀑布流自动轮播」后卡片停在最后一帧不动**——`_mmAutoSetInterval(false)` 只 `clearInterval`，而 `_mmAutoTick` 在开关关闭时提前 return，负责回收的 `_mmAutoSweep` 再也轮不到，实测关掉后 2 张非悬停卡片各剩 1 层叠帧；现在关闭时把 `_autoPlayers` 逐个 `_stopCarousel` 收干净，设置项即时生效分支也接上同一个函数。二是**v2.6.28 的「真淡入」其实没有淡**——刚 `append` 的元素在这一帧之前没被算过样式，浏览器没有「变化前样式」可比，rAF 里改 `opacity` 被当成初始值直接落到 1（实测 computed opacity 从 `1` 起步），现在 `append` 后先读一次 `getComputedStyle(el).opacity` 强制那次样式计算，并在用例里同时盯住「起始值 <0.9」与「过程中出现 intermediate 值」，防止退化成延迟硬切。用例侧另修了四处口径（采样要取 DOM 最后一张叠帧、慢网帧必须是远程 URL、清零类断言要先关自动节拍、淡入窗口要跨过 0.35s），`tests/test_ui_preferences.cjs` 里写死的「7 个导航页签」也改成核对页签集合（本仓库多一页「资源库」实际 8 个，同样在基线就失败）。轮播用例现 **15 项检查点全绿**。全量回归 651→**714 项通过**（新增 `tests/test_gallery_display_tier.py`、`tests/test_images_autofill.py`，真实库只读对拍用 env 开关默认跳过）。详见 [多图契约 §1b、§3e](docs/media-gallery-contract.md) 与 [版本说明](docs/releases/v2.6.29.md)。
 
 ## v2.6.28：模型库多图轮播修复 + 淡入与自动轮播
 

@@ -18,7 +18,7 @@ C 站 `modelVersions[].images` 每项：`{url, type: 'image'|'video', imageUrl(�
 6. `get_covers_multi(paths, size=220, n=3)`：`{path: [[src, isVideo], ...]}`，**帧顺序=本地优先于远程**：封面 → 按 info 序号依次取帧（该序号本地已落盘就用本地 b64，本地没有才用远程 URL，image 项转 `width=460` 缩略）→ 无序号的本地图片补位。视频项只返回可播源并标 `isVideo=True`，没有 poster 也绝不伪造一个指向 mp4 的"图片 URL"。
 7. `get_gallery_image` 对 video 项直接抛/返回中文错误（`image_gallery.preview` 在入口即拒，连下载都不发起）；`ValueError` 的文案原样透传给用户，不再并成"图片读取失败"。
 
-## 1b. 图片加载性能档位（v2.6.28 实测结论，勿凭直觉改）
+## 1b. 图片加载性能档位（v2.6.29 实测结论，勿凭直觉改）
 
 **CDN 参数能力（对真实库 URL 逐个 HEAD 实测）**
 
@@ -65,9 +65,16 @@ C 站 `modelVersions[].images` 每项：`{url, type: 'image'|'video', imageUrl(�
 3c. **停播后晚到的预载帧不许挂图**（同一轮在冻结产物上实测到的第二个缺陷）：`_stopCarousel` 只 `clearInterval` 并移除 `st.cur`，**不取消在途的 `new Image()` 预载**；慢网下鼠标已经移开、预载才回来，帧会被挂到已经停播的卡片上，成为没人负责清理的孤儿叠图（实测：一次 hover 后叠层数变 2，移开鼠标后仍剩 1 张，要等下次重渲染才消失）。现在 `mount()` 先做归属检查（`_masonryCarousel.get(card) !== st` 就丢弃并返回 false，视频分支据此不再 `play()`），`rearm()` 同样只在归属仍属于本轮时排下一拍（否则停播后回来的帧会留下无人回收的定时器），`_stopCarousel` 改成先摘登记、再按 DOM 清掉 `.ms-img-wrap` 里的全部 `.ms-img-alt`（顺手治好历史遗留的孤儿）。
 3d. **换帧必须是淡入，且自动轮播不靠悬停**（v2.6.28 完善；同时把 §3c 末句"先清空所有叠层再挂新帧"改成交叉淡入的口径）：
     - 淡入以前是**被自己废掉的**——CSS 已有 `.ms-img-alt{opacity:0;transition:opacity .35s}`，但 JS 在 `append` 之前就把 `style.opacity="1"` 写死，元素一插入就是不透明，过渡没有可插手的边界，所以切换生硬。现在改成"以 0 插入 → 下一帧抬到 1"，并且**旧帧压在下面保持不透明，等新帧淡到位（`transitionend` 或 `_MM_FADE_MS+260` 超时）才摘**——两张同时半透明会透出底下的主封面，反而闪一下。`_nextFrame()` 带 48ms 超时兜底：后台标签页与最小化窗口里 `requestAnimationFrame` 不跑，只靠 rAF 会让叠层永远停在 `opacity:0`（看不见又占着卡片）。
+    - **v2.6.29 实测到上面这套分两步还不够**：刚 `append` 的元素在这一帧之前没被算过样式，浏览器没有"变化前样式"可比，rAF 里改 `opacity` 被当成初始值直接落到 1，过渡整体跳过（computed opacity 从 `1` 起步）。所以 `append` 之后必须先读一次 `getComputedStyle(el).opacity` 强制那次样式计算，把 `opacity:0` 钉成变化前的值，淡入才真的存在。**回归断言要同时盯住起始值 <0.9 和过程中出现 intermediate 值**，只断言起始值会把"延迟硬切"当成合格淡入放过去。
+    - **关掉 `masonry_autoplay` 必须连已挂的叠帧一起收回**：`_mmAutoSetInterval(false)` 原来只 `clearInterval`，而 `_mmAutoTick` 在开关关闭时提前 return，回收用的 `_mmAutoSweep` 再也轮不到——实测关掉后 2 张非悬停卡片各剩 1 层叠帧，界面表现是"关了自动轮播，图停在最后一帧不动"，要等 hover 或重渲染才消失。现在关闭时把 `_autoPlayers` 里的卡片逐个 `_stopCarousel` 并清空登记，设置项即时生效分支（`state.cfg[key]=val` 那一支）直接调 `_mmAutoSetInterval(val!==false)`。
     - 自动轮播 `_mmAutoTick`（`_MM_AUTO_MS=3000`，设置项 `masonry_autoplay` 默认开）：**每拍只推进一张卡片**，按游标在"视口内 + 没被悬停 + 帧数 ≥2"的卡片间轮转，所以整屏是"隔几秒动一处"而不是同时闪；挑不到候选时催一次预取，下一拍就有得换。悬停会把该卡的播放器升级成它自己的 3 秒节拍（`st.auto=false` + 专属 `setInterval`），移出鼠标即 `_stopCarousel` 回到主封面；卡片滚出视口由 `_mmAutoSweep` 停播回收。**自动模式跳过视频帧**（一屏多路解码不划算，悬停时才播），`document.hidden`、`prefers-reduced-motion: reduce`、瀑布流不在前台时一律不跑，避免后台偷拉流量。
     - 播放器状态从闭包提成 `_masonryCarousel` 里的对象（`{card, wrap, list, idx, cur, loading, seq, dead, timer, auto}`），`_autoPlayers` 另存一份可迭代登记（WeakMap 不能遍历）；`idx` 因此能跨拍续着走，不会每次从第 2 帧重来。
     - 回归：`tests/test_masonry_carousel.cjs` 覆盖"以透明插入并收敛到不透明、交叉期最多两层、鼠标不碰网格也会挂帧换帧、关掉 `masonry_autoplay` 即停"。
+3e. **轮播用例自身的四条口径**（v2.6.29 一条条实测出来的，改用例时别退回旧写法）：
+    - 先 `switchPage('models')` 再 `mmSetView('masonry')`：`index.html` 默认 active 标签是 download，`#page-models` 处于 `display:none` 时卡片全是零尺寸，`waitForSelector('#mmMasonry .ms-card')` 只会等到超时。
+    - 判断"换帧了没有"要取 **DOM 里最后一张** `.ms-img-alt`：新帧是 `append` 上去的，淡入交叉期同时有旧新两张，`querySelector('.ms-img-alt')` 拿到的第一张是还没摘的旧帧——"约 3 秒/帧应至少换过一次帧"此前就是这样误报的（产品其实一直在换帧）。
+    - 慢网/孤儿图用例的帧必须是**远程 URL**：`data:` 帧在 `_carouselAdvance` 走"本地 b64 立即可用"的直挂分支，根本不经过 `new Image()` 预载，"预载未回来前不该有叠层"用 `data:` 帧恒不成立；用完把 `coverCacheMulti` 还原回 `data:` 帧，后面的重新起播检查才拿得到帧。
+    - 断言"整个网格叠层清零"的检查点必须先关自动轮播（自动节拍会在别的卡片上合法挂帧），用 `_mmAutoSetInterval(false)` 而不是只改 `state.cfg`——前者才是设置项走的同一条路。淡入探针的采样窗口要跨过 0.35s 过渡（≥30 帧），14 帧（≈0.23s）时"收敛到不透明"不可能成立。
 4. 瀑布流封面筛选：扫描行带 `has_cover`（webui 扫描时 `find_cover || _images_dir_first` 判定，`get_scan_rows` 透传）；前端 `#mmCoverF` 下拉（全部封面/仅看有图·视频/仅看无图）在 `applyMmFilter` 过滤，`state.coverCache` 已命中路径作为有图兜底（自愈扫描后补下封面的滞后）。
 5. 样式：.ms-img-alt、.thumb-video-badge、.iv-stage-video、.ms-img-wrap position:relative。
 

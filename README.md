@@ -2,12 +2,13 @@
 
 > 免费的 Civitai / HuggingFace 模型下载与本地模型管理工作台。
 
-![Version](https://img.shields.io/badge/version-2.6.28-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
+![Version](https://img.shields.io/badge/version-2.6.29-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
 
 [下载最新版](https://github.com/ADVICEsama/CivitaiFreeTool/releases/latest) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/ADVICEsama/CivitaiFreeTool/issues) · [Linux / macOS](LINUX.md)
 
 ## 当前工作台
 
+- **模型示例图加载性能（v2.6.29）**：「有些模型的图要 1 分钟甚至 5 分钟」的主因不是网络——真实库 479 条图片条目里 `type` 字段 100% 缺失，**107 条（22.3%）`.mp4` 被当静帧**（每张 1.3–2.3MB 的死缩略图，查看器更先下完 19.4MB 视频再交给 PIL 报错），判定改成「`type` 或 URL 尾缀」并收敛成一份实现，视频帧现在 0.016s / 0 字节返回明确文案；显示走 `width=1440,quality=80` 降级档（实测 1,450,825→94,168 字节，窄图不加 `width=` 防上采样，保存 / 复制仍走原图档）；磁盘缓存默认 1024→**8192MB**（全库原图约 3.3GB，预算太小必然把「看过一次」的淘汰掉）并按档位分缓存键；新增 `image_max_mb=20` / `video_max_mb=100` / `fetch_deadline_s=120`（wall-clock 总时限，两处钳制口径统一）；打开详情后按需把缺的帧补进「模型名.images」并改为**本地优先**读取（可在设置关闭，同时只 1 个任务、可取消、磁盘不足会跳过并说明）。详见 [版本说明](docs/releases/v2.6.29.md)。
 - **资源库（v2.6.27）**：把 ComfyUI output 的图片 / 视频索引成本地库，按类型 / 底模 / LoRA / 文件夹 / 标签 / 采样器 / 调度器 / 尺寸 / 时长筛选，可搜提示词、可播放视频、可收藏打标签，支持多选批量（收藏 / 加摘标签 / 送解析 / 删除，服务端分页取全 id、按 500 一片执行），模型引用能直接跳回模型库对应条目。纯 stdlib sqlite 索引 + 纯 Python 读 PNG 文本块、mp4 atom 与 webm/mkv 的 EBML（不依赖 ffmpeg），几万条目不卡；现代自定义节点工作流的提示词 / 底模 / 生成参数按字段名回收并如实标注来源，视频帧率按 `mdhd`+`stts` 计算；增量扫描，schema 升级即迁移不用删库重扫，收藏与标签可导出 JSON 再导入、库目录改名换盘符后自动重连；删除只回收媒体本体不动共用的工作流 `.json`。设置里填输出目录（支持多根与局域网共享路径，有自动探测）。详见 [版本说明](docs/releases/v2.6.27.md)。
 
 - **文件夹显示 / 排除（v2.6.26）**：首次默认显示全部。点父文件夹会统一显示或排除整个子树，覆盖之前的子目录选择；再单独点子目录可覆盖父目录。只想显示 A/B：先排除 A，再显示 B。勾选 A 后排除 B：只排除 B 子树，其它内容保留。只筛选显示，不移动 / 删除文件；选择立即保存。
