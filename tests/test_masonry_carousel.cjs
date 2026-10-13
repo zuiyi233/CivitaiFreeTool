@@ -35,6 +35,9 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
     window.fixtureMultiCovers=multi; window.fixturePaths=rows.map(r=>r.path);
     window.fixtureLastFrame=multi[rows[7].path][2][0];
     state.models=rows; window.fixtureScanRows=rows;
+    // 必须先切到「模型管理」页：index.html 的默认 active 标签是 download，
+    // #page-models 处于 display:none 时卡片全是零尺寸，waitForSelector 只等到超时。
+    switchPage('models');
     mmSetView('masonry'); state.mmBaseF=''; state.mmTypeF=''; applyMmFilter();
     document.querySelector('.content').scrollTop=0;
   });
@@ -64,11 +67,29 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
 
   const seen=new Set([shape.src]);
   for(let i=0;i<2;i++){await page.waitForTimeout(3400);
-    const s=await page.evaluate(()=>{const c=document.querySelector('#mmMasonry .ms-card:hover');const a=c.querySelector('.ms-img-alt');return a?String(a.src):'';});
+    // 采样必须取 DOM 里最后一张叠帧：新帧是 append 上去的，淡入交叉期 alts[0] 还是没摘的旧帧，
+    // 读第一张会把"已经换帧"采样成"没换"（这条检查点此前就是这么误报的）。
+    const s=await page.evaluate(()=>{const c=document.querySelector('#mmMasonry .ms-card:hover');const alts=[...(c?c.querySelectorAll('.ms-img-alt'):[])];
+      return alts.length?String(alts[alts.length-1].src):'';});
     assert(s,'换帧过程中叠层帧不能消失');seen.add(s);}
   assert(seen.size>=2,'约 3 秒/帧应至少换过一次帧');
   ok('hover 期间按 ~3 秒/帧继续换帧（真的在循环，不是挂个静止叠层）');
 
+  // 回归点：关掉自动轮播原来只 clearInterval，停下一次心跳，但自动播放器已经挂上的叠帧永远留在卡片上
+  // （实测关设置后 2 张非悬停卡片各剩 1 层叠帧，界面表现是"关了自动轮播，图停在最后一帧不动"，
+  // 要等 hover 或重渲染才消失）。现在关的时候连 DOM 一起收。
+  await page.mouse.move(8,8);
+  const seeded=await page.evaluate(()=>{document.querySelector('.content').scrollTop=0;
+    const c=[...document.querySelectorAll('#mmMasonry .ms-card')].find(x=>!x.matches(':hover')&&_carouselHasFrames(state.coverCacheMulti.get(x.dataset.path)));
+    if(!c)return null; const st=_carouselPlayer(c,c.dataset.path,true);
+    if(st){st.auto=true;_autoPlayers.add(c);_carouselAdvance(st);} return c.dataset.path;});
+  assert(seeded,'需要一个未悬停且有多图帧的卡片来复现');
+  await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length>0,null,{timeout:3000});
+  await page.evaluate(()=>{state.cfg.masonry_autoplay=false;_mmAutoSetInterval(false);});
+  await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length===0,null,{timeout:4000});
+  ok('关掉自动轮播后，自动播放器挂上的叠帧立即收回');
+
+  // 以下检查点都断言"整个网格叠层清零"，而自动轮播会在别的卡片上合法挂帧，所以保持节拍关闭
   await page.mouse.move(8,8);
   await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length===0,null,{timeout:4000});
   ok('移开鼠标后叠层帧清理干净');
@@ -79,6 +100,10 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
     window.Image=function(){const el=new Real();let s='';
       Object.defineProperty(el,'src',{set(v){s=v;setTimeout(()=>el.dispatchEvent(new Event('load')),1200);},get(){return s;}});return el;};
     window.__restoreImage=()=>{window.Image=Real;};});
+  // 帧必须走远程 URL：data: 帧在 _carouselAdvance 里直接挂载（本地 b64 立即可用），
+  // 那样慢网预载这条路径根本不会被经过，"预载未回来前不该有叠层"也就无从成立。
+  const slowPath=await page.evaluate(()=>{const p=window.fixturePaths[0];
+    state.coverCacheMulti.set(p,[['https://cdn.example/slow0.jpg',false],['https://cdn.example/slow1.jpg',false]]);return p;});
   await page.evaluate(()=>{document.querySelector('.content').scrollTop=0;});
   await page.locator('.ms-card').first().hover({position:{x:60,y:60}});
   await page.waitForTimeout(250);
@@ -86,7 +111,7 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
   await page.mouse.move(8,8);
   await page.waitForTimeout(2400);
   assert.equal(await page.evaluate(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length),0,'移开后晚到的预载帧挂成了孤儿叠图');
-  await page.evaluate(()=>window.__restoreImage());
+  await page.evaluate(p=>{window.__restoreImage();state.coverCacheMulti.set(p,window.fixtureMultiCovers[p]);},slowPath);
   await page.locator('.ms-card').first().hover({position:{x:60,y:60}});
   await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-card:first-child .ms-img-alt').length===1,null,{timeout:6000});
   await page.mouse.move(8,8);
@@ -117,20 +142,23 @@ let passed=0;function ok(s){console.log('OK '+s);passed++;}
     const st=_carouselPlayer(c,c.dataset.path,true);
     _carouselAdvance(st);
     const seen=[];
-    for(let i=0;i<14;i++){ await new Promise(r=>requestAnimationFrame(r));
+    for(let i=0;i<30;i++){ await new Promise(r=>requestAnimationFrame(r));   // 30 帧≈0.5s，跨过 0.35s 的过渡才谈得上"收敛"
       const a=[...c.querySelectorAll('.ms-img-alt')];
       if(a.length) seen.push({n:a.length,op:a.map(x=>Number(getComputedStyle(x).opacity))}); }
-    return {first:seen[0]||null,last:seen[seen.length-1]||null,maxN:Math.max(0,...seen.map(s=>s.n))};
+    return {first:seen[0]||null,last:seen[seen.length-1]||null,maxN:Math.max(0,...seen.map(s=>s.n)),
+            mid:seen.some(s=>s.op.some(v=>v>0.05&&v<0.95))};
   });
   assert(fade.first,'淡入探针没抓到叠层帧');
   assert(fade.first.op[0]<0.9,'新帧不是从透明淡入的（computed opacity 起始 '+fade.first.op[0]+'）');
+  assert(fade.mid,'过渡没有 intermediate 值：等于插入后延迟硬切，不是淡入');
   assert(fade.last.op[fade.last.op.length-1]>0.9,'淡入没收敛到不透明');
   assert(fade.maxN<=2,'交叉期最多旧新两层，实测 '+fade.maxN);
   ok('换帧是淡入：以透明插入、下一帧抬起，交叉期最多两层');
 
   // 自动轮播：鼠标完全不碰网格，也要自己换帧
   await page.mouse.move(4,4);
-  await page.evaluate(()=>{document.querySelector('.content').scrollTop=0;
+  await page.evaluate(()=>{state.cfg.masonry_autoplay=true;_mmAutoSetInterval(true);
+    document.querySelector('.content').scrollTop=0;
     [...document.querySelectorAll('#mmMasonry .ms-card')].forEach(c=>_stopCarousel(c));});
   await page.waitForFunction(()=>document.querySelectorAll('#mmMasonry .ms-img-alt').length>0,null,{timeout:9000});
   const autoA=await page.evaluate(()=>[...document.querySelectorAll('#mmMasonry .ms-img-alt')].map(a=>String(a.src)));

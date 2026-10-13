@@ -114,7 +114,11 @@ function ok(name) { passed++; console.log('OK ' + name); }
     const sidebar = await page.locator('.nav-wrap').boundingBox();
     const content = await page.locator('.content').boundingBox();
     assert.equal(sidebar.x,0); assert(content.x >= sidebar.width); ok('左侧导航与主内容左右分区');
-    assert.equal(await page.locator('.nav-tab .ic').count(),7); ok('七个页面导航图标完整');
+    // 导航页签按 fork 实际是 8 个（本仓库在原版基础上多了一页「资源库」）；
+    // 写死数字会像之前那样在加页签时静默烂掉，这里改成核对页签集合本身。
+    const navPages = await page.locator('.nav-tab').evaluateAll(ns => ns.map(n => n.dataset.page));
+    assert.deepEqual(navPages, ['download','dlmanager','models','library','updates','reverse','workflow','settings']);
+    assert.equal(await page.locator('.nav-tab .ic').count(), navPages.length); ok('八个页面导航图标完整');
     assert.equal(await page.locator('#dlPauseSel .ic').isVisible(),true); ok('经典主题不再隐藏已有图标');
     const logoThemes = ['dark','dark_purple','dark_blue','dark_green','dark_red','dark_graphite','dark_pink','dark_rose','light','light_blue','light_pink','light_green','modern','metro'];
     for (const theme of logoThemes) {
@@ -134,7 +138,10 @@ function ok(name) { passed++; console.log('OK ' + name); }
     assert.equal(await page.evaluate(()=>document.documentElement.dataset.sidebar),'collapsed');
     await page.locator('#toggleSidebar').click(); ok('导航收起状态可记忆');
     await page.locator('.nav-tab[data-page="settings"]').click();
-    assert.equal(await page.locator('.settings-category:visible').count(),1);
+    // 写死 1 个可见分类在本仓库不成立：资源库那节静态面板与 #settings-general 同为 data-settings-panel="general"，
+    // 按设计就是同组一起显示（实测 2 个）。断言改成"只允许 general 组可见"，既覆盖本意也不会再加同组面板时烂掉。
+    const visiblePanels = await page.locator('.settings-category:visible').evaluateAll(ns => [...new Set(ns.map(n => n.dataset.settingsPanel))]);
+    assert.deepEqual(visiblePanels, ['general']);
     assert.equal(await page.locator('#settings-general').isVisible(),true); ok('设置默认只显示常用分类');
     const footerInitial=await page.locator('#settingsActions').boundingBox();
     await page.evaluate(()=>document.querySelector('.content').scrollTop=2000);
@@ -698,9 +705,9 @@ function ok(name) { passed++; console.log('OK ' + name); }
     await page.evaluate(()=>{state.cfg.effects_fps_limit=0;applyUiAppearance();});assert.equal(await page.evaluate(()=>window.cftEffectsFpsLimit),0);ok('0 帧上限跟随显示刷新，不锁 30/60');
     await page.evaluate(()=>{state.cfg.pointer_effects='off';applyUiAppearance();closeImageViewer();showOnboarding();obStep=1;renderOnboarding();});
     assert.equal(await page.locator('.ob-brand-logo').count(),1);ok('页面介绍保留圆形 Logo');
-    assert.equal(await page.locator('#obSteps .ob-step').count(),6);assert.equal(await page.locator('.ob-page-card').count(),7);ok('恢复六步教程与七个页面的具体介绍');
+    assert.equal(await page.locator('#obSteps .ob-step').count(),6);assert.equal(await page.locator('.ob-page-card').count(),8);ok('恢复六步教程与八个页面的具体介绍');
     await page.screenshot({style:'#toast{visibility:hidden!important;}',path:path.join(docsShots,'onboarding.png')});
-    for(const route of ['download','dlmanager','models','updates','reverse','workflow','settings']){
+    for(const route of ['download','dlmanager','models','library','updates','reverse','workflow','settings']){
       await page.locator('.ob-page-card[data-page='+route+']').click();assert.equal(await page.locator('#page-'+route).getAttribute('class'),'page active');assert((await page.locator('#obMask').getAttribute('class')).includes('mini'));ok('教程 '+route+' 页面卡片立即进入并保留迷你引导');await page.locator('#obMiniContinue').click();assert.equal(await page.locator('.ob-page-card').first().isVisible(),true);
     }
     await page.locator('#obNext').click();assert.equal(await page.locator('.ob-theme').count(),14);ok('原主题引导保留全部十四套主题');

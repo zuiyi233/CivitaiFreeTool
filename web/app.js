@@ -1930,6 +1930,10 @@ function _carouselMount(st, el) {
   st.cur = el;
   // 关键：先按 CSS 的 opacity:0 插入，下一帧再抬到 1，过渡才会真的跑。
   // 以前这里在 append 之前就把 style.opacity 写成 "1"，等于自己把淡入废掉了，所以切换很生硬。
+  // 但只分两步还不够：刚插入的元素在这一帧之前没有被算过样式，浏览器没有"变化前样式"可比，
+  // rAF 里改 opacity 会被当成初始值直接跳到 1（实测 computed opacity 从 1 起步、过渡根本没跑）。
+  // 读一次 getComputedStyle 强制这一次样式计算，把 opacity:0 钉成变化前的值，淡入才真的存在。
+  try { getComputedStyle(el).opacity; } catch (e) { /* 取不到就算了，最多退回无淡入的硬切 */ }
   _nextFrame(() => { el.style.opacity = "1"; });   // 超时兜底：后台标签页/最小化窗口里 rAF 不跑，否则叠层会永远停在 opacity:0
   if (prev) {
     // 旧帧保持不透明直到新帧淡到位再摘：交叉期间两张都半透明会透出底下的主封面，反而闪一下
@@ -2064,7 +2068,13 @@ function _mmAutoTick() {
 }
 function _mmAutoSetInterval(on) {
   if (on && !_autoTimer) _autoTimer = setInterval(_mmAutoTick, _MM_AUTO_MS);
-  else if (!on && _autoTimer) { clearInterval(_autoTimer); _autoTimer = null; }
+  else if (!on && _autoTimer) {
+    clearInterval(_autoTimer); _autoTimer = null;
+    // 关掉自动轮播时把自动播放器请下来的叠帧一起收掉。只停节拍不清 DOM 的话，卡片会永远停在
+    // 最后一帧（不hover、不重渲染就不消失）——实测关设置后 2 张卡各剩 1 层叠帧。
+    [..._autoPlayers].forEach((card) => { _stopCarousel(card); });
+    _autoPlayers.clear();
+  }
 }
 _mmAutoSetInterval(true);
 document.addEventListener("mouseover", (e) => {
@@ -5117,6 +5127,7 @@ $("#settingsForm").addEventListener("change", (e) => {
   } else if (["effects_fps_limit", "cache_original_images", "gallery_cache_mb", "image_max_mb", "video_max_mb", "fetch_deadline_s", "gallery_display_width", "gallery_display_quality", "images_dir_autofill", "zebra_rows", "masonry_info_mode", "masonry_overlay_size", "masonry_autoplay", "name_scroll_speed", "name_scroll_start_pause", "name_scroll_end_pause", "pointer_effects", "pointer_effect_quality", "cache_detail_images", "ui_font", "ui_text_size", "window_appearance", "integrated_titlebar", "folder_picker_show_paths"].includes(key)) {
     state.cfg[key] = val;
     if(key==="cache_original_images" && val===false && typeof clearViewerImageCache==="function")clearViewerImageCache();
+    if(key==="masonry_autoplay")_mmAutoSetInterval(val!==false);   // 关的时候要连已挂的自动叠帧一起收回，不只是停下一次心跳
     applyUiAppearance();
     if(["image_max_mb","video_max_mb","fetch_deadline_s","gallery_display_width","gallery_display_quality","images_dir_autofill"].includes(key))setStatus(key==="images_dir_autofill"?(val?"已保存：打开详情后会往「模型名.images」写缺的示例图":"已保存并关闭：不再往模型同目录补帧"):"已保存：下一次读取图片与补帧时生效");
     api.call("save_config", { [key]: val }).catch(() => setStatus("设置保存失败"));
