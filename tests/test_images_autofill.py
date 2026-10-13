@@ -501,27 +501,54 @@ class SetModelCoverGuardTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(base+'.preview.png'))
 
 class ExclusiveTmpTests(unittest.TestCase):
-    # finding #3：临时文件必须独占创建，预置的 .tmp（symlink/残留文件）不得被静默覆盖
-    def _assert_refused(self,fn,dest,data,headers=None):
-        tmp=Path(dest+'.tmp');tmp.write_bytes(b'SENTINEL-DO-NOT-CLOBBER')
-        opener=Mock();opener.open=Mock(return_value=FakeResp(data,headers))
-        with patch('civitai_api.build_opener',return_value=opener):
-            ok=fn(U0,dest,proxy=None,verify=True)
-        self.assertFalse(ok,'.tmp 已存在时必须拒绝，不能覆盖')
-        self.assertFalse(os.path.exists(dest),'被拒时绝不能产出目标文件')
+    """finding #3 的落地口径：独占创建要挡的是「目录 / 链接」这类预置陷阱；上次中断留下的普通 .tmp
+    必须清掉重来——一律拒绝会让那一张图永远补不进去（补帧每次打开详情都会重试同一批目标）。"""
 
-    def test_gui_download_image_refuses_existing_tmp(self):
+    def _run(self, fn, dest, data):
+        with patch('civitai_api.build_opener', return_value=fake_opener(data)):
+            return fn(U0, dest, proxy=None, verify=True)
+
+    def _writers(self):
         import gui
-        with TemporaryDirectory() as d:
-            self._assert_refused(gui._download_image,os.path.join(d,'c.png'),b'\x89PNG'+b'x'*400)
+        return ((gui._download_image, 'c.png', b'\x89PNG' + b'x' * 400),
+                (webui._download_image_limited, 'c.png', b'\x89PNG' + b'x' * 400),
+                (webui._download_video, 'c.mp4', b'v' * 4096))
 
-    def test_download_image_limited_refuses_existing_tmp(self):
-        with TemporaryDirectory() as d:
-            self._assert_refused(webui._download_image_limited,os.path.join(d,'c.png'),b'\x89PNG'+b'x'*400)
+    def test_stale_plain_tmp_is_reclaimed(self):
+        for fn, name, data in self._writers():
+            with self.subTest(fn.__name__):
+                with TemporaryDirectory() as d:
+                    dest = os.path.join(d, name); tmp = Path(dest + '.tmp')
+                    tmp.write_bytes(b'STALE-FROM-KILLED-PROCESS')
+                    self.assertTrue(self._run(fn, dest, data), '普通残留 .tmp 必须清掉重来，不能永久失败')
+                    self.assertTrue(os.path.isfile(dest))
+                    self.assertFalse(tmp.exists())
 
-    def test_download_video_refuses_existing_tmp(self):
-        with TemporaryDirectory() as d:
-            self._assert_refused(webui._download_video,os.path.join(d,'c.mp4'),b'v'*4096)
+    def test_directory_at_tmp_is_refused_without_touching_anything(self):
+        for fn, name, data in self._writers():
+            with self.subTest(fn.__name__):
+                with TemporaryDirectory() as d:
+                    dest = os.path.join(d, name); os.mkdir(dest + '.tmp')
+                    self.assertFalse(self._run(fn, dest, data))
+                    self.assertFalse(os.path.exists(dest))
+                    self.assertTrue(os.path.isdir(dest + '.tmp'), '拒绝时绝不能删掉别人的东西')
+
+    def test_symlink_tmp_is_refused_and_left_in_place(self):
+        # 旧兜底是无条件 exists+unlink：它会把这根链接本身删掉，守卫沦为静默删除
+        for fn, name, data in self._writers():
+            with self.subTest(fn.__name__):
+                with TemporaryDirectory() as d:
+                    outside = Path(d) / 'outside.bin'; outside.write_bytes(b'victim')
+                    link = os.path.join(d, name + '.tmp')
+                    try:
+                        os.symlink(str(outside), link)
+                    except (OSError, SystemError):
+                        self.skipTest('本机无法创建文件符号链接（需开发者模式或管理员）')
+                    dest = os.path.join(d, name)
+                    self.assertFalse(self._run(fn, dest, data))
+                    self.assertTrue(os.path.islink(link), '拒绝时不能顺手删掉预置的链接')
+                    self.assertEqual(outside.read_bytes(), b'victim')
+                    self.assertFalse(os.path.exists(dest))
 
 class DownloadAllImagesHonestCountsTests(unittest.TestCase):
     # finding #4：download_all_images 不得把「已存在」计入「新下载」

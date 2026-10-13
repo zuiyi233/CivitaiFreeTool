@@ -2336,8 +2336,9 @@ def _download_image(url, dest, timeout=60, proxy=None, verify=True, cfg=None):
         data = bytes(buf)
         if data and len(data) > 100 and _is_image_bytes(data):
             tmp = dest + ".tmp"
-            # 独占创建：预先存在的 .tmp（symlink 或残留文件）一律拒绝，绝不静默跟随/覆盖
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            # 独占创建：目录/链接形态的预置 .tmp 直接拒绝；上次中断留下的普通 .tmp 清掉重来，
+            # 否则同一张图会因为那个残留文件永远补不进去（这里失败不会留下任何清理逻辑）。
+            fd = image_gallery.open_exclusive_tmp(tmp)
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(tmp, dest)

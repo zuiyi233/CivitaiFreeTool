@@ -76,7 +76,9 @@ def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=1
     deadline 是 time.monotonic() 的绝对截止点：socket 级 timeout 只在两次 read 之间生效，
     一条每次吐一点字节的慢流能永远不触发它，必须按墙钟斩断（补帧按帧预算传进来）。"""
     import urllib.request
+    import image_gallery
     tmp = dest + ".tmp"
+    created = False
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
@@ -84,8 +86,9 @@ def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=1
         })
         opener = civitai_api.build_opener(proxy, verify)
         got = 0
-        # 独占创建临时文件：预置的 .tmp（symlink/残留）一律拒绝，绝不静默跟随或覆盖
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        # 独占创建：目录/链接形态的预置 .tmp 直接拒绝；上次中断留下的普通 .tmp 由 helper 清掉重来
+        fd = image_gallery.open_exclusive_tmp(tmp)
+        created = True
         with opener.open(req, timeout=timeout) as r, os.fdopen(fd, "wb") as f:
             while True:
                 if deadline is not None and time.monotonic() > deadline:
@@ -103,11 +106,13 @@ def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=1
         os.replace(tmp, dest)
         return True
     except Exception:
-        try:
-            if os.path.exists(tmp):
+        # 只清自己创建的那个 fd 对应的临时文件。无条件 `os.path.exists(tmp) and unlink` 会把
+        # 独占创建刚拒绝掉的别人的文件删掉——守卫就变成了静默删除。
+        if created:
+            try:
                 os.unlink(tmp)
-        except Exception:
-            pass
+            except Exception:
+                pass
         return False
 
 
@@ -157,14 +162,10 @@ def _fetch_deadline_s(cfg):
 def _is_reparse_path(path):
     """Windows 重解析点检测（符号链接 / junction / mount point）。
 
-    `os.path.islink()` 对 junction 一律返回 False（Python 3.12 实测），而 `mklink /J` 不需要管理员权限就能
-    造出来：`<名>.images` 做成指向同层其它目录的 junction 时，realpath 的「同层」校验照样通过，
-    补帧就会写进一个和模型无关的目录。所以守卫必须看 FILE_ATTRIBUTE_REPARSE_POINT，不能只信 islink。"""
-    try:
-        st = os.stat(path, follow_symlinks=False)
-    except (OSError, ValueError):
-        return False
-    return bool(getattr(st, "st_file_attributes", 0) & 0x400)   # FILE_ATTRIBUTE_REPARSE_POINT
+    实现收敛到 image_gallery.is_reparse_path 一份：判定理由见那里（`os.path.islink()` 对 junction
+    恒为 False，而 `mklink /J` 不需要管理员权限），补帧与写封面两条链路必须同口径。"""
+    import image_gallery
+    return image_gallery.is_reparse_path(path)
 
 
 def _fill_dir_writable(out_dir, model_path=None):
@@ -226,10 +227,12 @@ def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_
     「.jpg 尾缀实为 mp4」这类伪装。deadline 是 time.monotonic() 的绝对截止点，
     慢流靠 socket timeout 斩不断（见 _download_video 同一说明）。"""
     import urllib.request
+    import image_gallery
     from gui import _is_image_bytes
     if max_bytes is None:
         max_bytes = _image_cap_bytes(None)
     tmp = dest + ".tmp"
+    created = False
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
@@ -243,8 +246,9 @@ def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_
                     return False
             except (TypeError, ValueError):
                 pass
-            # 独占创建临时文件：预置的 .tmp（symlink/残留）一律拒绝，绝不静默跟随或覆盖
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            # 独占创建：目录/链接形态的预置 .tmp 直接拒绝；上次中断留下的普通 .tmp 由 helper 清掉重来
+            fd = image_gallery.open_exclusive_tmp(tmp)
+            created = True
             with os.fdopen(fd, "wb") as f:
                 while True:
                     if deadline is not None and time.monotonic() > deadline:
@@ -267,11 +271,11 @@ def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_
         os.replace(tmp, dest)
         return True
     except Exception:
-        try:
-            if os.path.exists(tmp):
+        if created:   # 同 _download_video：拒绝别人的 .tmp 时不能顺手把它删了
+            try:
                 os.unlink(tmp)
-        except Exception:
-            pass
+            except Exception:
+                pass
         return False
 
 

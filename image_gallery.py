@@ -141,6 +141,34 @@ def cache_load(item, cfg, kind, tier=''):
         return data if kind=='original' else json.loads(data.decode(),parse_constant=lambda _:None)
     except (OSError,ValueError,UnicodeError):return None
 
+def is_reparse_path(path):
+    """Windows 重解析点（符号链接 / junction / mount point）检测。
+
+    `os.path.islink()` 对 junction 一律返回 False（Python 3.12 实测），而 `mklink /J` 不需要管理员权限
+    就能造出来：`<名>.images` 做成指向别处的 junction 时，realpath 的「同层」校验照样通过，写盘就会
+    落到一个和模型无关的目录。所以守卫必须看 FILE_ATTRIBUTE_REPARSE_POINT，不能只信 islink。"""
+    try:
+        st=os.stat(path,follow_symlinks=False)
+    except (OSError,ValueError):
+        return False
+    return bool(getattr(st,'st_file_attributes',0)&0x400)
+
+
+def open_exclusive_tmp(path):
+    """独占创建写盘用的 .tmp 并返回已打开的 fd（调用方用 os.fdopen 接管）。
+
+    为什么要独占：这些临时文件落在用户的模型目录里，预先放一个好名字的文件/链接就能把写入引到别处。
+    为什么不能「存在就报错」：下载中断、进程被杀都会留下普通残留 .tmp，而补帧每次打开详情都会重试同一批
+    目标——一律拒绝会让那一张图永远补不进去。所以只对「残留的普通文件」清掉重来，目录与链接直接抛错。"""
+    flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
+    try:
+        return os.open(path,flags,0o644)
+    except FileExistsError:
+        if os.path.isdir(path) or is_reparse_path(path):raise
+        os.unlink(path)
+        return os.open(path,flags,0o644)
+
+
 def cache_store(item, cfg, kind, value, tier=''):
     key=cache_key(item,cfg,kind!='original',tier)
     if key is None:return
