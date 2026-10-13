@@ -1856,8 +1856,11 @@ async function prefetchMultiForCards(cards) {
         state.coverCacheMulti.set(p, list
           .filter((f) => Array.isArray(f) && f[0])
           .map((f) => {
-            const src = String(f[0]);
-            return [/^data:/i.test(src) || /^https?:/i.test(src) || /^file:/i.test(src) ? src : "data:image/jpeg;base64," + src, !!f[1]];
+            const src = String(f[0]), isVideo = !!f[1];
+            // 视频帧的 src 只能是可播直链（后端给 mp4 URL 或本地 file URI），绝不能再套 data:image/jpeg 前缀：
+            // 那会把 mp4 地址伪装成 jpeg base64，交回 <img> 又是一次白费带宽且永远解不出图。
+            if (isVideo) return [src, true];
+            return [/^data:/i.test(src) || /^https?:/i.test(src) || /^file:/i.test(src) ? src : "data:image/jpeg;base64," + src, false];
           }));
         if (typeof _startCarousel !== "function") continue;
         // 正在 hover 该卡片且刚拿到多图 → 立即启动轮播
@@ -1891,12 +1894,26 @@ function _carouselPlayer(card, path, auto) {
   const old = _masonryCarousel.get(card);
   if (old) return old;
   const list = state.coverCacheMulti && state.coverCacheMulti.get(path);
-  if (!Array.isArray(list) || list.length < 2) return null;   // 只有一张就没必要轮
+  if (!Array.isArray(list) || !_carouselHasFrames(list)) return null;   // 只有一张静帧就没必要轮
   const wrap = card.querySelector(".ms-img-wrap");
   if (!wrap) return null;
-  const st = { card, wrap, list, idx: 1, cur: null, loading: false, seq: 0, dead: new Set(), timer: null, auto: !!auto };
+  const plan = _carouselFramePlan(list);
+  const st = { card, wrap, list, idx: plan.start, start: plan.start, videoOnly: plan.videoOnly, cur: null, loading: false, seq: 0, dead: new Set(), timer: null, auto: !!auto };
   _masonryCarousel.set(card, st);
   return st;
+}
+// 帧计划：正常列表第 1 张是本地静帧封面，轮播从第 2 张起；首帧就是视频说明这模型没有静帧封面
+// （老 info 连 poster 都没有），此时从第 0 帧起，否则卡片主位一直空着。
+// videoOnly = 封面之后没有任何静帧：全视频模型，自动轮播也必须能播，不然整卡在瀑布流里哑火。
+function _carouselFramePlan(frames) {
+  const start = frames[0] && frames[0][1] ? 0 : 1;
+  const rest = frames.slice(start).filter((f) => f && f[0]);
+  return { start, videoOnly: rest.length > 0 && rest.every((f) => f[1]) };
+}
+function _carouselHasFrames(frames) {
+  if (!Array.isArray(frames) || !frames.length) return false;
+  const plan = _carouselFramePlan(frames);
+  return frames.length >= 2 || plan.videoOnly;
 }
 function _nextFrame(fn) {
   let done = false;
@@ -1939,11 +1956,15 @@ function _carouselAdvance(st) {
   const list = st.list;
   const my = ++st.seq;    // 每次推进递增：预载回来时若已不是最新请求就丢弃
   for (let tries = 0; tries < list.length; tries++) {
-    if (st.idx >= list.length) st.idx = 1;   // 主封面固定第 1 张，轮播从第 2 张起并在此回卷
+    if (st.idx >= list.length) st.idx = (Number.isFinite(st.start) ? st.start : 1);   // 主封面固定第 1 张，轮播从第 2 张起并在此回卷（全视频模型从第 0 帧起）
     const frame = list[st.idx] || [];
     const src = String(frame[0] || ""), isVideo = !!frame[1];
-    if (isVideo && st.auto) { st.idx = st.idx + 1; continue; }   // 自动轮播不播视频帧：一屏多路解码不划算，悬停时才播
-    if (isVideo && /^https?:|^file:/i.test(src)) {
+    if (isVideo && st.auto && !st.videoOnly) { st.idx = st.idx + 1; continue; }   // 自动轮播默认不播视频帧：一屏多路解码不划算，悬停时才播
+    if (isVideo) {
+      // 视频帧只交给 <video>：src 是 mp4 直链或本地 file URI。协议不对就直接跳过这一帧，
+      // 绝不落到下面的 new Image()——真实库 479 条 images[] 里 107 条（22.3%）是 .mp4，
+      // 图片预载拿到的是 content-type: video/mp4 的 1.28–2.31MB 视频字节，图片永远解码不出来却已经花掉带宽。
+      if (!/^(https?:|file:)/i.test(src)) { st.idx = st.idx + 1; continue; }
       const v = document.createElement("video");
       v.className = "ms-img ms-img-alt"; v.muted = true; v.loop = true; v.autoplay = true;
       v.playsInline = true; v.preload = "metadata";
@@ -1952,6 +1973,7 @@ function _carouselAdvance(st) {
       if (_carouselMount(st, v)) { const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); }
       st.idx = st.idx + 1; _carouselRearm(st); return;
     }
+    if (!src) { st.idx = st.idx + 1; continue; }   // 空 src 不喂给 new Image()（空串既不发 load 也不发 error，会把这一拍拖到 6s 超时）
     if (/^data:/i.test(src)) {
       const alt = document.createElement("img");
       alt.className = "ms-img ms-img-alt"; alt.alt = ""; alt.decoding = "async";
@@ -1982,7 +2004,7 @@ function _carouselAdvance(st) {
     setTimeout(() => finish(false), 6000);   // 挂起帧 6s 超时跳过
     return;
   }
-  st.idx = 1; _carouselRearm(st);   // 所有帧都不可用：继续排拍，别把这一轮卡死
+  st.idx = Number.isFinite(st.start) ? st.start : 1; _carouselRearm(st);   // 所有帧都不可用：继续排拍，别把这一轮卡死
 }
 function _startCarousel(card, path) {
   const st = _carouselPlayer(card, path, false);
@@ -2021,7 +2043,9 @@ function _mmAutoTick() {
     const st = _masonryCarousel.get(c);
     if (st && st.timer) return false;      // 悬停中的卡片归它自己的节拍
     const frames = state.coverCacheMulti && state.coverCacheMulti.get(c.dataset.path || "");
-    return Array.isArray(frames) && frames.length >= 2;   // 只有一张的卡片挑中也无事发生，节拍就白空转
+    // 只有一张的卡片挑中也无事发生，节拍就白空转；但全视频模型（哪怕只有 1 帧）必须进自动节拍，
+    // 否则它在瀑布流里依旧是哑火的空卡。
+    return _carouselHasFrames(frames);
   });
   if (!cards.length) {
     const any = _visibleMasonryCards();    // 一帧都没预取到时顺手催一次，下一拍就有得换
@@ -3397,6 +3421,87 @@ function syncDialogRender(d, st) {
   const okb = dlg.querySelector("#sdOk"); if (okb) okb.addEventListener("click", () => syncDialogClose(d));
 }
 
+// ===== 详情后台补帧进度 =====
+// 后端 get_model_detail 结尾已经自动排了一次补帧任务（受 config.images_dir_autofill 控制），
+// 这里只负责轮询展示与取消：绝不自己再起任务、绝不每次轮询重建 DOM（重排会把详情里的视频/滚动位置打断）。
+const _AUTOFILL_POLL_MS = 1500;
+const _AUTOFILL_EMPTY_TICKS = 3;   // 连续 3 次「没有任务」就停：本地已齐/开关关闭时不该一直问后端
+let _autofillTimer = null, _autofillSeq = 0;
+function _autofillStop() { _autofillSeq++; if (_autofillTimer) { clearInterval(_autofillTimer); _autofillTimer = null; } }
+function _autofillJson(x) {
+  if (x && typeof x === "object") return x;
+  try { return JSON.parse(String(x || "{}")); } catch (_) { return {}; }
+}
+function _autofillRow(panel, path) {
+  let row = panel.querySelector("#dtAutofill");
+  if (row) return row;
+  const wrap = panel.querySelector(".detail-left") || panel.querySelector(".dt-body");
+  if (!wrap) return null;
+  wrap.insertAdjacentHTML("beforeend",
+    '<p class="dt-autofill" id="dtAutofill" hidden role="status"><span class="dt-af-text"></span>' +
+    '<button type="button" class="btn btn-tiny dt-af-cancel" title="取消补帧：剩余帧本轮不再下载，已落盘的保留">取消</button></p>');
+  row = panel.querySelector("#dtAutofill");
+  row.querySelector(".dt-af-cancel").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const r = _autofillJson(await api.call("cancel_images_autofill", path));
+      _autofillText(row, (r && (r.msg || r.canceled)) ? (r.msg || "已请求取消") : "取消请求失败");
+    } catch (_) {
+      _autofillText(row, "取消请求失败");
+    } finally { btn.disabled = false; }
+  });
+  return row;
+}
+function _autofillText(row, text, running) {
+  const el = row.querySelector(".dt-af-text");
+  if (el) el.textContent = text || "";   // 只换文本：不重排、不重建详情 DOM
+  row.hidden = !text;
+  const btn = row.querySelector(".dt-af-cancel");
+  if (btn) btn.hidden = running !== true;
+}
+function startAutofillWatch(d, generation, panel) {
+  _autofillStop();
+  const seq = _autofillSeq;
+  const path = String(d.path || "");
+  if (!path || d.cached_history) return;
+  let emptyTicks = 0;
+  const alive = () => seq === _autofillSeq && generation === detailGeneration && detailRow === d &&
+    $("#detailMask") && $("#detailMask").style.display === "flex" && $("#page-models").classList.contains("active");
+  const tick = async () => {
+    if (!alive()) { _autofillStop(); return; }
+    let st;
+    try { st = _autofillJson(await api.call("get_images_autofill_state", path)); }
+    catch (_) { _autofillStop(); return; }
+    if (!alive()) return;   // 轮询期间已离开详情：直接放弃这一帧
+    if (!st || st.ok === false) { _autofillStop(); return; }
+    const total = Number(st.total) || 0, done = Number(st.done) || 0;
+    const failed = Number(st.failed) || 0, skipped = Number(st.skipped) || 0;
+    const downloaded = Number(st.downloaded) || 0;
+    const msg = String(st.msg || "");
+    if (!st.running) {
+      if (!total) {   // 该模型没有补帧任务（本地已齐 / 开关关闭 / 全局闸门被占）：静默退出
+        if (++emptyTicks >= _AUTOFILL_EMPTY_TICKS) _autofillStop();
+        return;
+      }
+      const row = _autofillRow(panel, path);
+      if (row) _autofillText(row, "补帧结束 " + done + "/" + total +
+        (downloaded ? "，新增 " + downloaded : "") + (failed ? "，失败 " + failed : "") +
+        (skipped ? "，跳过 " + skipped : "") + (msg ? "：" + msg : ""), false);
+      _autofillStop();
+      return;
+    }
+    emptyTicks = 0;
+    const row = _autofillRow(panel, path);
+    if (row) _autofillText(row, "正在补齐示例图 " + done + "/" + total +
+      (failed ? "，失败 " + failed : "") + (skipped ? "，跳过 " + skipped : "") +
+      (msg ? "：" + msg : ""), true);
+  };
+  _autofillTimer = setInterval(tick, _AUTOFILL_POLL_MS);
+  tick();
+}
+
 async function showModelDetail(path, historyId = "") {
   const generation = ++detailGeneration;
   let json;try{json = await api.call(historyId ? "get_history_detail" : "get_model_detail", historyId || path);}catch(_){if(generation===detailGeneration)setStatus('详情读取异常，请检查元数据或刷新后重试');return;}
@@ -3780,6 +3885,7 @@ async function showModelDetail(path, historyId = "") {
     };
     prepare(0);
   }
+  startAutofillWatch(d, generation, panel);   // 只轮询后端已起的补帧任务，不阻塞详情渲染
 }
 // 详情图片右键：复制/打开文件夹/复制提示词/打开原图（document 级委托）
 let detailImgCtx = null;
@@ -3919,6 +4025,7 @@ document.addEventListener("keydown", (e) => {
 });
 function closeDetail() {
   detailGeneration++;
+  _autofillStop();   // 离开详情页就停轮询：后端任务继续跑，进度不再打扰
   const dvd=$("#detailPanel video");if(dvd&&dvd.pause)dvd.pause();
   $("#detailMask").style.display = "none";
   $("#detailPanel").innerHTML = "";
@@ -4666,6 +4773,12 @@ const SETTING_FIELDS = [
   ["界面", "effects_fps_limit", "动画帧率上限（0 = 跟随屏幕）", "number"],
   ["界面", "cache_original_images", "缓存已查看原图和生成数据", "bool"],
   ["界面", "gallery_cache_mb", "原图缓存容量（MB）", "number"],
+  ["界面", "gallery_display_width", "查看器显示档最长边（像素，超出才降级；保存与复制仍是原图）", "number"],
+  ["界面", "gallery_display_quality", "查看器显示档 JPEG 质量（转码会剥掉原图内嵌生成参数）", "number"],
+  ["界面", "image_max_mb", "单张静帧体积上限（MB，超限整张丢弃不留半张）", "number"],
+  ["界面", "video_max_mb", "单个视频体积上限（MB，超限不落盘）", "number"],
+  ["界面", "fetch_deadline_s", "单帧在线读取总时限（秒，超时该帧留到下次打开）", "number"],
+  ["界面", "images_dir_autofill", "打开详情后自动补齐「模型名.images」缺的示例图（会往模型同目录写文件，详情里可取消）", "bool"],
   ["界面", "close_action", "点窗口关闭按钮时", "select", [["exit", "退出软件（默认）"], ["minimize", "最小化到任务栏（不退出）"]]],
   ["下载", "update_keep_old", "更新后如何处理旧版本", "select", [["keep", "保留旧版文件（默认）"], ["delete", "删除旧版（移入回收站，可还原）"]]],
   ["界面", "webview_disable_gpu", "禁用 GPU 加速（软件渲染）", "bool"],
@@ -4978,7 +5091,13 @@ $("#settingsForm").addEventListener("change", (e) => {
   if(key==="name_scroll_speed"){val=Math.max(10,Math.min(240,Math.round(Number.isFinite(Number(val))?Number(val):70)));el.value=val;}
   if(["name_scroll_start_pause","name_scroll_end_pause"].includes(key)){val=Math.max(0,Math.min(5000,Math.round(Number(val)||0)));el.value=val;}
   if(key==="effects_fps_limit"){val=val===0?0:Math.max(15,Math.min(360,Math.round(Number(val)||60)));el.value=val;}
-  if(key==="gallery_cache_mb"){val=Math.max(64,Math.min(8192,Math.round(Number(val)||1024)));el.value=val;}
+  if(key==="gallery_cache_mb"){val=Math.max(64,Math.min(65536,Math.round(Number(val)||8192)));el.value=val;}
+  // 新增的图片相关数值：钳制范围与后端 config.normalize_ui_preferences 完全一致，前端不再另立一套口径
+  if(key==="image_max_mb"){val=Math.max(1,Math.min(2000,Math.round(Number(val)||20)));el.value=val;}
+  if(key==="video_max_mb"){val=Math.max(1,Math.min(4096,Math.round(Number(val)||100)));el.value=val;}
+  if(key==="fetch_deadline_s"){val=Math.max(5,Math.min(3600,Math.round(Number(val)||120)));el.value=val;}
+  if(key==="gallery_display_width"){val=Math.max(256,Math.min(4096,Math.round(Number(val)||1440)));el.value=val;}
+  if(key==="gallery_display_quality"){val=Math.max(40,Math.min(100,Math.round(Number(val)||80)));el.value=val;}
   if(key==='ui_mode' || key==='browser_fallback_enabled'){
     const previous=state.cfg[key];state.cfg[key]=val;
     api.call('save_config',{[key]:val}).then(ok=>{
@@ -4995,10 +5114,11 @@ $("#settingsForm").addEventListener("change", (e) => {
     api.call("save_config", { [key]: val }).then((ok) => {
       if (!ok) setStatus("外观已预览，保存失败，请重试");
     }).catch(() => setStatus("外观已预览，保存失败，请重试"));
-  } else if (["effects_fps_limit", "cache_original_images", "gallery_cache_mb", "zebra_rows", "masonry_info_mode", "masonry_overlay_size", "masonry_autoplay", "name_scroll_speed", "name_scroll_start_pause", "name_scroll_end_pause", "pointer_effects", "pointer_effect_quality", "cache_detail_images", "ui_font", "ui_text_size", "window_appearance", "integrated_titlebar", "folder_picker_show_paths"].includes(key)) {
+  } else if (["effects_fps_limit", "cache_original_images", "gallery_cache_mb", "image_max_mb", "video_max_mb", "fetch_deadline_s", "gallery_display_width", "gallery_display_quality", "images_dir_autofill", "zebra_rows", "masonry_info_mode", "masonry_overlay_size", "masonry_autoplay", "name_scroll_speed", "name_scroll_start_pause", "name_scroll_end_pause", "pointer_effects", "pointer_effect_quality", "cache_detail_images", "ui_font", "ui_text_size", "window_appearance", "integrated_titlebar", "folder_picker_show_paths"].includes(key)) {
     state.cfg[key] = val;
     if(key==="cache_original_images" && val===false && typeof clearViewerImageCache==="function")clearViewerImageCache();
     applyUiAppearance();
+    if(["image_max_mb","video_max_mb","fetch_deadline_s","gallery_display_width","gallery_display_quality","images_dir_autofill"].includes(key))setStatus(key==="images_dir_autofill"?(val?"已保存：打开详情后会往「模型名.images」写缺的示例图":"已保存并关闭：不再往模型同目录补帧"):"已保存：下一次读取图片与补帧时生效");
     api.call("save_config", { [key]: val }).catch(() => setStatus("设置保存失败"));
   } else if (key === "masonry_card_width") {
     setMasonrySize(val,true);

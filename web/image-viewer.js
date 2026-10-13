@@ -54,13 +54,20 @@ function mergeViewerMetadata(c,metadata){
   if(metadata.resources?.length)c.resources=metadata.resources;
   if(metadata.online_metadata || ((!c.metadata_source || c.metadata_source==='未提供生成数据') && Object.keys(metadata.meta||{}).length))c.metadata_source=metadata.metadata_source;
 }
+function viewerTierNote(full){
+  // 显示档与原图档必须分得清：C 站 width=/quality= 转码会剥掉 EXIF/UserComment，
+  // 降级档绝不能说成"已读到原图生成参数"；保存/复制/本地高清缓存读取仍走原图档。
+  if(!full||full.downgraded!==true) return '；原图档';
+  const tier=String(full.display_tier||'').replace(/^:/,'');
+  return '；显示档'+(tier?' '+tier:'')+'（保存与复制仍是原图）'+(full.metadata_from_original===false?'；生成参数未从原图读取':'');
+}
 function displayViewerEntry(v,c,entry,memory){
   const current=v.root.querySelector('#ivImage');if(current!==entry.image)current.replaceWith(entry.image);
   v.entry=entry;v.full=entry.full;
   Object.assign(c,{meta:{...(c.meta||{}),...(entry.full.meta||{})},resources:entry.full.resources?.length?entry.full.resources:(c.resources||[]),metadata_source:entry.full.metadata_source||c.metadata_source,width:entry.full.width,height:entry.full.height});
   mergeViewerMetadata(c,entry.metadata);renderGeneration(c);setViewerZoom(1,null,true);
   const source=memory?'内存缓存：直接复用已解码图片':entry.full.cache_hit?'本地缓存：读取与解码完成':'首次加载完成';
-  v.root.querySelector('#ivStatus').textContent=source+(entry.full.original_available===false?'；仅有预览，来源原图不可用':entry.full.preview_limited?'；预览限制 4096 px，保存仍使用来源文件':'；滚轮直接缩放图片');
+  v.root.querySelector('#ivStatus').textContent=source+viewerTierNote(entry.full)+(entry.full.original_available===false?'；仅有预览，来源原图不可用':entry.full.preview_limited?'；预览限制 4096 px，保存仍使用来源文件':'；滚轮直接缩放图片');
   v.root.dataset.imageSource=memory?'memory':entry.full.cache_hit?'disk':'first';
 }
 

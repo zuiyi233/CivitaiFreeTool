@@ -886,6 +886,10 @@ textarea.rules {
   object-fit: contain;
 }
 .detail-thumbs { display: flex; gap: 8px; flex-wrap: wrap; }
+/* 补帧进度：固定一行轻量状态，hidden 时不占高度，显示时也不会挤压详情排版 */
+.dt-autofill { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--text-dim); font-size: calc(12px * var(--type-scale, 1)); line-height: 1.5; margin: 0; }
+.dt-autofill[hidden] { display: none; }
+.dt-autofill .dt-af-cancel { flex: 0 0 auto; }
 .detail-thumb-box { position: relative; display: inline-flex; }
 .detail-thumb-box .detail-thumb { display: block; }
 .detail-thumb {

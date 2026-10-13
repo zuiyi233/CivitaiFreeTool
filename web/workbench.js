@@ -46,7 +46,13 @@ const WORKBENCH_SETTING_HELP = {
   cache_detail_images: "把详情中已加载的在线缩略图缓存在本机，重复打开优先读取缓存。不下载原图；关闭后不写新缓存。",
   effects_fps_limit: "仅控制拖尾/点击和氛围动画，不改变视频或 WebView 刷新率。0 跟随屏幕；可输入 15–360，上限不保证实际帧率。",
   cache_original_images: "只缓存你打开过的原图和来源已提供的生成数据，下次优先本地读取；不会批量下载未查看的图片。关闭后不读写缓存。",
-  gallery_cache_mb: "64–8192 MB，超过上限按最旧访问自动淘汰。缓存随软件数据目录迁移；清理不删除模型或你保存的图片。",
+  gallery_cache_mb: "64–65536 MB，默认 8192；超过上限按最旧访问自动淘汰。口径来自实测：全库原图约 3.3GB，预算只给 1GB 时“查看过一次”的原图档必然被淘汰。缓存随软件数据目录迁移；清理不删除模型或你保存的图片。",
+  image_max_mb: "1–2000 MB，默认 20。口径来自实测：静帧 original 档均值 3235KB，个别 4096px 原图过 10MB。单张超过上限整张丢弃，绝不留半张（半张图会让查看器解码失败还占着缓存额度）。",
+  video_max_mb: "1–4096 MB，默认 100。口径来自实测：original 档视频均值 19.4MB。超限的视频不落盘，轮播与详情继续用远程直链播放；已落盘的视频不受此值影响。",
+  fetch_deadline_s: "5–3600 秒，默认 120，是「单帧」在线预算（连接＋重连＋落盘的墙钟上限）。后台补帧按待补帧数放大总预算，超时后剩余帧本轮不下载，下次打开详情继续（已存在即跳过）。",
+  gallery_display_width: "256–4096 px，默认 1440，只影响查看器的显示档。实测：original 均值 3235KB，width=1440 为 609KB，width=460 为 102KB；图片本身不大于该值时按实际宽度取，不会上采样。保存图片、复制图片与 get_gallery_cached 仍是原图档。",
+  gallery_display_quality: "40–100，默认 80，与显示宽度组合后实测均值 461KB。代价要说清：C 站 width=/quality= 转码会剥掉 EXIF 与 UserComment，显示档读不到原图内嵌生成参数，查看器会标注“生成参数未从原图读取”，完整参数仍按原图档或 C 站接口取。",
+  images_dir_autofill: "开启后每次打开模型详情，后台把该模型同目录「模型名.images」缺的示例图补齐——这是往你的模型目录写文件，不是 bug。节奏：同时只 1 个任务、任务内串行 1 张、已存在即跳过；体积按 image_max_mb 与 video_max_mb 计，磁盘余量不足会跳过并在详情里写明原因。不想让软件动模型目录就在这里关闭，或点详情进度行里的取消；关闭只影响后续补帧，已落盘的帧保留。",
   pointer_effects: "仅在本软件内绘制波纹与几何拖尾，不安装全局鼠标钩子。静止、切后台或关闭时停止绘制。",
   pointer_effect_quality: "轻量档限制 30 FPS、粒子数和像素比例；软件渲染或较慢机器优先选择轻量档。",
 };
@@ -91,7 +97,7 @@ function settingRow(key, label, type, opts, tip) {
   } else if (type === "color") {
     input = '<input class="appearance-color" type="color"' + attrs + ' value="' + esc(/^#[0-9a-f]{6}$/i.test(value || "") ? value : "#60a5fa") + '"/>';
   } else {
-    input = '<input class="input" type="' + (type === "number" ? "number" : "text") + '"' + attrs + (key === "window_wait_seconds" ? ' min="30" max="600" step="1"' : key === "effects_fps_limit" ? ' min="0" max="360" step="1"' : key === "name_scroll_speed" ? ' min="10" max="240" step="5"' : ["name_scroll_start_pause","name_scroll_end_pause"].includes(key) ? ' min="0" max="5000" step="50"' : key === "gallery_cache_mb" ? ' min="64" max="8192" step="1"' : "") + ' value="' + esc(value == null ? "" : value) + '"/>';
+    input = '<input class="input" type="' + (type === "number" ? "number" : "text") + '"' + attrs + (key === "window_wait_seconds" ? ' min="30" max="600" step="1"' : key === "effects_fps_limit" ? ' min="0" max="360" step="1"' : key === "name_scroll_speed" ? ' min="10" max="240" step="5"' : ["name_scroll_start_pause","name_scroll_end_pause"].includes(key) ? ' min="0" max="5000" step="50"' : key === "gallery_cache_mb" ? ' min="64" max="65536" step="1"' : key === "image_max_mb" ? ' min="1" max="2000" step="1"' : key === "video_max_mb" ? ' min="1" max="4096" step="1"' : key === "fetch_deadline_s" ? ' min="5" max="3600" step="1"' : key === "gallery_display_width" ? ' min="256" max="4096" step="1"' : key === "gallery_display_quality" ? ' min="40" max="100" step="1"' : "") + ' value="' + esc(value == null ? "" : value) + '"/>';
   }
   if(key === "window_appearance") input += '<p id="windowAppearanceStatus" role="status"></p>';
   const help = tip || "保持默认即可，按需要调整。";

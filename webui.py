@@ -57,16 +57,31 @@ def _json_safe(value):
 
 
 def _pick_cover_url(imgs):
-    """选封面 URL（统一走 reverse_parse.pick_cover_url，gui/webui 共用同一逻辑）"""
-    return reverse_parse.pick_cover_url(imgs)
+    """选封面 URL：先用 _is_video_entry 滤掉视频帧，再交给 reverse_parse.pick_cover_url。
+
+    reverse_parse 那份只按 type 判视频，而真实库的 images[] 里 type 字段 100% 缺失 ——
+    不过滤就会把 .mp4 直链当封面去下载（gui._download_image 的 magic 校验会拒掉，结果是封面缺失）。
+    只剩视频项时退回视频首帧 imageUrl；老 info 连 poster 也没有 → 返回 ''，调用方按「无封面」处理。
+    （reverse_parse.py 不在本轮改动范围，所以过滤放在本文件的统一入口上。）"""
+    entries = [im for im in (imgs or []) if isinstance(im, dict)]
+    url = reverse_parse.pick_cover_url([im for im in entries if not _is_video_entry(im)])
+    if url:
+        return url
+    for im in entries:
+        if _is_video_entry(im):
+            poster = str(im.get("imageUrl") or "").strip()
+            if poster:
+                return poster
+    return ""
 
 
 _VIDEO_LIMIT_PER_MODEL = 3  # 每模型自动/批量落盘的视频数上限（防止单模型拉爆带宽）
 
 
-def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=512 * 1024 * 1024):
+def _download_video(url, dest, timeout=180, proxy=None, verify=True, max_bytes=100 * 1024 * 1024):
     """流式下载视频到本地（.tmp + 原子替换；过大/过小/失败返回 False）。与 _download_image（PIL 校验版）不同，
-    视频无法用图片 magic bytes 校验，以体积下限兜底。"""
+    视频无法用图片 magic bytes 校验，以体积下限兜底。
+    max_bytes 的默认值与 config.video_max_mb 同口径（100MB）——不留一个比设置更大的暗档。"""
     import urllib.request
     tmp = dest + ".tmp"
     try:
@@ -104,10 +119,106 @@ def _local_video_file(base, idx):
     return os.path.join(base + ".images", "video_%02d.mp4" % idx)
 
 
-def _ensure_local_videos(base, images, proxy=None, verify=True, limit=_VIDEO_LIMIT_PER_MODEL):
+# 视频尾缀集合：与 image_gallery.is_video_source 保持一致。
+# 不在这里 import image_gallery —— 两处都要用，且那模块也会被独立调用。
+VIDEO_URL_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".avi")
+
+
+def _video_url_ext(u):
+    """URL/路径的尾缀（去 query/fragment，小写）；不是视频扩展名则返回 ''。"""
+    s = str(u or "").strip()
+    if not s:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+        path = urlsplit(s).path
+    except Exception:
+        path = s.split("?")[0].split("#")[0]
+    low = path.lower()
+    return low if low.endswith(VIDEO_URL_EXTS) else ""
+
+
+def _is_video_entry(img):
+    """info.json 的 images[] 条目是否为视频：type == 'video' **或** url/imageUrl 尾缀是视频扩展名。
+
+    实测缺陷（v2.6.28 之前只按 type 判）：真实库 479 条 images[] 里 type 字段 100% 缺失
+    （条目只有 url/width/height/nsfw 四个键），于是 107 条 .mp4（占 22.3%）被当成静帧 ——
+    前端 <img> 收到 content-type: video/mp4 的 1.2~2.3MB 视频字节，图片永远解码不出来，
+    带宽却已经花掉；查看器再按原图档下一遍（original 档视频均值 19.4MB）。
+    按尾缀兜底是安全的：.jpeg 尾缀的 60 条抽样 HEAD 全是 image/png|webp|jpeg，没有伪装成
+    图片的视频。所有视频判定必须走这个入口，不要再就地写 type == 'video'。"""
+    if not isinstance(img, dict):
+        return False
+    if str(img.get("type") or "").lower() == "video":
+        return True
+    return bool(_video_url_ext(img.get("url")) or _video_url_ext(img.get("imageUrl")))
+
+
+def _video_source_url(img):
+    """视频项的可播源（url 字段的 mp4 直链；缺失返回 ''）"""
+    return str((img or {}).get("url") if isinstance(img, dict) else "").strip()
+
+
+def _image_cap_bytes(cfg):
+    """静帧单张体积上限（config.image_max_mb，默认 20MB）。
+    口径唯一来源是 image_gallery.static_limit_bytes——同一配置键在两处必须算出同一个值。"""
+    import image_gallery
+    return image_gallery.static_limit_bytes(cfg or {})
+
+
+def _video_cap_bytes(cfg):
+    """视频单个体积上限（config.video_max_mb，默认 100MB；无 cfg 时也用同一默认，不留更大的暗档）"""
+    import image_gallery
+    return image_gallery.video_limit_bytes(cfg or {})
+
+
+def _fetch_deadline_s(cfg):
+    """单帧在线读取总时限（秒，config.fetch_deadline_s，默认 120）——与 image_gallery 同一实现"""
+    import image_gallery
+    return int(image_gallery.fetch_deadline_seconds(cfg or {}))
+
+
+def _is_reparse_path(path):
+    """Windows 重解析点检测（符号链接 / junction / mount point）。
+
+    `os.path.islink()` 对 junction 一律返回 False（Python 3.12 实测），而 `mklink /J` 不需要管理员权限就能
+    造出来：`<名>.images` 做成指向同层其它目录的 junction 时，realpath 的「同层」校验照样通过，
+    补帧就会写进一个和模型无关的目录。所以守卫必须看 FILE_ATTRIBUTE_REPARSE_POINT，不能只信 islink。"""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)   # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _fill_dir_writable(out_dir, model_path=None):
+    """补帧落盘前的目录校验：目录不能是重解析点，且必须解析到模型同层（不跟着链接写到别处）。"""
+    try:
+        if _is_reparse_path(out_dir) or os.path.islink(out_dir):
+            return False
+        real_dir = os.path.realpath(out_dir)
+        if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+            return False
+        if model_path:
+            parent = os.path.realpath(os.path.dirname(os.path.abspath(model_path)))
+            if os.path.dirname(real_dir) != parent:
+                return False
+            if real_dir != os.path.join(parent, os.path.basename(real_dir)):
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _ensure_local_videos(base, images, proxy=None, verify=True, limit=_VIDEO_LIMIT_PER_MODEL, max_bytes=None):
     """把 images 中的 video 项下载落盘为 <base>.images/video_XX.mp4（跳过已存在；返回新增数量）。
-    供下载完成自动流程/下载示例图/批量下载封面共用。"""
+    供下载完成自动流程/下载示例图/批量下载封面共用。
+    max_bytes 缺省取 config.video_max_mb（默认 100MB；无 cfg 时同一个默认，不留更大的暗档）。"""
     out_dir = base + ".images"
+    if max_bytes is None:
+        max_bytes = _video_cap_bytes(None)
+    if not _fill_dir_writable(out_dir):
+        return 0
     try:
         os.makedirs(out_dir, exist_ok=True)
     except Exception:
@@ -116,17 +227,230 @@ def _ensure_local_videos(base, images, proxy=None, verify=True, limit=_VIDEO_LIM
     for i, im in enumerate(images or []):
         if added >= limit:
             break
-        if not isinstance(im, dict) or str(im.get("type") or "").lower() != "video":
+        if not _is_video_entry(im):
             continue
-        u = (im.get("url") or "").strip()
+        u = _video_source_url(im)
         if not u:
             continue
         dest = _local_video_file(base, i + 1)
+        if _is_reparse_path(dest) or os.path.islink(dest):
+            continue   # 绝不跟随符号链接/junction 往模型目录外写
         if os.path.exists(dest) and os.path.getsize(dest) > 1024:
             continue
-        if _download_video(u, dest, proxy=proxy, verify=verify):
+        if _download_video(u, dest, proxy=proxy, verify=verify, max_bytes=max_bytes):
             added += 1
     return added
+
+
+def _download_image_limited(url, dest, timeout=60, proxy=None, verify=True, max_bytes=None):
+    """流式下载图片到本地（.tmp + 原子替换；超限/过小/非图片格式返回 False）。
+
+    与 gui._download_image 的唯一区别是体积上限：上限来自 config.image_max_mb，超了直接丢弃，
+    绝不留下半张图（半张图会让查看器解码失败并占着缓存额度）。magic bytes 校验顺带挡住
+    「.jpg 尾缀实为 mp4」这类伪装。"""
+    import urllib.request
+    from gui import _is_image_bytes
+    if max_bytes is None:
+        max_bytes = _image_cap_bytes(None)
+    tmp = dest + ".tmp"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
+            "Referer": "https://civitai.com/",
+        })
+        opener = civitai_api.build_opener(proxy, verify)
+        got = 0
+        with opener.open(req, timeout=timeout) as r:
+            try:
+                if int(r.headers.get("Content-Length") or 0) > max_bytes:
+                    return False
+            except (TypeError, ValueError):
+                pass
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > max_bytes:
+                        raise ValueError("image too large")
+                    f.write(chunk)
+        if got < 100:
+            os.unlink(tmp)
+            return False
+        with open(tmp, "rb") as f:
+            head = f.read(32)
+        if not _is_image_bytes(head):
+            os.unlink(tmp)
+            return False
+        os.replace(tmp, dest)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _images_fill_targets(base, images, want_videos=True):
+    """info images[] → <base>.images/ 落盘清单 [(kind, url, dest)]，kind 为 'image' 或 'video'。
+
+    命名与「已存在即跳过」的幂等语义完全沿用 download_all_images：静帧 image_%02d.<ext>；
+    视频首帧 poster 落 image_%02d.jpg、原片落 video_%02d.mp4（同序号，本地优先取用靠这个约定）。
+    判定一律走 _is_video_entry —— 老 info 没有 type 字段，只按 type 判会把 mp4 存成 image_XX.jpg。"""
+    out_dir = base + ".images"
+    targets = []
+    for i, im in enumerate(images or []):
+        if not isinstance(im, dict):
+            continue
+        if _is_video_entry(im):
+            poster = str(im.get("imageUrl") or "").strip()
+            if poster:
+                targets.append(("image", poster, os.path.join(out_dir, "image_%02d.jpg" % (i + 1))))
+            mp4 = _video_source_url(im)
+            if mp4 and want_videos:
+                targets.append(("video", mp4, _local_video_file(base, i + 1)))
+            continue
+        u = str(im.get("url") or "").strip()
+        if not u:
+            continue
+        head = u.lower().split("?")[0]
+        ext = ".webp" if ".webp" in head else ".png" if ".png" in head else ".jpg"
+        targets.append(("image", u, os.path.join(out_dir, "image_%02d%s" % (i + 1, ext))))
+    return targets
+
+
+def _fill_pending_targets(targets):
+    """过滤出真正要下的项 —— 补帧因此是幂等的。
+
+    静帧：目标存在且有内容即算已落盘（半张图不可能出现：写盘走 .tmp + 原子替换，且有 magic bytes 校验）。
+    视频：还要求 >1KB，历史实现就是按这个阈值认定「已下载」，避免把截断的 mp4 当成品。"""
+    pending = []
+    for kind, url, dest in targets or []:
+        try:
+            if _is_reparse_path(dest) or os.path.islink(dest):
+                continue
+            if not os.path.exists(dest):
+                pending.append((kind, url, dest))
+                continue
+            size = os.path.getsize(dest)
+            if size <= 0 or (kind == "video" and size <= 1024):
+                pending.append((kind, url, dest))
+                continue
+        except OSError:
+            continue
+    return pending
+
+
+def _fill_free_space_ok(probe_dir, cfg, kind):
+    """落盘前的磁盘余量检查：余量不足返回 (False, 说明)。按当次要写的档位取上限估一遍，
+    再留 32MB 安全垫；宁可跳过补帧也不把用户的模型目录写满。"""
+    cap = _video_cap_bytes(cfg) if kind == "video" else _image_cap_bytes(cfg)
+    reserve = min(cap, 128 * 1024 * 1024) + 32 * 1024 * 1024
+    try:
+        free = shutil.disk_usage(probe_dir).free
+    except (OSError, ValueError):
+        return False, "无法确认磁盘剩余空间，已跳过补帧"
+    if free < reserve:
+        return False, "磁盘剩余约 %dMB，低于本次补帧需要的 %dMB，已跳过" % (
+            free // (1024 * 1024), reserve // (1024 * 1024))
+    return True, ""
+
+
+def _images_fill_run(path, targets, cfg, state=None, cancel=None, deadline_s=None):
+    """串行执行补帧清单（同时只 1 张在写），进度写进 state，任何失败只记账不抛异常。
+
+    调用方负责并发闸门（_start_images_autofill 保证全局只 1 个任务）。返回统计 dict。"""
+    proxy = (cfg or {}).get("proxy_address") if (cfg or {}).get("proxy_enabled") else None
+    verify = (cfg or {}).get("ssl_verify", True)
+    started = time.monotonic()
+    if deadline_s is None:
+        deadline_s = _fetch_deadline_s(cfg)
+    stats = {"total": len(targets or []), "downloaded": 0, "failed": 0, "skipped": 0, "msg": ""}
+    # 磁盘余量按模型所在盘探测：<名>.images 首次补帧时还不存在，直接探它会抛错、把整批误判成「空间不足」
+    probe_dir = os.path.dirname(os.path.abspath(path)) if path else None
+    out_dir = None
+    for kind, url, dest in targets or []:
+        if cancel is not None and cancel.is_set():
+            stats["msg"] = "已取消，剩余帧未下载"
+            break
+        left = deadline_s - (time.monotonic() - started)
+        if left <= 1:
+            stats["msg"] = "超出总时限 %ds，剩余帧未下载" % int(deadline_s)
+            break
+        ok = False
+        note = ""
+        try:
+            target_dir = os.path.dirname(dest)
+            if out_dir is None:
+                out_dir = target_dir
+                if not _fill_dir_writable(target_dir, path):
+                    stats["skipped"] += len(targets)
+                    stats["msg"] = "图片目录不可写，或会写到模型目录之外，已跳过"
+                    return stats
+                os.makedirs(target_dir, exist_ok=True)
+            if _is_reparse_path(dest) or os.path.islink(dest):
+                stats["skipped"] += 1   # 符号链接/junction 指向别处，绝不跟随
+            else:
+                enough, note = _fill_free_space_ok(probe_dir or target_dir, cfg, kind)
+                if not enough:
+                    stats["skipped"] += 1
+                elif kind == "video":
+                    ok = _download_video(url, dest, timeout=min(180, max(5, int(left))), proxy=proxy,
+                                         verify=verify, max_bytes=_video_cap_bytes(cfg))
+                else:
+                    ok = _download_image_limited(url, dest, timeout=min(60, max(5, int(left))), proxy=proxy,
+                                                 verify=verify, max_bytes=_image_cap_bytes(cfg))
+        except Exception:
+            ok = False
+        if ok:
+            stats["downloaded"] += 1
+        else:
+            stats["failed"] += 1
+        if state is not None:
+            state["done"] = state.get("done", 0) + 1
+            state["downloaded"] = stats["downloaded"]
+            state["failed"] = stats["failed"]
+            state["skipped"] = stats["skipped"]
+    if not stats["msg"]:
+        stats["msg"] = note if stats["skipped"] else ("补帧完成" if stats["downloaded"] else "无需补帧")
+    return stats
+
+
+def _gallery_display_tier(cfg):
+    """显示档参数（config.gallery_display_width / gallery_display_quality）。
+    返回 (max_width, quality)，脏值/缺键退回安全默认（老用户配置里没有这两个键）。"""
+    try:
+        width = int((cfg or {}).get("gallery_display_width", 1440))
+    except (TypeError, ValueError, OverflowError):
+        width = 1440
+    try:
+        quality = int((cfg or {}).get("gallery_display_quality", 80))
+    except (TypeError, ValueError, OverflowError):
+        quality = 80
+    return max(256, min(4096, width)), max(40, min(100, quality))
+
+
+def _gallery_preview(item, cfg):
+    """查看器显示档预览：把 gallery_display_width / gallery_display_quality 交给 image_gallery.preview。
+
+    只有「显示」走这一档 —— save_gallery_image / copy_gallery_image / get_gallery_cached 继续按原图档读，
+    不受这里影响。参数按 image_gallery.preview 的实际签名过滤：上游还没接档位时退回它自己的默认档，
+    绝不因为签名对不上就丢帧或改数据来源。体积/时限上限（image_max_mb / video_max_mb / fetch_deadline_s）
+    由 cfg 一起传下去，image_gallery 侧自取；本文件内的落盘下载则显式带上上限。"""
+    import inspect
+    import image_gallery
+    width, quality = _gallery_display_tier(cfg)
+    wanted = {"max_width": width, "quality": quality}
+    try:
+        params = inspect.signature(image_gallery.preview).parameters
+    except (TypeError, ValueError):
+        params = {}
+    accepts_any = any(p.kind is p.VAR_KEYWORD for p in params.values())
+    kwargs = {k: v for k, v in wanted.items() if accepts_any or k in params}
+    return image_gallery.preview(item, cfg, **kwargs)
 
 
 def _local_video_uri(base, idx):
@@ -307,11 +631,11 @@ class Api:
                                         proxy=proxy_cfg, verify=verify_cfg)
                     except Exception:
                         pass
-                has_video = any(isinstance(im, dict) and str(im.get("type") or "").lower() == "video"
-                                and (im.get("url") or "").strip() for im in imgs)
+                has_video = any(_is_video_entry(im) and _video_source_url(im) for im in imgs)
                 if has_video:
                     threading.Thread(target=_ensure_local_videos,
-                                     args=(base, imgs), kwargs={"proxy": proxy_cfg, "verify": verify_cfg},
+                                     args=(base, imgs), kwargs={"proxy": proxy_cfg, "verify": verify_cfg,
+                                                                 "max_bytes": _video_cap_bytes(self.cfg)},
                                      daemon=True).start()
             # Completed files stay where the user classified them. Global target only affects
             # future downloads; relocation is exclusively an explicit move action.
@@ -1555,8 +1879,20 @@ class Api:
         cover = model_manager.find_cover(path)
         if img_files:
             cover = img_files[0]
-        # 本地封面占用 C 站前 N 张（下载图按 image_%02d 顺序），URL 图从 N 开始避免重复
-        url_start = len(img_files) if img_files else (1 if (cover and os.path.exists(cover)) else 0)
+        # 本地优先：本地 .images/ 已落盘的帧先出，同序号 info 的远程 URL 不再出现（避免同帧重复）。
+        # 按 image_%02d 精确匹配而不是按张数计数 —— 视频项落的是 video_XX.mp4（不进 img_files），
+        # 只数张数会把序号算歪；视频项的 image_XX.jpg 只是 poster，由视频帧本身代表，不另立图帧。
+        video_idx = {i for i, img in enumerate(images) if _is_video_entry(img)}
+        local_img_slots = set()
+        for fp in img_files:
+            m = re.match(r"image_(\d+)[.]", os.path.basename(fp), re.I)
+            if m:
+                k = int(m.group(1)) - 1
+                if k not in video_idx:
+                    local_img_slots.add(k)
+        if not local_img_slots:
+            local_img_slots = (set(range(len(img_files))) if img_files
+                               else ({0} if (cover and os.path.exists(cover)) else set()))
         if cover and os.path.exists(cover):
             try:
                 from PIL import Image
@@ -1574,19 +1910,46 @@ class Api:
                                "prompt": _p, "negative": _n})
             except Exception:
                 pass
-        # 追加 C 站 URL 图（跳过本地封面已占的序号 + url 去重）
+        # 本地 images 目录其余图补入（文件名 image_%02d → 序号匹配 prompt；视频首帧不重复出图）
+        for fp in img_files[1:]:
+            try:
+                if os.path.realpath(fp) == os.path.realpath(cover):
+                    continue
+                fn = os.path.basename(fp)
+                if fn.lower().startswith("image_") and fn[6:8].isdigit() and int(fn[6:8]) - 1 in video_idx:
+                    continue
+                from PIL import Image
+                import io as _io
+                import base64 as _b64
+                im = Image.open(fp).convert("RGB")
+                im.thumbnail((512, 512))
+                buf = _io.BytesIO()
+                im.save(buf, "JPEG", quality=82)
+                idx = -1
+                if fn.lower().startswith("image_") and fn[6:8].isdigit():
+                    idx = int(fn[6:8]) - 1
+                _p, _n = _local_img_prompt(fp)
+                if _p is None:
+                    _p, _n = _img_prompt(idx)
+                covers.append({"b64": _b64.b64encode(buf.getvalue()).decode(),
+                               "local": True, "local_path": fp,
+                               "prompt": _p, "negative": _n})
+            except Exception:
+                pass
+        # 追加 C 站 URL 图（跳过本地已占的序号 + url 去重）
         for i, img in enumerate(images[:20]):
-            if i < url_start:
+            if i in local_img_slots:
                 continue
             u = img.get("url")
             if not u:
                 continue
-            is_video = str(img.get("type") or "").lower() == "video"
-            if any(c.get("url") == u for c in covers):
+            is_video = _is_video_entry(img)
+            if any(c.get("url") == u or c.get("orig_url") == u for c in covers):
                 continue
             if is_video:
                 # 视频项：url 优先本地落盘的 video_XX.mp4（file:/// 离线可播），否则远程 mp4 直链；
-                # 绝不进 PIL/缩略图管线；poster 为首帧 imageUrl
+                # 绝不进 PIL/缩略图管线，也绝不把 mp4 当图片 URL 交出去（<img> 收到 video/mp4 字节永不解码）。
+                # poster 只有新 info 的 imageUrl 才有；老 info 没有 → 留空，由前端 <video preload="metadata"> 自己出首帧。
                 local_uri = _local_video_uri(base, i + 1)
                 covers.append({"type": "video", "url": local_uri or u, "local": bool(local_uri),
                                "poster": img.get("imageUrl") or "",
@@ -1598,28 +1961,6 @@ class Api:
                                "prompt": (img.get("meta") or {}).get("prompt") or "",
                                "negative": (img.get("meta") or {}).get("negativePrompt") or "",
                                "orig_url": img.get("url") or ""})
-        # 本地 images 目录其余图补入（文件名 image_%02d → 序号匹配 prompt）
-        for fp in img_files[1:]:
-            try:
-                from PIL import Image
-                import io as _io
-                import base64 as _b64
-                im = Image.open(fp).convert("RGB")
-                im.thumbnail((512, 512))
-                buf = _io.BytesIO()
-                im.save(buf, "JPEG", quality=82)
-                idx = -1
-                fn = os.path.basename(fp)
-                if fn.lower().startswith("image_") and fn[6:8].isdigit():
-                    idx = int(fn[6:8]) - 1
-                _p, _n = _local_img_prompt(fp)
-                if _p is None:
-                    _p, _n = _img_prompt(idx)
-                covers.append({"b64": _b64.b64encode(buf.getvalue()).decode(),
-                               "local": True, "local_path": fp,
-                               "prompt": _p, "negative": _n})
-            except Exception:
-                pass
         import image_gallery
         for c in covers:
             idx = 0
@@ -1635,6 +1976,14 @@ class Api:
             if c.get('local_path') and not re.search(r'image_\d+',os.path.basename(c['local_path']),re.I) and c.get('metadata_source')=='C站模型信息缓存':
                 c['metadata_source']='模型缓存首图参数；自定义封面可能不对应'
         covers=self._remember_gallery_detail(path,covers)
+        # 顺手把 <名>.images/ 缺的帧排进后台补帧（开关关/本地已齐/已有任务 → 不起线程；失败只记状态）
+        # 没起来的原因要留痕：前端只轮询 get_images_autofill_state，拿不到这里的返回值，
+        # 否则「开关关了 / 磁盘不足 / 目录被拒」在界面上和「这个模型没示例图」长得一模一样。
+        try:
+            _fill = self._start_images_autofill(path, "detail")
+            self._autofill_registry()["last_reason"] = "" if _fill.get("started") else _fill.get("reason", "")
+        except Exception:
+            pass
         return json.dumps(_json_safe({
             "ok": True,"path": path,"name": os.path.basename(path),"info": info,"covers": covers,
         }),ensure_ascii=False,allow_nan=False)
@@ -1691,9 +2040,17 @@ class Api:
 
     def get_gallery_image(self, path, index, history_id=''):
 
-        import image_gallery
-        try:return image_gallery.preview(self._gallery_item(path,index,history_id),self.cfg)
-        except Exception:return {'ok':False,'msg':'图片读取失败；在线图片可能无权限或网络不可用，可打开 C站原图页'}
+        # image_gallery 抛的 ValueError 文案本来就是给用户看的（视频/超时/超体积），
+        # 一律并成「图片读取失败」会把「这是视频，请用播放入口」这种关键信息抹掉。
+        try:
+            return _gallery_preview(self._gallery_item(path, index, history_id), self.cfg)
+        except ValueError as e:
+            msg = str(e) or ''
+            if msg:
+                return {'ok': False, 'msg': msg}
+            return {'ok': False, 'msg': '图片读取失败；在线图片可能无权限或网络不可用，可打开 C站原图页'}
+        except Exception:
+            return {'ok': False, 'msg': '图片读取失败；在线图片可能无权限或网络不可用，可打开 C站原图页'}
 
     def get_gallery_metadata(self,path,index,history_id=''):
         import image_gallery
@@ -1747,6 +2104,10 @@ class Api:
         try:
             item=self._gallery_item(path,index,history_id)
             data,fmt,w,h,original=image_gallery.read_bytes(item,self.cfg)
+            if fmt == 'VIDEO':
+                # read_bytes 对视频源不再进 PIL（视频字节解码不出图片，之前是下完 19MB 才报错）。
+                # 这里必须挡在 ext 映射前：'VIDEO' 不在映射表里， KeyError 会被下面并成通用失败文案。
+                return {'ok': False, 'msg': '当前帧是视频，不能按图片保存；可让模型自动补帧下载 mp4，或用「打开 C站原图页」保存'}
             if not webview.windows:return {'ok':False,'msg':'浏览器模式请使用“保存当前预览”或 C站原图页下载'}
             ext={'JPEG':'jpg','PNG':'png','WEBP':'webp','GIF':'gif'}[fmt]
             name=os.path.splitext(os.path.basename(path or 'image'))[0]+'_image_'+str(index+1)+'.'+ext
@@ -1880,82 +2241,155 @@ class Api:
                 pass
         return json.dumps({"ok": True, "removed": removed}, ensure_ascii=False)
 
+    def _info_images(self, path):
+        """读该模型的 C 站信息文件，返回归一化后的 images[]（只保留 dict 项）。读不到 → []。"""
+        info = {}
+        try:
+            info_path = model_manager.find_info_file(path)
+            if info_path:
+                with open(info_path, "r", encoding="utf-8") as f:
+                    info = json.load(f)
+        except Exception:
+            return []
+        if not isinstance(info, dict):
+            return []
+        images = info.get("images") or []
+        return [x for x in images if isinstance(x, dict)] if isinstance(images, list) else []
+
     def download_all_images(self, path):
-        """download all C-site images to <base>.images/"""
-        import urllib.request
+        """手动「下载全部示例图」到 <base>.images/（同步跑，前端轮询 get_img_dl_state 拿进度）。
+
+        落盘命名与「已存在即跳过」的幂等语义和后台补帧共用同一套（_images_fill_targets / _images_fill_run）：
+        静帧 image_%02d.<ext>，视频首帧 poster image_%02d.jpg + 原片 video_%02d.mp4（同序号）。
+        视频判定走 _is_video_entry：老 info 没有 type 字段，只按 type 判会把 mp4 原片存成 image_XX.jpg，
+        查看器再按静帧解码它 —— 这是「图片要 1 分钟甚至 5 分钟才加载」的根因之一。"""
         path = (path or "").strip()
         if not path or not os.path.exists(path):
             return json.dumps({"ok": False, "msg": "file not exists"})
-        info = {}
-        info_path = model_manager.find_info_file(path)
-        if info_path:
-            try:
-                with open(info_path, "r", encoding="utf-8") as f:
-                    info = json.load(f)
-            except Exception:
-                info = {}
-        images = info.get("images") or []
-        images=[x if isinstance(x,dict) else {} for x in images] if isinstance(images,list) else []
-        for image in images:
-            if not isinstance(image.get('meta'),dict):image['meta']={}
-        if info:info['images']=images
+        images = self._info_images(path)
         if not images:
             return json.dumps({"ok": False, "msg": "no images in info"})
         base = os.path.splitext(path)[0]
         out_dir = base + ".images"
+        if not _fill_dir_writable(out_dir, path):
+            return json.dumps({"ok": False, "msg": "图片目录不可写，或会写到模型目录之外，已拒绝"})
         try:
             os.makedirs(out_dir, exist_ok=True)
         except Exception:
             pass
-        n = 0
-        total = len(images)
-        self._img_dl_state = {"total": total, "done": 0}
-        for i, im in enumerate(images):
-            if str(im.get("type") or "").lower() == "video":
-                # 视频项：首帧 imageUrl 落 image_XX.jpg（缩略/封面用）+ mp4 原片落 video_XX.mp4（播放用）
-                u = (im.get("imageUrl") or "").strip()
-                ext = ".jpg"
-            else:
-                u = (im.get("url") or "").strip()
-                if not u:
-                    self._img_dl_state["done"] = self._img_dl_state.get("done", 0) + 1
-                    continue
-                low = u.lower()
-                if ".webp" in low.split("?")[0]:
-                    ext = ".webp"
-                elif ".png" in low.split("?")[0]:
-                    ext = ".png"
-                else:
-                    ext = ".jpg"
-            if not u:
-                self._img_dl_state["done"] = self._img_dl_state.get("done", 0) + 1
-                continue
-            dest = os.path.join(out_dir, "image_%02d%s" % (i + 1, ext))
-            if os.path.exists(dest):
-                n += 1
-            else:
-                try:
-                    req = urllib.request.Request(u, headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CivitaiFreeTool/1.4",
-                        "Referer": "https://civitai.com/",
-                    })
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        data = resp.read()
-                    with open(dest, "wb") as f:
-                        f.write(data)
-                    n += 1
-                except Exception:
-                    pass
-            if str(im.get("type") or "").lower() == "video":
-                mp4 = (im.get("url") or "").strip()
-                vdest = _local_video_file(base, i + 1)
-                if mp4 and not (os.path.exists(vdest) and os.path.getsize(vdest) > 1024):
-                    if _download_video(mp4, vdest, proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
-                                       verify=self.cfg.get("ssl_verify", True)):
-                        n += 1
-            self._img_dl_state["done"] = self._img_dl_state.get("done", 0) + 1
-        self._img_dl_state["done"] = total
-        return json.dumps({"ok": True, "downloaded": n, "dir": out_dir})
+        targets = _images_fill_targets(base, images)
+        pending = _fill_pending_targets(targets)
+        existing = len(targets) - len(pending)
+        state = {"total": len(targets), "done": existing, "downloaded": existing, "failed": 0}
+        self._img_dl_state = state
+        stats = _images_fill_run(path, pending, self.cfg, state=state,
+                                 deadline_s=_fetch_deadline_s(self.cfg) * max(1, len(targets)))
+        state["done"] = len(targets)
+        return json.dumps({"ok": True, "downloaded": existing + stats["downloaded"], "dir": out_dir,
+                           "failed": stats["failed"], "skipped": stats["skipped"], "msg": stats["msg"]})
+
+    def _autofill_registry(self):
+        """补帧任务表：全局同时只允许 1 个任务（reg['current'] 是它的 key）。
+        last_reason 记「这次为什么没补」，供只轮询进度的前端如实解释。"""
+        reg = getattr(self, "_images_autofill", None)
+        if reg is None:
+            reg = {"lock": threading.Lock(), "current": "", "jobs": {}, "last_reason": ""}
+            self._images_autofill = reg
+        return reg
+
+    def _start_images_autofill(self, path, reason="detail"):
+        """后台补帧入口（详情打开时自动调用，也可由前端显式调用）。
+
+        硬约束都在这里落：受 config.images_dir_autofill 开关控制；进程内同时只 1 个任务、任务内串行 1 张；
+        已存在的帧直接跳过（幂等，重复打开详情零成本）；目录必须是模型同层的 <名>.images 且不跟随符号链接；
+        磁盘余量不足则跳过并写明原因；写失败只进任务状态，绝不影响当前查看。"""
+        try:
+            path = (path or "").strip()
+            if not self.cfg.get("images_dir_autofill"):
+                return {"ok": True, "started": False, "reason": "设置中已关闭自动补齐示例图"}
+            if not path or not os.path.isfile(path):
+                return {"ok": False, "started": False, "reason": "模型文件不存在"}
+            if getattr(self, "_storage_migrating", False):
+                return {"ok": True, "started": False, "reason": "数据目录迁移中，暂不补帧"}
+            base = os.path.splitext(path)[0]
+            out_dir = base + ".images"
+            if not _fill_dir_writable(out_dir, path):
+                return {"ok": False, "started": False, "reason": "图片目录不可写，或会写到模型目录之外，已拒绝"}
+            images = self._info_images(path)
+            if not images:
+                return {"ok": True, "started": False, "reason": "模型信息里没有示例图"}
+            pending = _fill_pending_targets(_images_fill_targets(base, images))
+            if not pending:
+                return {"ok": True, "started": False, "reason": "本地帧已齐全", "total": len(images)}
+            key = os.path.normcase(os.path.abspath(path))
+            reg = self._autofill_registry()
+            with reg["lock"]:
+                if reg["current"]:
+                    return {"ok": True, "started": False, "reason": "已有补帧任务在跑（同时只做 1 个，不跟下载抢带宽）",
+                            "current": reg["current"]}
+                running = reg["jobs"].get(key)
+                if running and not running.get("finished"):
+                    return {"ok": True, "started": False, "reason": "该模型的补帧任务已在进行",
+                            "total": running.get("total", 0)}
+                job = {"path": path, "dir": out_dir, "total": len(pending), "done": 0, "downloaded": 0,
+                       "failed": 0, "skipped": 0, "msg": "", "cancel": threading.Event(),
+                       "finished": False, "trigger": reason}
+                reg["jobs"][key] = job
+                for stale in list(reg["jobs"])[:-32]:   # 只留最近 32 条进度（前端按 path 轮询，历史无需长存）
+                    if reg["jobs"][stale].get("finished"):
+                        reg["jobs"].pop(stale, None)
+                reg["current"] = key
+            threading.Thread(target=self._images_autofill_worker, args=(key, job, pending), daemon=True).start()
+            return {"ok": True, "started": True, "total": len(pending), "dir": out_dir}
+        except Exception as e:
+            return {"ok": False, "started": False, "reason": "补帧启动失败：%s" % str(e)[:80]}
+
+    def _images_autofill_worker(self, key, job, pending):
+        reg = self._autofill_registry()
+        try:
+            # fetch_deadline_s 是「单帧」预算：整个任务按帧数放大，超时后剩余帧不下载（下次打开继续，幂等）
+            stats = _images_fill_run(job["path"], pending, self.cfg, state=job, cancel=job["cancel"],
+                                     deadline_s=_fetch_deadline_s(self.cfg) * max(1, len(pending)))
+            job["msg"] = stats["msg"] or "补帧完成"
+        except Exception as e:
+            job["msg"] = "补帧中断：%s" % str(e)[:80]
+        finally:
+            job["finished"] = True
+            with reg["lock"]:
+                if reg["current"] == key:
+                    reg["current"] = ""
+
+    def autofill_model_images(self, path):
+        """RPC：把该模型 <名>.images/ 缺的示例图排进后台补帧（开关关闭时直接返回原因）。"""
+        result = self._start_images_autofill(path, "rpc")
+        self._autofill_registry()["last_reason"] = "" if result.get("started") else result.get("reason", "")
+        return json.dumps(result, ensure_ascii=False)
+
+    def get_images_autofill_state(self, path=""):
+        """RPC：补帧进度（JSON）。{ok, running, path, total, done, downloaded, failed, skipped, msg, reason}
+        reason 说明「为什么没补」（开关关了 / 本地已齐 / 闸门被占 / 目录被拒），前端据此显示而不是静默不报。"""
+        reg = self._autofill_registry()
+        key = os.path.normcase(os.path.abspath(path)) if path else ""
+        job = reg["jobs"].get(key) if key else (reg["jobs"].get(reg["current"]) if reg["current"] else None)
+        if job is None:
+            return json.dumps({"ok": True, "running": False, "total": 0, "done": 0,
+                               "reason": reg.get("last_reason", ""),
+                               "msg": "没有补帧任务"}, ensure_ascii=False)
+        return json.dumps({"ok": True, "running": not job.get("finished"), "path": job.get("path", ""),
+                           "dir": job.get("dir", ""), "total": job.get("total", 0), "done": job.get("done", 0),
+                           "downloaded": job.get("downloaded", 0), "failed": job.get("failed", 0),
+                           "skipped": job.get("skipped", 0), "reason": job.get("reason", ""),
+                           "msg": job.get("msg", "")}, ensure_ascii=False)
+
+    def cancel_images_autofill(self, path=""):
+        """RPC：取消补帧（不传 path 取消当前任务）。已落盘的帧保留（幂等，下次接着补）。"""
+        reg = self._autofill_registry()
+        key = os.path.normcase(os.path.abspath(path)) if path else reg["current"]
+        job = reg["jobs"].get(key)
+        if not job:
+            return json.dumps({"ok": True, "canceled": False, "msg": "没有正在进行的补帧任务"}, ensure_ascii=False)
+        job["cancel"].set()
+        return json.dumps({"ok": True, "canceled": True, "msg": "已请求取消，剩余帧不再下载"}, ensure_ascii=False)
 
     def wf_analyze_data(self, name, b64data):
         """drag-drop file: write base64 to temp then analyze"""
@@ -2797,10 +3231,16 @@ class Api:
     def get_covers_multi(self, paths, size=220, n=3):
         """批量返回轮播帧（JSON：{path: [[src, isVideo], ...]}）。
 
-        数据源合并：本地封面（b64，现有缓存管线）→ .civitai.info 的 images（远程 URL，
-        image 项转 C 站 width=460 缩略、video 项给 imageUrl 首帧 + mp4 直链标记 isVideo）
-        → 本地 .images/ 补位。远程 URL 由前端 hover 时才加载（预取零流量）。
-        旧 info（无 type）按 image 处理，一样有轮播。"""
+        帧顺序 = **本地优先于远程**：封面（.preview.* 或 .images 首图）→ 按 info 序号依次取帧，
+        该序号本地已落盘就用本地 b64（同帧绝不重复出远程 URL），本地没有才用 .civitai.info 的
+        远程 URL（image 项转 C 站 width=460 缩略，hover 才加载，预取零流量）→ 无序号的本地图片补位。
+        视频项一律走 _is_video_entry 判定，只返回可播源（本地 video_XX.mp4 的 file URI，否则 mp4 直链）
+        并标 isVideo=True，由前端 <video preload="metadata"> 出首帧。
+
+        以前这里是「info 不足 n 张才用本地补位」，且只按 type 判视频 —— 真实库的 images[] 100% 没有
+        type 字段，于是 22.3% 的 .mp4 被当成静帧塞给 <img>：拿到的是 content-type: video/mp4 的
+        1.2~2.3MB 视频字节，图片永远解码不出来、带宽却已经花掉。没有 poster 的老 info 现在也不再
+        伪造一个指向 mp4 的「图片 URL」。"""
         out = {}
         try:
             size = int(size or 220)
@@ -2817,14 +3257,20 @@ class Api:
         for p in (paths or [])[:80]:
             try:
                 items = []
+                emitted = set()   # 已出帧的本地文件（normcase 绝对路径），防同帧重复
+
+                def _data(b):
+                    return b if b.startswith("data:") else "data:image/jpeg;base64," + b
+
                 cover = model_manager.find_cover(p)
                 if not cover or not os.path.exists(cover):
                     cover = self._images_dir_first(p)
                 if cover and os.path.exists(cover):
                     b = self._cover_thumb(p, cover, size, 0, thumb_dir)
                     if b:
-                        items.append([b if b.startswith("data:") else "data:image/jpeg;base64," + b, False])
-                # .civitai.info 的远程 images（含视频项）——封面已占第 1 帧时跳过 info[0]（通常与封面同源）
+                        items.append([_data(b), False])
+                        emitted.add(os.path.normcase(os.path.abspath(cover)))
+                # .civitai.info 的 images（含视频项）
                 info = {}
                 try:
                     fp_info = model_manager.find_info_file(p)
@@ -2833,39 +3279,78 @@ class Api:
                             info = json.load(fh)
                 except Exception:
                     info = {}
+                if not isinstance(info, dict):
+                    info = {}
                 base_p = os.path.splitext(p)[0]
-                remote = [(i, im) for i, im in enumerate(info.get("images") or []) if isinstance(im, dict)]
-                for i, img in remote:
-                    if items and i == 0:
-                        continue  # info[0] 通常与封面同源，跳过避免轮播首帧重复
+                remote = {i: im for i, im in enumerate(info.get("images") or []) if isinstance(im, dict)}
+                local_by_idx = {}
+                unnumbered = []
+                for fp in self._images_dir_files(p):
+                    m = re.match(r"image_(\d+)[.]", os.path.basename(fp), re.I)
+                    if m:
+                        local_by_idx.setdefault(int(m.group(1)) - 1, fp)
+                    else:
+                        unnumbered.append(fp)
+                video_idx = {i for i, im in remote.items() if _is_video_entry(im)}
+                # 封面占了哪个序号，那个序号的远程 URL 就不能再出一次。
+                # 只按 normcase 路径去重不够：封面常是 image_02.jpg（字典序首图或具名封面），
+                # 此时 local_by_idx[1] 命中「已出过」被跳过，循环却继续走远程分支，同一帧出两层。
+                # 认不出序号的封面（具名 .preview.png 之类）仍按老约定视作占第 1 帧。
+                cover_slot = 0
+                if cover:
+                    _mc = re.match(r"image_(\d+)[.]", os.path.basename(cover), re.I)
+                    if _mc:
+                        cover_slot = int(_mc.group(1)) - 1
+                seq = 1
+                for i in sorted(set(local_by_idx) | set(remote)):
                     if len(items) >= n:
                         break
-                    t = str(img.get("type") or "").lower()
-                    if t == "video":
-                        mp4 = (img.get("url") or "").strip()
+                    if items and i not in video_idx and i == cover_slot:
+                        continue   # 该帧已由封面占位，不再重复出远程 URL
+                    img = remote.get(i)
+                    local_fp = local_by_idx.get(i)
+                    if i not in video_idx and local_fp and os.path.normcase(os.path.abspath(local_fp)) not in emitted:
+                        b = self._cover_thumb(p, local_fp, size, seq, None)  # seq>0 仅内存缓存，防 thumb_cache 膨胀
+                        if b:
+                            items.append([_data(b), False])
+                            seq += 1
+                            emitted.add(os.path.normcase(os.path.abspath(local_fp)))
+                        continue
+                    if img is None:
+                        continue
+                    if _is_video_entry(img):
                         local_uri = _local_video_uri(base_p, i + 1)
                         if local_uri:
                             items.append([local_uri, True])   # 本地落盘视频：离线可播
+                            continue
+                        poster = local_by_idx.get(i) if i in video_idx else None
+                        if poster and os.path.normcase(os.path.abspath(poster)) not in emitted:
+                            b = self._cover_thumb(p, poster, size, seq, None)
+                            if b and len(items) < max(1, n - 1):
+                                items.append([_data(b), False])
+                                seq += 1
+                                emitted.add(os.path.normcase(os.path.abspath(poster)))
                         else:
-                            poster = (img.get("imageUrl") or "").strip()
-                            if poster:
-                                items.append([_civitai_thumb_url(poster), False])
-                            if mp4:
-                                items.append([mp4, True])     # 远程 mp4：hover 时流式播放
+                            poster_u = str(img.get("imageUrl") or "").strip()
+                            if poster_u and len(items) < max(1, n - 1):
+                                items.append([_civitai_thumb_url(poster_u), False])
+                        mp4 = _video_source_url(img)
+                        if mp4:
+                            items.append([mp4, True])         # 远程 mp4：hover 时流式播放
                     else:
-                        u = (img.get("url") or "").strip()
+                        u = str(img.get("url") or "").strip()
                         if u:
                             items.append([_civitai_thumb_url(u), False])
-                # 本地 .images/ 补位（info 缺失或不足 n 张时）
+                # 无序号对应的本地图片最后补位（自定义文件名，例如 image_cover.png）
                 if len(items) < n:
-                    seq = 1
-                    for fimg in self._images_dir_files(p):
-                        if fimg == (cover or ""):
+                    for fimg in unnumbered:
+                        if os.path.normcase(os.path.abspath(fimg)) in emitted:
                             continue
-                        b = self._cover_thumb(p, fimg, size, seq, None)  # seq>0 仅内存缓存，防 thumb_cache 膨胀
+                        b = self._cover_thumb(p, fimg, size, seq, None)
                         if b:
-                            items.append([b if b.startswith("data:") else "data:image/jpeg;base64," + b, False])
+                            items.append([_data(b), False])
                             seq += 1
+                            emitted.add(os.path.normcase(os.path.abspath(fimg)))
                             if len(items) >= n:
                                 break
                 if items:
@@ -4128,7 +4613,8 @@ class Api:
                     try:
                         _ensure_local_videos(b, imgs,
                                              proxy=self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
-                                             verify=self.cfg.get("ssl_verify", True))
+                                             verify=self.cfg.get("ssl_verify", True),
+                                             max_bytes=_video_cap_bytes(self.cfg))
                     except Exception:
                         pass
                 self.mm_progress["done"] += 1

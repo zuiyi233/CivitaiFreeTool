@@ -49,8 +49,14 @@ DEFAULTS = {
     "pointer_effects": "off",           # off / click / trail
     "pointer_effect_quality": "low",   # 粒子/像素预算；帧率独立设置
     "effects_fps_limit": 60,            # 0 跟随屏幕刷新；15–360 自定义上限
-    "cache_original_images": True,      # 已查看原图与生成数据保存到软件数据目录
-    "gallery_cache_mb": 1024,           # 自动淘汰最旧缓存，不移动模型文件
+    "cache_original_images": True,      # 已查看原图与生成数据保存到软件数据目录（原图和生成数据为私有运行数据，不进源码/发行包）
+    "gallery_cache_mb": 8192,           # 自动淘汰最旧缓存，不移动模型文件（全库原图约 3.3GB，1GB 预算必然把「查看过一次」的档淘汰掉）
+    "image_max_mb": 20,                 # 静帧单张体积上限（宁可得大：实测静帧均值 3.2MB，个别 4096px 原图过 10MB）
+    "video_max_mb": 100,                # 视频单个体积上限（实测 original 档视频均值 19.4MB）
+    "fetch_deadline_s": 120,            # 单帧在线读取的总时限（秒）：连接+重连+落盘的墙钟上限，不再按块空等
+    "gallery_display_width": 1440,      # 显示档最长边（像素）；保存/复制走原图档，不受此值影响
+    "gallery_display_quality": 80,      # 显示档 JPEG 质量（40-100）
+    "images_dir_autofill": True,        # 详情打开后后台把 <名>.images/ 补齐（同时只 1 个、可取消、已存在即跳过）
     "model_favorites": [],             # 收藏置顶的本地模型路径
     "model_toolbar_locked": False,
     "onboarding_done": False,
@@ -211,9 +217,10 @@ def normalize_ui_preferences(cfg):
     if cfg.get("download_name_mode", "original") not in ("original", "civitai", "chinese"): cfg["download_name_mode"] = "original"
     cfg["filename_include_version"] = cfg.get("filename_include_version") is True
     if cfg.get("multi_file_download", "ask") not in ("ask", "first", "all"): cfg["multi_file_download"] = "ask"
-    for key,default,lo,hi in [("max_concurrent_downloads",3,1,32),("effects_fps_limit",60,15,360),("gallery_cache_mb",1024,64,8192),("model_list_size",3,1,3),("name_scroll_speed",70,10,240),("name_scroll_start_pause",350,0,5000),("name_scroll_end_pause",250,0,5000),("media_page_size",200,20,500)]:
+    for key,default,lo,hi in [("max_concurrent_downloads",3,1,32),("effects_fps_limit",60,15,360),("gallery_cache_mb",8192,64,65536),("image_max_mb",20,1,2000),("video_max_mb",100,1,4096),("fetch_deadline_s",120,5,3600),("gallery_display_width",1440,256,4096),("gallery_display_quality",80,40,100),("model_list_size",3,1,3),("name_scroll_speed",70,10,240),("name_scroll_start_pause",350,0,5000),("name_scroll_end_pause",250,0,5000),("media_page_size",200,20,500)]:
         try:value=int(cfg.get(key,default));cfg[key]=0 if key=="effects_fps_limit" and value==0 else max(lo,min(hi,value))
         except (TypeError,ValueError,OverflowError):cfg[key]=default
+    cfg['images_dir_autofill']=cfg.get('images_dir_autofill',True) is not False   # 默认开；只有显式 false 才关
     cfg['shortcuts_enabled']=cfg.get('shortcuts_enabled') is True
     legacy_shortcuts=cfg.pop("shortcuts_preset", None)
     bindings=cfg.get('shortcuts_bindings')
