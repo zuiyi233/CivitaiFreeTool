@@ -169,6 +169,54 @@ function flattenPromptText(text) {
         .trim();
 }
 
+// ---- HTML → 纯文本：只做文本提取，绝不把页面内容交给 innerHTML / 活文档 ----
+// 入参是任意 C 站用户编写的 HTML 描述（可含 <img src=x onerror=…> 这类载荷），调用方是
+// offscreen 归档线程（有扩展权限）。解析只允许发生在惰性文档里：DOMParser 生成的文档
+// 脚本不执行、事件处理器不触发；img/iframe 仍可能排队一次资源下载，所以在读出文本前
+// 先把「可加载属性」摘掉——整个函数是同步的，取数据任务真正执行时 src 已经没了。
+// 任何节点都不会被并回活文档（并入后脚本才会真的可执行、图片才会真的去取）。
+// 无 DOMParser 的环境（Service Worker）走 _plainTextFromHtmlString：纯正则剥标记 +
+// 实体解码，全程不解析标记、不创建元素、不执行也不请求任何东西。
+
+// 惰性文档里可能触发请求的元素 / 属性（摘掉后文本内容不变）
+const _HTML_LOADERS = 'img, iframe, embed, source, track, video, audio, object, input, link';
+const _HTML_LOAD_ATTRS = ['src', 'srcset', 'data', 'poster', 'code', 'codebase'];
+
+// 描述文本里高频出现的命名实体（其余原样保留，绝不二次解码）
+const _NAMED_ENTITIES = {
+    nbsp: '\u00A0', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", ensp: '\u2002', emsp: '\u2003',
+    thinsp: '\u2009', shy: '', ndash: '\u2013', mdash: '\u2014', lsquo: '\u2018', rsquo: '\u2019',
+    ldquo: '\u201C', rdquo: '\u201D', hellip: '\u2026', middot: '\u00B7', bull: '\u2022',
+    copy: '\u00A9', reg: '\u00AE', trade: '\u2122', deg: '\u00B0', times: '\u00D7', divide: '\u00F7',
+    laquo: '\u00AB', raquo: '\u00BB', euro: '\u20AC', pound: '\u00A3', yen: '\u00A5', sect: '\u00A7'
+};
+const _BLOCK_TAG_NAMES = 'p|div|li|ul|ol|h[1-6]|blockquote|pre|section|article|table|tr|td|th';
+
+// 数字引用 + 上面的命名引用；只解一次（&amp;lt; 还原成 &lt; 文本，不会变成标记）
+function _decodeHtmlEntities(text) {
+    return String(text).replace(/&(?:#(\d{1,7})|#x([0-9a-fA-F]{1,6})|([a-zA-Z][a-zA-Z0-9]{1,9}));/g,
+        (m, dec, hex, name) => {
+            if (dec !== undefined || hex !== undefined) {
+                const cp = parseInt(hex !== undefined ? hex : dec, hex !== undefined ? 16 : 10);
+                if (cp > 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)) {
+                    try { return String.fromCodePoint(cp); } catch (_) { return m; }
+                }
+                return m;
+            }
+            const key = String(name).toLowerCase();
+            return Object.prototype.hasOwnProperty.call(_NAMED_ENTITIES, key) ? _NAMED_ENTITIES[key] : m;
+        });
+}
+
+// 兜底路径：正则剥标记（顺序敏感——先剥注释，再转 <br>/块级标签，最后剥剩余标签并解码）
+function _plainTextFromHtmlString(html) {
+    let s = String(html).replace(/<!--[\s\S]*?(?:-->|$)/g, '').replace(/<br\s*\/?>/gi, '\n');
+    s = s.replace(new RegExp('<\\s*/?\\s*(?:' + _BLOCK_TAG_NAMES + ')\\b[^>]*>', 'gi'), '\n');
+    s = s.replace(/<\/?[a-zA-Z!][^>]*>/g, ' '); // 要求 < 后接字母/斜杠/!，正文里孤立的「a < b」不被吞
+    s = _decodeHtmlEntities(s);
+    return s.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // 规范化 HTML → 纯文本（保留段落/换行）
 function htmlToPlainTextFormatted(htmlString) {
     if (typeof htmlString !== 'string' || !htmlString.includes('<')) {
@@ -177,17 +225,18 @@ function htmlToPlainTextFormatted(htmlString) {
     if (typeof DOMParser !== 'undefined') {
         try {
             const doc = new DOMParser().parseFromString(htmlString, 'text/html');
+            doc.body.querySelectorAll(_HTML_LOADERS).forEach(el => {
+                _HTML_LOAD_ATTRS.forEach(attr => el.removeAttribute(attr)); // 断掉 img/iframe 的请求队列
+            });
             const clone = doc.body.cloneNode(true);
             clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
             clone.querySelectorAll('p, div, li, h1, h2, h3, h4, h5, h6').forEach(el => {
                 el.append('\n');
             });
             return clone.textContent.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
-        } catch (_) { /* 走 textContent 兜底 */ }
+        } catch (_) { /* 走纯文本兜底（同样不解析标记） */ }
     }
-    const div = document.createElement('div');
-    div.innerHTML = String(htmlString);
-    return div.textContent || '';
+    return _plainTextFromHtmlString(htmlString);
 }
 
 function normalizeMultilineText(text) {

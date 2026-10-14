@@ -5,3 +5,11 @@
 #btnArchive:disabled{opacity:.45}
 #archiveNote{margin-top:8px;color:#ce6b38}
 #archiveStatus{margin-top:6px}
+
+/* ---- 连接状态与「按钮为什么不能点」提示：区分 未打开 / 不是 CFT / 版本过旧 / 缺 API Key ---- */
+#connection{max-width:158px;text-align:right;overflow-wrap:anywhere}
+#connection.warn{color:#ce6b38}
+#sendHint{margin:6px 0 0;line-height:1.45}
+#sendHint.warn{color:#ce6b38}
+/* 缺 Key 是待办不是失败：用中性色，避免和 .failed/.uncertain 的橙色失败态混淆 */
+.result.needskey{color:var(--dim)}

@@ -18,6 +18,27 @@
       return {url:u.href, key, id:m[2], version:version || ''};
     } catch (_) { return null; }
   }
+  // /api/health 认人：只判「应答方是不是 CFT、版本够不够」，不是安全边界（本机任意进程
+  // 都能仿冒 app 字段），它挡的是端口上挂着别的服务/旧版 exe 这类错认。
+  const APP_ID = 'CivitaiFreeTool';
+  const MIN_APP_VERSION = '2.6.25'; // 归档桥 /api/archive/* 与 /api/library/check 的最低版本
+  function versionAtLeast(v, min) {
+    const a = String(v || '').split('.').map(n => parseInt(n, 10) || 0);
+    const b = String(min || '').split('.').map(n => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      const x = a[i] || 0, y = b[i] || 0;
+      if (x !== y) return x > y;
+    }
+    return true;
+  }
+  function cftHealth(json, minVersion) {
+    const j = (json && typeof json === 'object') ? json : null;
+    const version = String((j && j.version) || '');
+    if (!j || j.ok !== true) return { ok: false, reason: 'offline', version: '' };
+    if (j.app !== APP_ID) return { ok: false, reason: 'not-cft', version };
+    if (!versionAtLeast(version, minVersion || MIN_APP_VERSION)) return { ok: false, reason: 'too-old', version };
+    return { ok: true, reason: 'ok', version, mode: String(j.mode || ''), window: !!j.window };
+  }
   function cleanTitle(s) { return String(s || '').replace(/\s*\|\s*Civitai\s*$/i, '').replace(/^Civitai\s*\|\s*/i, '').trim() || 'Civitai 模型'; }
   function candidates(tabs) {
     const rows = [], seen = new Map();
@@ -30,5 +51,5 @@
     }
     return rows;
   }
-  root.CftTabs = {modelLink, cleanTitle, candidates};
+  root.CftTabs = {modelLink, cleanTitle, candidates, cftHealth, versionAtLeast, APP_ID, MIN_APP_VERSION};
 })(globalThis);

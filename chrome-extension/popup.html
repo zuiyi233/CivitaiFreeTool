@@ -3,6 +3,7 @@
 <body><main class="card">
 <header><img src="icons/icon32.png" alt=""/><div><strong>CivitaiFreeTool</strong><small>一键发送 · 标签页批量下载 · 一键归档</small></div><span id="connection" role="status">连接中…</span></header>
 <nav aria-label="发送模式"><button id="modeCurrent" class="active" aria-pressed="true">当前页面</button><button id="modeBatch" aria-pressed="false">批量标签页</button></nav>
+<p id="sendHint" class="muted" hidden></p>
 <section id="currentPanel"><h2 id="modelName">正在读取…</h2><p id="modelUrl" class="muted"></p><button id="sendCurrent" class="primary" disabled>发送当前页到 CFT</button>
 <button id="btnArchive" class="primary" disabled>🗂 一键归档到本地</button><p id="archiveNote" class="muted" hidden></p><p id="archiveStatus" class="muted" hidden></p></section>
 <section id="batchPanel" hidden><div class="tools"><label>范围 <select id="scope"><option value="all">所有浏览器窗口</option><option value="current">当前窗口</option></select></label><button id="refresh">刷新</button></div><input id="search" type="search" placeholder="搜索模型名或 ID" aria-label="搜索模型标签页"/><div class="tools"><label><input id="selectAll" type="checkbox"/> 全选当前列表</label><span id="selectionCount"></span></div><div id="tabList" aria-label="可发送的模型标签页"></div><p class="muted" id="tabSummary"></p><div class="tools"><button id="sendBatch" class="primary" disabled>发送选中到 CFT</button><button id="btnArchiveBatch" class="primary" disabled>🗂 批量归档选中</button></div>

@@ -124,6 +124,14 @@ function buildExamplePayload(trainedWords, promptList) {
   };
 }
 
+// 归档目录名唯一规则（契约 §3：<safeFsName(模型名_版本)>）：单页与批量共用。
+// 曾经单页用「所选文件名前缀」，同一模型两个入口落两个目录（重复目录 + 历史记录里的
+// dirName 随入口漂移）；软件侧查重按 version_id，所以这只是目录一致性问题。
+function archiveDirName(modelName, modelVer, modelVersionId) {
+  const base = String(modelName || '').trim() || ('model_' + (modelVersionId || Date.now()));
+  return CFT.util.safeFsName(base + '_' + String(modelVer || '').trim());
+}
+
 // 媒体候选选择（脚本 2285-2316：封面按 coverSaveMode；配图图片限 maxPics、视频全下）
 function selectMedia(verItem, cfg, authImages) {
   const list = Array.isArray(authImages) ? authImages : [];
@@ -153,8 +161,15 @@ function selectMedia(verItem, cfg, authImages) {
 }
 
 // 样图 generation data（脚本 2258-2280：image/video 类型、slice(0,20)、单图失败跳过）
-async function collectPromptList(verItem) {
-  const rawImages = Array.isArray(verItem.images) ? verItem.images : [];
+// pageUrl 决定请求打到 civitai.com 还是 civitai.red（镜像站数据独立）——站点判定统一由
+// CFT.api.civitaiBaseUrl(pageUrl) 负责（lib 里已改为公开 API，见 lib 文件头 5)。）。
+// getImageGenerationData 返回的是「归一化 core」（不再是 tRPC 信封）：
+//   {found, type, meta:<扁平生成数据>, reason?, resources, civitaiResources, modelVersionIds}
+// example.json 的每条样本形状不变（prompt/negativePrompt/sampler/cfgScale/steps/Size）。
+// 拿不到元数据的图（无密钥时公开 API 对 NSFW/受限图返回空 items）不静默丢弃，记进 gaps，
+// 由归档 errors / 模型信息 txt 如实说明原因。
+async function collectPromptList(verItem, pageUrl) {
+  const rawImages = rawImagesOf(verItem);
   const authImages = rawImages.filter((it) => it && (it.type === 'image' || it.type === 'video'));
   const imageIds = authImages.map((img) => {
     if (img.id != null) return String(img.id);
@@ -162,12 +177,12 @@ async function collectPromptList(verItem) {
     return String(seg).split('.')[0];
   }).filter((id) => /^\d+$/.test(id));
   const promptList = [];
+  const gaps = { noMeta: [], failed: 0, lastReason: '', lastErr: '' };
   for (const imageId of imageIds.slice(0, 20)) {
     try {
-      const data = await CFT.api.getImageGenerationData(imageId);
-      const core = data && data.result && data.result.data && data.result.data.json;
+      const core = await CFT.api.getImageGenerationData(imageId, pageUrl);
       const meta = core && core.meta;
-      if (meta && (core.type === 'image' || core.type === 'video')) {
+      if (core && core.found === true && meta && (core.type === 'image' || core.type === 'video')) {
         promptList.push({
           prompt: CFT.util.flattenPromptText(meta.prompt),
           negativePrompt: CFT.util.flattenPromptText(meta.negativePrompt),
@@ -176,14 +191,51 @@ async function collectPromptList(verItem) {
           steps: meta.steps,
           Size: meta.Size,
         });
+      } else {
+        gaps.noMeta.push(String(imageId));
+        gaps.lastReason = (core && core.reason) || 'no-meta';
       }
-    } catch (_) { /* 单个样图失败不影响主流程 */ }
+    } catch (e) {
+      /* 单个样图失败不影响主流程 */
+      gaps.failed += 1;
+      gaps.lastErr = (e && e.message) || String(e);
+    }
   }
-  return { authImages, promptList };
+  return { authImages, promptList, gaps };
+}
+
+function rawImagesOf(verItem) {
+  return Array.isArray(verItem && verItem.images) ? verItem.images : [];
+}
+
+// example.json 少提示词的真实原因（绝不写成「该图没有提示词」）：
+// 站点公开 API 在不带 API key 时对 NSFW/受限图直接返回 {"items":[]}（实测 imageId=145224191,
+// nsfwLevel 4 → 空；SFW 的 145676249 → 完整 meta）。扩展没有也不申请 key，所以这部分样图的
+// 提示词/参数注定拿不到，必须把原因摆到产物里，而不是留一个空 samples 让用户误判。
+function promptGapNote(gaps, gotCount) {
+  const g = gaps || { noMeta: [], failed: 0 };
+  const noMeta = (g.noMeta || []).length;
+  const failed = Number(g.failed) || 0;
+  if (!noMeta && !failed) return '';
+  const total = noMeta + failed + (Number(gotCount) || 0);
+  const parts = [];
+  if (noMeta) {
+    parts.push(noMeta + '/' + total + ' 张样图站点公开 API 未返回生成数据'
+      + '（公开 API 在不带 API key 时不返回 NSFW/受限图的元数据，实测返回 {"items":[]}'
+      + (g.lastReason ? '，reason=' + g.lastReason : '')
+      + '；本扩展无 API key 且不做申请，因此这些样图的提示词/参数无法保存——'
+      + '这不代表这些图没有提示词）');
+  }
+  if (failed) {
+    parts.push(failed + '/' + total + ' 张样图元数据请求失败' + (g.lastErr ? '：' + g.lastErr : ''));
+  }
+  return parts.join('；') + '。已保存 ' + (Number(gotCount) || 0) + ' 条提示词样本。';
 }
 
 // 评论 + 评价（trpc 主通道 + DOM 兜底，失败不中断；返回拼接前的两段文本）
-async function fetchCommentsText(modelId, versionId, tabId) {
+// trpc 已被站点 401 关闭时，lib 侧会熔断并在文本里写清原因（评论走页面抓取兜底，评价没有
+// 兜底通道所以只留原因）；这里不吞掉文本，空串才代表"真的没有内容"。
+async function fetchCommentsText(modelId, versionId, tabId, pageUrl) {
   const domFallbackFn = async () => {
     const ans = await askContent(tabId, 'requestDomComments', {});
     // content 侧回传 {cid, results:[{user,content,createdAt,reply,fromDom}]}
@@ -191,14 +243,37 @@ async function fetchCommentsText(modelId, versionId, tabId) {
     return [];
   };
   const settled = await Promise.allSettled([
-    CFT.api.fetchCivitaiComments(modelId, domFallbackFn),
-    CFT.api.fetchCivitaiReviews(versionId),
+    CFT.api.fetchCivitaiComments(modelId, domFallbackFn, pageUrl),
+    CFT.api.fetchCivitaiReviews(versionId, pageUrl),
   ]);
+  // 熔断状态直接问 lib（别靠匹配文案）：哪些 procedure 已经因 401 停调，一目了然
+  const gateState = typeof CFT.api.trpcUnauthorizedState === 'function' ? CFT.api.trpcUnauthorizedState() : {};
   return {
     commentsText: settled[0].status === 'fulfilled' ? (settled[0].value || '') : '',
     reviewsText: settled[1].status === 'fulfilled' ? (settled[1].value || '') : '',
+    gatedProcedures: Object.keys(gateState),
+    failures: [settled[0].reason, settled[1].reason]
+      .filter((e) => e)
+      .map((e) => ((e && e.message) || String(e))),
   };
 }
+
+// 降级说明（单页进 bag.errors，批量进 batch.errors；评论.txt 里的同名单已由 lib 写好）
+// savedCount = 文本里真正落盘的评论条数，用它区分"存到了页面评论"和"一条都没存到"，
+// 免得说明本身写成半句假话（明明没评论却说"已保存页面评论"）。
+function commentsDegradeNote(gatedProcedures, savedCount) {
+  const list = Array.isArray(gatedProcedures) ? gatedProcedures.filter((p) =>
+    p === CFT.api.COMMENTS_PROCEDURE || p === CFT.api.REVIEWS_PROCEDURE) : [];
+  if (!list.length) return '';
+  const reason = CFT.api.TRPC_CLOSED_REASON || '评论/评价接口已被站点关闭（401）';
+  const n = Number(savedCount) || 0;
+  const tail = n > 0
+    ? '，已保存 ' + n + ' 条页面上已渲染的评论（每条带 [页面抓取] 标记），未加载出来的历史评论无法保存'
+    : '，页面上没有已渲染的评论（评价也没有页面抓取通道），本次未能保存任何评论';
+  return reason + tail + '；已停调的接口: ' + list.join(', ')
+    + '。归档前先在模型页展开评论区并等待加载完成，可多保存一些评论。';
+}
+
 
 function countCommentLines(commentsText) {
   if (!commentsText) return 0;
@@ -258,7 +333,7 @@ async function runArchive(payload, opts) {
     } else {
       try {
         const resp = await CFT.api.fetchJson(
-          CFT.api.civitaiBaseUrl() + '/api/v1/models/' + encodeURIComponent(modelId),
+          CFT.api.civitaiBaseUrl(pageUrl) + '/api/v1/models/' + encodeURIComponent(modelId),
           { headers: { Accept: 'application/json' }, timeoutMs: FETCH_TIMEOUT_MS });
         if (!resp.ok) { done(false, '[错误：访问模型信息接口失败] ' + resp.status); return lastResult; }
         modelData = await resp.json();
@@ -309,9 +384,9 @@ async function runArchive(payload, opts) {
     if (isBatch && p.dirName) {
       dirName = String(p.dirName); // 批量短路：与 prepare 入队模型文件的目标子目录保持一致
     } else {
-      const rawCalc = CFT.util.sanitizeFilename(modelNameVer).trim() || ('model_' + (modelVersionId || Date.now()));
-      dirName = CFT.util.safeFsName(rawCalc);
+      dirName = archiveDirName(modelName, modelVer, modelVersionId);
     }
+    // raw 仅做封面/配图文件名前缀（保持脚本原语义），目录名统一走 archiveDirName
     const raw = CFT.util.sanitizeFilename(modelNameVer).trim() || ('model_' + (modelVersionId || Date.now()));
     clog('info', '归档开始', null, { modelId, modelVersionId, dirName, modelFile });
     reportProgress(tabId, 0, '开始归档…', 'info');
@@ -331,9 +406,19 @@ async function runArchiveVersion(bag) {
   const U = CFT.util;
   const st = { completed: 0, mediaFail: 0, modelError: null, commentCount: 0 };
   bag.st = st;
-  const collected = await collectPromptList(bag.verItem);
+  const collected = await collectPromptList(bag.verItem, bag.pageUrl);
   bag.authImages = collected.authImages;
   bag.promptList = collected.promptList;
+  // 提示词缺失就把「为什么缺」写进 errors/进度/模型信息 txt（不留空白让用户误判）
+  bag.promptGapNote = promptGapNote(collected.gaps, bag.promptList.length);
+  if (bag.promptGapNote) {
+    bag.errors.push('[example] ' + bag.promptGapNote);
+    clog('warn', '样图元数据不完整: ' + bag.promptGapNote, null, {
+      modelId: bag.modelId, modelVersionId: bag.modelVersionId,
+      noMeta: (collected.gaps && collected.gaps.noMeta) || [],
+    });
+    reportProgress(bag.tabId, 0, '部分样图无提示词（站点公开 API 未返回其元数据）', 'warn');
+  }
   const media = selectMedia(bag.verItem, bag.cfg, collected.authImages);
   bag.coverItem = media.coverItem;
   bag.additional = media.additional;
@@ -366,9 +451,20 @@ async function runArchiveVersion(bag) {
   enqueueModelTask(bag, sendModel);
   enqueueCoverTask(bag);
   enqueueMediaTasks(bag);
-  await writeInfoText(bag);
-  await writeExampleJson(bag);
-  await writeCommentsFile(bag);
+  // 附属文本文件失败不致命：此时调度器已在写同一目录，若异常冒泡到 runArchive 的 catch，
+  // 归档会被判失败（且不记历史）而写入者仍在跑。失败只进 errors，进度单位补上。
+  const writeAux = async (label, fn) => {
+    try {
+      await fn();
+    } catch (e) {
+      bag.errors.push('[' + label + '] 写入失败: ' + ((e && e.message) || e));
+      clog('warn', '「' + label + '」写入失败(不阻断归档)', e);
+      bag.st.completed += 1;
+    }
+  };
+  await writeAux('info', () => writeInfoText(bag));
+  await writeAux('example', () => writeExampleJson(bag));
+  await writeAux('comments', () => writeCommentsFile(bag));
   try { await scheduler.waitAll(); } catch (_) { /* 单任务错误已由调度器计数 */ }
   // 诚实判定：模型文件失败绝不能记为成功（脚本 2499-2507）
   const stats = scheduler.stats();
@@ -385,20 +481,23 @@ async function runArchiveVersion(bag) {
 // 模型文件任务最先入队（OPT-06）
 function enqueueModelTask(bag, sendModel) {
   if (sendModel && bag.modelFile) {
-    const primaryFile = bag.files.find((f) => f && f.primary === true) || bag.files[0];
-    if (primaryFile && primaryFile.downloadUrl) {
+    // 下载用户实际选中的那个文件（按名匹配，与 askFileSelection/prepare 的 modelFile 同源）；
+    // 名字没匹配上才回落 primary/首个。命中名字但无下载地址时不替换成别的文件，直接跳过。
+    const chosenFile = bag.files.find((f) => f && f.name === bag.modelFile)
+      || bag.files.find((f) => f && f.primary === true) || bag.files[0];
+    if (chosenFile && chosenFile.downloadUrl) {
       bag.scheduler.enqueue({
         type: 'model', media: false,
         run: async () => {
           bag.setP(0, '发送模型文件到软件: ' + bag.modelFile);
-          const res = await sendBg('sendModelToSoftware', { downloadUrl: primaryFile.downloadUrl, pageUrl: bag.pageUrl, destSubdir: bag.dirName });
+          const res = await sendBg('sendModelToSoftware', { downloadUrl: chosenFile.downloadUrl, pageUrl: bag.pageUrl, destSubdir: bag.dirName });
           if (!res || res.ok !== true) throw new Error((res && res.msg) || '软件下载通道失败');
           bag.setP(1, '模型文件已发送');
         },
       });
       return;
     }
-    clog('warn', '模型文件无下载地址，已跳过（进度计入）');
+    clog('warn', '模型文件无下载地址，已跳过（进度计入）', null, { modelFile: bag.modelFile });
     bag.st.completed += 1;
     return;
   }
@@ -479,6 +578,8 @@ async function writeInfoText(bag) {
     modelVersionId: bag.modelVersionId,
     modelUrl: bag.pageUrl,
   };
+  // 样图提示词缺失时把真实原因写在「其他参数」里（example.json 的形状不动，只在信息文件补说明）
+  if (bag.promptGapNote) modelInfoJson['examplePromptNote'] = bag.promptGapNote;
   bag.setP(0, '写入模型信息');
   await writeFileToBg(bag.dirName, U.safeFsName(bag.modelName + '.txt'),
     utf8ToB64(U.flattenObjectToPlainTextWithHtmlHandling(modelInfoJson)));
@@ -499,15 +600,22 @@ async function writeCommentsFile(bag) {
   if (bag.batchSkipComments) { bag.st.completed += 1; return; }
   let commentsText = '';
   let reviewsText = '';
+  let gatedProcedures = [];
   try {
-    const got = await fetchCommentsText(bag.modelId, bag.modelVersionId, bag.tabId);
+    const got = await fetchCommentsText(bag.modelId, bag.modelVersionId, bag.tabId, bag.pageUrl);
     commentsText = got.commentsText;
     reviewsText = got.reviewsText;
+    gatedProcedures = got.gatedProcedures || [];
+    (got.failures || []).forEach((m) => bag.errors.push('[comments] 拉取异常: ' + m));
   } catch (e) {
     clog('warn', '评论拉取失败(已跳过)', e);
     bag.errors.push('[comments] 拉取失败: ' + ((e && e.message) || e));
   }
   bag.st.commentCount = countCommentLines(commentsText);
+  // 接口被 401 关掉 → 除 评论.txt 里的说明外，再进一次 errors/日志，避免"文件没了/文件是空的"
+  // 被读成"这个模型没人评论"
+  const degradeNote = commentsDegradeNote(gatedProcedures, bag.st.commentCount);
+  if (degradeNote) { bag.errors.push('[comments] ' + degradeNote); clog('warn', '评论/评价降级: ' + degradeNote); }
   if (commentsText || reviewsText) {
     try {
       bag.setP(0, '写入评论');
@@ -581,25 +689,40 @@ async function runSingleImage(payload) {
   let currentMid = null;
   let currentVid = null;
   let metaToSave = null;
+  let metaNote = '';
   try {
-    const data = await CFT.api.getImageGenerationData(imageId);
-    const core = data && data.result && data.result.data && data.result.data.json;
+    // pageUrl 由 content/bg 附带时才能定站点；单图流缺省按 civitai.com（getCivitaiImageUrl 走 CDN 不受影响）
+    // getImageGenerationData 现在返回归一化 core（公开 /api/v1/images），不再是 tRPC 信封
+    const core = await CFT.api.getImageGenerationData(imageId, String(p.pageUrl || ''));
     if (!core) throw new Error('API 返回结构异常');
-    if (Array.isArray(core.resources)) {
-      const res = core.resources[0];
-      if (res && res.modelId) currentMid = res.modelId;
-      if (res && res.versionId) currentVid = res.versionId;
+    if (core.found !== true) {
+      // 站点公开 API 在不带 API key 时对 NSFW/受限图返回空 items（实测 imageId=145224191）：
+      // 这是"拿不到"不是"没有"，原图照样保存，但绝不编造 meta，也不写成"该图没有提示词"
+      metaNote = '站点公开 API 未返回该图生成数据（reason=' + (core.reason || 'unknown')
+        + '；无 API key 时 NSFW/受限图就是空 items），已仅保存原图';
+      clog('warn', '单图无生成数据: ' + metaNote, null, { imageId });
+    } else {
+      const refs = CFT.api.imageGenerationRefs(core);
+      currentVid = refs.versionId;
+      currentMid = refs.modelId;
+      if (!currentMid && currentVid) {
+        // 公开 API 的图片对象只给 modelVersionIds、不给 modelId；补一次 model-versions
+        // （单图是用户逐张点的一次动作，多这一个请求可以接受；样图循环绝不做这件事）
+        const ver = await CFT.api.getModelVersionInfo(currentVid, String(p.pageUrl || ''));
+        if (ver && ver.modelId) currentMid = ver.modelId;
+      }
+      metaToSave = {
+        type: core.type,
+        modelId: currentMid,
+        versionId: currentVid,
+        meta: Object.assign({}, core.meta || {}, {
+          prompt: U.flattenPromptText(core.meta && core.meta.prompt),
+          negativePrompt: U.flattenPromptText(core.meta && core.meta.negativePrompt),
+        }),
+      };
     }
-    metaToSave = {
-      type: core.type,
-      modelId: currentMid,
-      versionId: currentVid,
-      meta: Object.assign({}, core.meta || {}, {
-        prompt: U.flattenPromptText(core.meta && core.meta.prompt),
-        negativePrompt: U.flattenPromptText(core.meta && core.meta.negativePrompt),
-      }),
-    };
   } catch (e) {
+    metaNote = '单图元数据获取失败: ' + ((e && e.message) || e);
     clog('warn', '单图元数据获取失败(继续下载原图)', e, { imageId });
   }
   const urls = U.getCivitaiImageUrlCandidates(originalUrl);
@@ -656,7 +779,7 @@ async function runSingleImage(payload) {
     clog('warn', 'savedImageDone 广播失败(不影响保存结果)', e, { imageId });
   }
   }
-  return { ok: true, msg: '图片已保存' };
+  return { ok: true, msg: '图片已保存', metaSaved: !!metaToSave, metaNote: metaNote };
 }
 
 // ---- 批量归档状态机（契约 8.2；模块级 batch，与单页 _running 互斥） ----
@@ -693,7 +816,7 @@ async function prepareBatchItem(res, cfg) {
   const modelId = String(res.modelId || '');
   const payloadVersionId = String(res.modelVersionId || '');
   const resp = await CFT.api.fetchJson(
-    CFT.api.civitaiBaseUrl() + '/api/v1/models/' + encodeURIComponent(modelId),
+    CFT.api.civitaiBaseUrl(res.pageUrl || '') + '/api/v1/models/' + encodeURIComponent(modelId),
     { headers: { Accept: 'application/json' }, timeoutMs: FETCH_TIMEOUT_MS });
   if (!resp.ok) throw new Error('[错误：访问模型信息接口失败] ' + resp.status);
   const modelData = await resp.json();
@@ -721,7 +844,7 @@ async function prepareBatchItem(res, cfg) {
       return;
     }
   } catch (e) { clog('warn', '批量历史预检失败(按未归档继续)', e, { modelId, versionId }); }
-  const dirName = CFT.util.safeFsName(modelName + '_' + modelVer);
+  const dirName = archiveDirName(modelName, modelVer, versionId);
   res.dirName = dirName;
   const primaryFile = files.find((f) => f && f.primary === true) || files[0] || null;
   res.modelFile = primaryFile ? String(primaryFile.name || '') : '';
@@ -796,11 +919,24 @@ async function runCommentsStage(b) {
     if (b.cancel) return;
     if (!res || res.status !== 'done') continue;
     try {
-      const got = await fetchCommentsText(res.modelId, res.modelVersionId, null);
+      const got = await fetchCommentsText(res.modelId, res.modelVersionId, null, res.pageUrl || '');
       const text = [got.commentsText, got.reviewsText]
         .filter((s) => s && String(s).length > 0)
         .join('\n\n');
       if (text) await writeFileToBg(res.dirName, '评论.txt', utf8ToB64(text));
+      // 熔断是全批生效的：批级 errors 只报一次（逐文件的说明已经写在各自 评论.txt 里），
+      // 免得 110 页刷出 110 行同义错误把 popup 状态区淹没
+      const note = commentsDegradeNote(got.gatedProcedures, countCommentLines(got.commentsText));
+      if (note && !b.commentsGateNoted) {
+        b.commentsGateNoted = true;
+        clog('warn', '批量评论降级: ' + note);
+        if (Array.isArray(b.errors)) {
+          b.errors.push({
+            modelId: res.modelId, modelVersionId: res.modelVersionId, dirName: res.dirName,
+            msg: '评论/评价降级: ' + note + '（批量阶段无页面抓取通道，各模型的 评论.txt 已写入该说明）',
+          });
+        }
+      }
     } catch (e) {
       b.errors.push({
         modelId: res.modelId, modelVersionId: res.modelVersionId, dirName: res.dirName,
@@ -950,7 +1086,7 @@ try {
 try {
   globalThis.__cftArchiveTest = {
     handleMessage, runArchive, runSingleImage,
-    computeTotalUnits, buildExamplePayload, selectMedia,
+    computeTotalUnits, buildExamplePayload, selectMedia, archiveDirName,
     newCid, waitCid, resolveCid,
     getBatchState, runBatchStage, runPool,
     prepareBatchItem, runPrepareStage, runMediaStage, runCommentsStage, finishBatch,

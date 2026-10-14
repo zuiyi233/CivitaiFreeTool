@@ -4,12 +4,15 @@
  * DOM 评论兜底(1510-1522)、showObjectSelectionDialog(2572-2607)、createButtonProgressController(1354-1405)、
  * askArchiveConfirm 文案(2155-2157)。样式全部走 content.css（cft- 前缀类），本文件无 inline 样式。
  * classic content script：依赖 manifest 按序注入的 globalThis.CFT.util，只读使用。
+ * 按钮挂载为事件驱动（路由事件 + body childList 观察）+ 15s 可见性兜底，不做前台轮询。
  */
 (function () {
   var BTN_ID = 'cft-archive-btn';
   var LABEL_DEFAULT = '🗂 一键归档';
   var RESTORE_DELAY_MS = 3000;
-  var ENSURE_INTERVAL_MS = 2000;
+  var ROUTE_SETTLE_MS = 250;     // 路由事件后等 SPA 本轮渲染结束再处理一次
+  var ROUTE_WATCH_MS = 5000;     // 纯字符串复查（完全不碰 DOM），补 pushState 拦不到的路由切换
+  var ENSURE_BACKSTOP_MS = 15000; // 慢速兜底：漏网的 SPA 路由切换靠它自愈（后台页跳过）
 
   /* ================= 纯逻辑函数（无 DOM，可在 node 下单测） ================= */
 
@@ -223,6 +226,8 @@
   var btnEls = { btn: null, fill: null, label: null };
   var btnBusy = false;
   var restoreTimer = 0;
+  var btnMounted = false;   // 按钮当前是否在 DOM 里（由 body childList 观察者维护）
+  var handledPath = null;   // 上次处理完（挂载或确认卸载）的 pathname：路由没变则 ensure 直接早退
 
   function getButton() {
     try {
@@ -257,7 +262,7 @@
       clearRestoreTimer();
       btnBusy = false;
       var btn = getButton();
-      if (!btn) { setBtnRefs(null); return; }
+      if (!btn) { setBtnRefs(null); btnMounted = false; handledPath = null; return; } // 按钮被页面摘掉：复位，等下一次路由事件/兜底重挂
       setBtnRefs(btn);
       btn.classList.remove('cft-archiving', 'cft-done', 'cft-error');
       try { btn.disabled = false; } catch (_) {}
@@ -336,7 +341,9 @@
         { __cft: true, to: 'bg', type: 'startArchive', payload: {} },
         function () {
           try {
-            if (chrome.runtime.lastError) {
+            var err = chrome.runtime.lastError;
+            if (err) {
+              warn('startArchive rejected:', err.message || 'unknown'); // 真实原因进控制台，别只留「后台无响应」
               applyArchiveDone({ ok: false, msg: '后台无响应' });
             }
             // bg 侧按契约无答复：保持进度态，等待 progress/archiveDone 事件驱动
@@ -346,16 +353,27 @@
     } catch (e) { warn('onArchiveClick failed', e); }
   }
 
-  function ensureArchiveButton() {
+  function ensureArchiveButton(force) {
+    var path = safePathname();
+    // 快速早退：路由没变且状态已稳定（按钮在位 / 已确认该页无按钮）时一次 DOM 查询都不做
+    if (!force && path === handledPath) return;
     try {
       var d = doc();
       if (!d || !d.body) return;
-      if (!isModelPath(safePathname())) {
+      if (!isModelPath(path)) {
         var stale = getButton();
         if (stale) { try { stale.remove(); } catch (_) {} setBtnRefs(null); btnBusy = false; }
+        btnMounted = false;
+        handledPath = path;
         return;
       }
-      if (getButton()) return;
+      var existing = getButton();
+      if (existing) {
+        if (!btnEls.btn) setBtnRefs(existing); // 进度态引用曾丢失：重新收养，别再插一个
+        btnMounted = true;
+        handledPath = path;
+        return;
+      }
       var btn = d.createElement('button');
       btn.id = BTN_ID;
       btn.type = 'button';
@@ -371,7 +389,9 @@
       btn.addEventListener('click', onArchiveClick);
       d.body.appendChild(btn);
       setBtnRefs(btn);
-    } catch (e) { warn('ensureArchiveButton failed', e); }
+      btnMounted = true;
+      handledPath = path;
+    } catch (e) { warn('ensureArchiveButton failed', e); handledPath = null; }
   }
 
   /* ============ 文件选择弹窗（脚本 2572-2607 搬运，样式改 css 类） ============ */
@@ -489,7 +509,17 @@
     } catch (e) { warn('onRuntimeMessage failed', e); }
   }
 
-  /* ================= 挂载（SPA 路由变化时确保按钮存在） ================= */
+  /* ========== 挂载：事件驱动为主 + 慢速兜底（不再前台轮询） ========== */
+  // 即时：pushState/replaceState 包装 + popstate/hashchange + body 直接子节点增删
+  //（整页重渲染、portal、toast）+ visibilitychange；
+  // 复查：5s 只比 pathname 字符串（零 DOM 访问），15s 才做一次 getElementById 在位校验。
+  // 已知局限：隔离世界里改写 history.pushState 拦不到页面主世界的调用，漏网的路由切换靠复查。
+
+  var routeTimer = 0;
+  var backstopTimer = 0;
+  var routeWatchTimer = 0;
+  var bodyObserver = null;
+  var eventsArmed = false;
 
   function wrapHistory(type) {
     try {
@@ -497,10 +527,106 @@
       var original = history[type];
       history[type] = function () {
         var r = original.apply(this, arguments);
-        setTimeout(function () { ensureArchiveButton(); }, 600);
+        scheduleEnsure();
         return r;
       };
     } catch (e) { warn('wrapHistory failed', e); }
+  }
+
+  function isPageHidden() {
+    try { return !!(typeof document !== 'undefined' && document.hidden); } catch (_) { return false; }
+  }
+
+  function buttonDetached() {
+    try { return !!(btnMounted && btnEls.btn && btnEls.btn.isConnected === false); } catch (_) { return false; }
+  }
+
+  function runEnsure() {
+    try { ensureArchiveButton(); } catch (e) { warn('ensure failed', e); }
+  }
+
+  // 同一轮 SPA 渲染里的连续路由事件合并成一次处理
+  function scheduleEnsure() {
+    try {
+      if (routeTimer) return;
+      routeTimer = setTimeout(function () { routeTimer = 0; runEnsure(); }, ROUTE_SETTLE_MS);
+    } catch (e) { warn('scheduleEnsure failed', e); }
+  }
+
+  function onBodyMutations() {
+    if (buttonDetached()) { btnMounted = false; handledPath = null; } // 页面把按钮摘掉了：立即重挂
+    runEnsure();
+  }
+
+  function armBodyObserver() {
+    try {
+      var d = doc();
+      if (bodyObserver || !d || !d.body || typeof MutationObserver === 'undefined') return;
+      bodyObserver = new MutationObserver(onBodyMutations);
+      bodyObserver.observe(d.body, { childList: true }); // 只观察 body 直接子节点，不观察子树
+    } catch (e) { warn('armBodyObserver failed', e); bodyObserver = null; }
+  }
+
+  function armBackstop() {
+    try {
+      if (backstopTimer) return;
+      backstopTimer = setInterval(function () {
+        try {
+          if (isPageHidden()) return;      // 后台标签页零工作
+          armBodyObserver();               // body 曾缺失的异常时序在这里补挂观察者（幂等）
+          ensureArchiveButton(true);       // 强制校验：一次 getElementById
+        } catch (e) { warn('ensure backstop failed', e); }
+      }, ENSURE_BACKSTOP_MS);
+    } catch (e) { warn('armBackstop failed', e); }
+  }
+
+  // 5s 复查只做 pathname 字符串比较（不查询 DOM），补上主世界 pushState 的拦不到的缺口
+  function armRouteWatch() {
+    try {
+      if (routeWatchTimer) return;
+      routeWatchTimer = setInterval(function () {
+        try {
+          if (isPageHidden() || safePathname() === handledPath) return;
+          ensureArchiveButton();
+        } catch (e) { warn('route watch failed', e); }
+      }, ROUTE_WATCH_MS);
+    } catch (e) { warn('armRouteWatch failed', e); }
+  }
+
+  function arm() {
+    armBodyObserver();
+    armBackstop();
+    armRouteWatch();
+  }
+
+  function disarm() {
+    try { if (backstopTimer) clearInterval(backstopTimer); } catch (_) {}
+    backstopTimer = 0;
+    try { if (routeWatchTimer) clearInterval(routeWatchTimer); } catch (_) {}
+    routeWatchTimer = 0;
+    try { if (bodyObserver) bodyObserver.disconnect(); } catch (_) {}
+    bodyObserver = null;
+  }
+
+  function revalidate() {
+    handledPath = null; // 允许隐藏期间漏掉的路由切换在下一次可见时立即纠正
+    runEnsure();
+    arm();
+  }
+
+  function armWindowEvents() {
+    if (eventsArmed) return;
+    eventsArmed = true;
+    try {
+      window.addEventListener('popstate', scheduleEnsure);
+      window.addEventListener('hashchange', scheduleEnsure);
+      window.addEventListener('pageshow', revalidate);      // bfcache 恢复：重新挂观察者/兜底
+      window.addEventListener('pagehide', disarm);          // 页面离开：清定时器 + 断观察者
+    } catch (_) { /* 忽略 */ }
+    try {
+      var d = doc();
+      if (d) d.addEventListener('visibilitychange', function () { if (!isPageHidden()) revalidate(); });
+    } catch (_) { /* 忽略 */ }
   }
 
   function init() {
@@ -508,16 +634,10 @@
       var d = doc();
       if (!d) return;
       ensureArchiveButton();
-      setInterval(function () {
-        try { ensureArchiveButton(); } catch (e) { warn('ensure tick failed', e); }
-      }, ENSURE_INTERVAL_MS);
       wrapHistory('pushState');
       wrapHistory('replaceState');
-      try {
-        window.addEventListener('popstate', function () {
-          setTimeout(function () { ensureArchiveButton(); }, 600);
-        });
-      } catch (_) { /* 忽略 */ }
+      armWindowEvents();
+      arm();
       if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
         chrome.runtime.onMessage.addListener(onRuntimeMessage);
       }

@@ -19,6 +19,11 @@ const RAW_SIZE_DOWNLOADS_MAX = 20 * 1024 * 1024; // downloads 降级上限
 const ARCHIVE_CONFIG_TTL_MS = 30 * 1000; // getArchiveConfig 缓存 30s
 const ARCHIVE_BATCH_MAX_ROWS = 500; // 批量归档上限（契约 8.1）
 const ARCHIVE_BATCH_COLLECT_MS = 5000; // 逐页 collectPage 超时（契约 8.3）
+// 软件写盘超时随体积放大：固定 15s 会把「慢盘上的合法大封面」误判成失败（桥侧 body 上限 128MB /
+// 解码后 64MB，browser_bridge.py:36-37，比本扩展 32MB 原始上限宽松，放大超时不与服务器冲突）。
+const SW_WRITE_TIMEOUT_BASE_MS = 15000;
+const SW_WRITE_TIMEOUT_PER_MB_MS = 1500; // 每 1MB 原始数据追加，桥要解码 + 落盘
+const SW_WRITE_TIMEOUT_MAX_MS = 60000; // 32MB 原始 → 15+48=63s 收口到 60s；sendBg 无宿主超时
 const STORE = 'lastBatch';
 
 // 批量提交状态（上游 v1.3.0）
@@ -125,7 +130,13 @@ ext.runtime.onInstalled.addListener(() => {
 });
 ext.contextMenus.onClicked.addListener(info => {
   if (info.menuItemId !== 'cft-dl') return;
-  start([info.linkUrl || info.pageUrl]).then(r => { if (!r.ok) { badge('!', '#c23d50'); ext.action.setTitle({ title: r.msg }); } }).catch(() => badge('!', '#c23d50'));
+  // 失败必须给出可读原因：徽标只说明「没成功」，标题才说明为什么
+  start([info.linkUrl || info.pageUrl]).then(r => {
+    if (!r || !r.ok) { badge('!', '#c23d50'); ext.action.setTitle({ title: (r && r.msg) || '发送失败' }).catch(() => {}); }
+  }, () => {
+    badge('!', '#c23d50');
+    ext.action.setTitle({ title: '发送失败，请检查扩展状态后重试' }).catch(() => {});
+  }).catch(() => {}); // setTitle 本身异常也不该冒成 unhandled rejection
 });
 
 // ---- offscreen 管理（并发防抖 + 已存在竞态兜底） ----
@@ -162,26 +173,44 @@ async function ensureOffscreen() {
   return _offscreenPromise;
 }
 
-// ---- getArchiveConfig（探活 2.5s + 读软件归档配置，缓存 30s） ----
+// ---- getArchiveConfig（探活 2.5s + 认人 + 读软件归档配置，缓存 30s） ----
 let _archiveCfgCache = null;
+// 显式失效：改目录/写盘失败后 30s TTL 会让扩展继续按旧目标写，光靠 TTL 不够。
+// 消费方（popup 设置区 / offscreen）改完软件端配置后发 invalidateArchiveConfig 即可立刻生效。
+function invalidateArchiveConfigCache(reason) {
+  if (!_archiveCfgCache) return;
+  _archiveCfgCache = null;
+  if (reason) bgLog('info', '归档配置缓存失效: ' + reason);
+}
 async function handleGetArchiveConfig() {
   const now = Date.now();
   if (_archiveCfgCache && now - _archiveCfgCache.at < ARCHIVE_CONFIG_TTL_MS) {
     return _archiveCfgCache.value;
   }
-  const out = { softwareOnline: false, archiveRoot: '', channel: 'downloads' };
+  // archiveRoot=软件归档根（落盘实际位置），downloadDir=软件下载目录（仅展示，二者可不同）
+  const out = { softwareOnline: false, archiveRoot: '', channel: 'downloads', downloadDir: '', version: '', reason: 'offline' };
   try {
     const h = await bridgeFetch('/api/health', { timeoutMs: 2500 });
-    if (h.httpOk && h.data && h.data.ok) {
+    // 只认「应答方确实是 CFT 且版本够」：端口上挂着别的服务或旧版 exe 一律算离线
+    const health = CftTabs.cftHealth(h.httpOk ? h.data : null);
+    out.version = health.version;
+    out.reason = health.reason;
+    if (health.ok) {
       out.softwareOnline = true;
       try {
         const c = await bridgeFetch('/api/archive/config', { timeoutMs: 5000 });
         if (c.httpOk && c.data && c.data.ok) {
-          out.archiveRoot = c.data.archive_root || c.data.download_dir || '';
+          // webui.archive_config 服务端已把 archive_root 回落过 download_dir（webui.py:2916-2919
+          // 与写盘用的 _archive_root() 同规则），archive_root 就是权威落盘根；
+          // download_dir 只是原始下载目录，绝不能再当根目录用。
+          out.archiveRoot = String(c.data.archive_root || '');
+          out.downloadDir = String(c.data.download_dir || '');
         }
       } catch (e) {
         bgLog('warn', '读取软件归档配置失败', e);
       }
+    } else if (health.reason !== 'offline') {
+      bgLog('warn', '端口应答方不可用作 CFT: ' + health.reason + ' ' + health.version);
     }
   } catch (_) {
     // 软件离线：保持 downloads 降级
@@ -191,12 +220,14 @@ async function handleGetArchiveConfig() {
   return out;
 }
 
-// ---- writeFile（通道顺序：软件 POST → downloads data:URL 降级） ----
+// ---- writeFile（通道顺序：软件 POST → downloads data:URL 降级，降级必须可见） ----
 async function trySoftwareWrite(relPath, dataB64) {
+  const rawSize = Math.floor(dataB64.length * 3 / 4);
+  const mb = Math.max(1, Math.ceil(rawSize / 1048576));
   const r = await bridgeFetch('/api/archive/file', {
     method: 'POST',
     body: { rel_path: relPath, data_b64: dataB64 },
-    timeoutMs: 15000,
+    timeoutMs: Math.min(SW_WRITE_TIMEOUT_MAX_MS, SW_WRITE_TIMEOUT_BASE_MS + mb * SW_WRITE_TIMEOUT_PER_MB_MS),
   });
   return !!(r.httpOk && r.data && r.data.ok);
 }
@@ -212,6 +243,7 @@ async function tryDownloadsWrite(relPath, dataB64) {
   });
   return filename;
 }
+const DEGRADED_SOFTWARE_MSG = '软件归档通道写盘失败，本文件改落到浏览器下载目录，归档可能不完整';
 async function handleWriteFile(payload) {
   const p = payload || {};
   const relPath = String(p.relPath || p.rel_path || '');
@@ -222,24 +254,39 @@ async function handleWriteFile(payload) {
     return { ok: false, saved: '', channel: 'downloads', msg: '文件过大（约 ' + (rawSize / 1048576).toFixed(1) + 'MB，超过 32MB 上限）' };
   }
   const cfg = await handleGetArchiveConfig();
-  if (cfg.channel === 'software') {
+  // 软件通道本该可用 → 后面任何 downloads 落盘/放弃都算「降级」，要在响应里显式暴露
+  const degraded = cfg.channel === 'software';
+  if (degraded) {
     try {
       if (await trySoftwareWrite(relPath, dataB64)) {
         return { ok: true, saved: 'software', channel: 'software', msg: '' };
       }
+      invalidateArchiveConfigCache('软件写盘返回失败，缓存的软件通道已不可信');
       bgLog('warn', '软件写盘返回失败，降级 downloads: ' + relPath);
     } catch (e) {
+      invalidateArchiveConfigCache('软件写盘异常，缓存的软件通道已不可信');
       bgLog('warn', '软件写盘异常，降级 downloads: ' + relPath, e);
     }
   }
   if (rawSize > RAW_SIZE_DOWNLOADS_MAX) {
-    return { ok: false, saved: '', channel: cfg.channel, msg: '文件过大且软件未在线（约 ' + (rawSize / 1048576).toFixed(1) + 'MB，降级上限 20MB）' };
+    return {
+      ok: false, saved: '', channel: cfg.channel, degraded,
+      msg: (degraded ? '软件写盘失败，且文件过大无法降级（约 ' : '文件过大且软件未在线（约 ') + (rawSize / 1048576).toFixed(1) + 'MB，降级上限 20MB）',
+      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '（该文件未落任何目录）' : '',
+    };
   }
   try {
-    await tryDownloadsWrite(relPath, dataB64);
-    return { ok: true, saved: 'downloads', channel: 'downloads', msg: '' };
+    const savedName = await tryDownloadsWrite(relPath, dataB64);
+    return {
+      ok: true, saved: 'downloads', channel: 'downloads', msg: '', degraded,
+      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '：' + savedName : '',
+    };
   } catch (e) {
-    return { ok: false, saved: '', channel: 'downloads', msg: '浏览器下载失败: ' + String((e && e.message) || e) };
+    return {
+      ok: false, saved: '', channel: 'downloads', degraded,
+      msg: '浏览器下载失败: ' + String((e && e.message) || e),
+      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '（浏览器下载也失败）' : '',
+    };
   }
 }
 
@@ -320,7 +367,11 @@ async function handleStartArchive(payload, sendResponse) {
     collected = null;
   }
   if (!collected || !collected.modelId) {
-    sendResponse({ ok: false, msg: '请先打开 Civitai 模型页' });
+    // 三种情形分开说，否则「已装扩展但页面早于安装」也会被同一句「请先打开模型页」误导
+    let msg = '请先打开 Civitai 模型页';
+    if (collected) msg = '未能从页面识别出模型 ID，请刷新该页面后重试';
+    else if (CftTabs.modelLink(String(tab.url || ''))) msg = '当前模型页还未接入助手，请刷新该页面后重试';
+    sendResponse({ ok: false, msg });
     return;
   }
   try {
@@ -451,6 +502,10 @@ ext.runtime.onMessage.addListener((msg, sender, respond) => {
           break;
         case 'getArchiveConfig':
           respond(await handleGetArchiveConfig());
+          break;
+        case 'invalidateArchiveConfig': // 用户在 CFT 改了归档目录后由 UI 侧调用，立刻重探活
+          invalidateArchiveConfigCache(String((payload && payload.reason) || '调用方要求失效'));
+          respond({ ok: true });
           break;
         case 'writeFile':
           respond(await handleWriteFile(payload));
