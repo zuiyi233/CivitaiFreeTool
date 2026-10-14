@@ -20,6 +20,31 @@ class AccessTests(unittest.TestCase):
     def test_existing_key_not_validated_or_disclosed_by_gate(self):
         a=self.api('synthetic-key');a.api=Mock();a.dl_enqueue_url=Mock(return_value={'started':True});a._notify_ext_download_started=Mock()
         r=a.dl_submit_url('https://civitai.red/models/1');self.assertTrue(r['ok']);self.assertNotIn('synthetic-key',json.dumps(r));a.dl_enqueue_url.assert_called_once()
+    def test_bridge_call_convention_two_positional_args_with_subdir(self):
+        """browser_bridge 的 /api/download 一律 fn(url, dest_subdir) 两参调用；少一个参数就是整条扩展下载链 500。
+
+        回归 v2.6.30 实测故障：注册从 dl_enqueue_url_sync（两参）换成 dl_submit_url（当时只收一参）后，
+        扩展「发送当前页」与归档的 sendModelToSoftware 全部返回
+        "下载启动失败: Api.dl_submit_url() takes 2 positional arguments but 3 were given"。
+        """
+        import inspect
+        for name in ('dl_submit_url','dl_enqueue_url'):
+            with self.subTest(name=name):
+                params=[p for p in inspect.signature(getattr(webui.Api,name)).parameters.values() if p.name!='self']
+                self.assertGreaterEqual(len(params),2,f'{name} 必须收 (url, dest_subdir)')
+                self.assertTrue(all(p.default is not inspect.Parameter.empty for p in params[1:]),f'{name} 第二个参数必须有默认值（老调用方仍传单参）')
+        a=self.api('synthetic-key');a.api=Mock();a.dl_enqueue_url=Mock(return_value={'started':True});a._notify_ext_download_started=Mock()
+        r=a.dl_submit_url('https://civitai.red/models/1','Demo Model_v1.0')
+        self.assertTrue(r['ok']);a.dl_enqueue_url.assert_called_once_with('https://civitai.red/models/1','Demo Model_v1.0')
+        b=self.api('synthetic-key');b.api=Mock();b._notify_ext_download_started=Mock()
+        with patch.object(webui.Api,'_enqueue_one') as enq:
+            enq.return_value={'url':'u','ok':True,'msg':''}
+            b.dl_enqueue_url('https://civitai.red/models/1','Demo Model_v1.0')
+            for _ in range(200):
+                if enq.call_args:break
+                time.sleep(.01)
+            self.assertTrue(enq.call_args,f'后台入队未执行，dest_subdir 无从透传')
+            self.assertEqual(enq.call_args.kwargs.get('dest_subdir'),'Demo Model_v1.0')
     def wait(self,a):
         for _ in range(100):
             if not a._rp_state['running']:return

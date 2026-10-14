@@ -4,8 +4,10 @@
 设计要点
 - 仅绑定 127.0.0.1，外部网络不可达；
 - CORS 白名单：只允许 chrome-extension://* 与本机页面（file://、null、127.0.0.1/localhost）；
-- POST /api/download：校验 URL 后调用注册的下载 handler（webui.Api.dl_enqueue_url，
+- POST /api/download：校验 URL 后调用注册的下载 handler（webui.Api.dl_submit_url，
   解析并入队下载均为后台线程，handler 同步快速返回）；
+  **handler 一律按 (url, dest_subdir) 两参调用**——归档桥的 sendModelToSoftware 靠第二个参数
+  把模型文件落进 <归档根>/<目录名>/，注册进来的方法必须收得住这两个参数。
 - POST /api/rpc：浏览器模式下的通用方法调用（前端 shim 把 window.pywebview.api.xxx 映射到这里）；
 - GET /、/app.js 等：浏览器模式下直接由本服务提供 web/ 目录里的界面文件；
 - GET /api/heartbeat：页面心跳（用于「关页面即退出」）；
@@ -212,7 +214,7 @@ def set_ui_state(**kw):
 
 
 def set_download_handler(fn):
-    """注册下载入口：webui.Api 启动时把 dl_enqueue_url 注册进来"""
+    """注册下载入口：webui.Api 启动时把 dl_submit_url 注册进来（必须接受 (url, dest_subdir) 两参）"""
     global _handler
     _handler = fn
 

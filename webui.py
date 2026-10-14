@@ -2867,13 +2867,13 @@ class Api:
         return item
 
     @requires_civitai_key("dict")
-    def dl_enqueue_url(self, url):
+    def dl_enqueue_url(self, url, dest_subdir=""):
         """强制解析单条 URL 并入队（忽略付费状态，用于「仍要下载」，后台执行）"""
         state = {"running": True, "total": 1, "done": 0, "items": [], "finished": False}
         self._parse_state = state
 
         def work():
-            item = self._enqueue_one(url)
+            item = self._enqueue_one(url, dest_subdir=dest_subdir)
             state["items"].append(item)
             state["done"] += 1
             state["finished"] = True
@@ -2890,11 +2890,15 @@ class Api:
         return item
 
     @requires_civitai_key("dict")
-    def dl_submit_url(self, url):
-        """Extension bridge acknowledges submission immediately; selection continues in CFT."""
+    def dl_submit_url(self, url, dest_subdir=""):
+        """Extension bridge acknowledges submission immediately; selection continues in CFT.
+
+        dest_subdir 必须留着：browser_bridge 的 /api/download 一律按 (url, dest_subdir) 两参调用
+        本方法（归档桥的 sendModelToSoftware 靠它把模型文件落进 <归档根>/<目录名>/）。
+        """
         try: self.api.resolve_url(url)
         except Exception: return {"ok": False, "msg": "不是有效的 Civitai 模型链接"}
-        result = self.dl_enqueue_url(url)
+        result = self.dl_enqueue_url(url, dest_subdir)
         if result.get("started"): self._notify_ext_download_started()
         return {"ok": bool(result.get("started")), "started": bool(result.get("started")),
                 "msg": "已提交解析，请在 CivitaiFreeTool 下载管理选择文件或查看结果"}
