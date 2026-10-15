@@ -59,10 +59,110 @@ chrome-extension/
 | content → offscreen | `archiveConfirm` | `{proceed}` | P3 |
 | content → offscreen | `domComments` | `{cid, results:[...]}`（同上结构；offscreen 并入 trpc 结果走统一 formatter） | P2 |
 | content → bg | `saveSingleImage` | `{imageId, originalUrl, ext}` → `{ok}` | P3 |
-| offscreen → content | `savedImageDone` | `{ok, imageId}`（bg 经 tabs.sendMessage 广播到所有 images/posts 页，刷新徽章 SAVED） | P3 |
+| offscreen → content | `savedImageDone` | `{ok, imageId}`（bg 经 tabs.sendMessage 广播到所有 images/posts 页，刷新徽章 SAVED） |
+| offscreen → content | `pageFetch` | `{url, timeoutMs}`（cid 由 askContent 注入）→ content 在页面里**同源代发** GET，见 §2.1 |
+| content → offscreen | `pageFetchResult` | `{cid, ok, status, body, err, truncated}`（sendResponse + runtime 广播双路，resolveCid 先到先得） |
+| popup → bg | `invalidateArchiveConfig` | → `{ok}`（软件离线或归档目录变化后，丢弃 getArchiveConfig 的缓存通道判定） | P3 |
 
 注意：content 页面可能被刷新/关闭，offscreen 对 content 的每个"请求-答复"消息都要有
 超时兜底（15s），超时按用户取消处理。
+
+### 2.1 页面数据通道（pageFetch）与传输层
+
+为什么必须有：油猴脚本时代所有 C 站数据请求都发生在页面里（同源，浏览器自动带登录 Cookie）。
+移植到 offscreen 后源变成 `chrome-extension://`、请求变匿名，站点就不给受限数据了：tRPC 一律
+401 `Please use the public API instead`，公开 API 则是 200 + 空结果（实测匿名
+`GET /api/v1/images?imageId=145676405&withMeta=true` → `{"items":[],"metadata":{}}`，同结构的
+SFW 图 145676249 有完整 meta）。**丢的是登录上下文，不是接口**，所以主通道改回页面。
+
+【2026-10-16 更正，两条结论都要带上】
+1. 用户的 **API Key 是可以过 tRPC 认证的**：`Authorization: Bearer <key>` 打
+   `/api/trpc/commentv2.getInfinite` / `resourceReview.getPaged`，匿名 401 → 带 Key 200，
+   且返回真实数据（模型 2989579 版本 3389879 实测 `items=50 totalItems=67 totalPages=2`）。
+   所以**桌面端不必依赖浏览器**：有 Key 就能自己取评论/评价（见 §2.3）。页面通道是给
+   「没有 Key」或「Key 没有相应 scope」时的兜底，不是唯一通路。
+2. 公开 API 的空结果不只是匿名造成的：`/api/v1/images` 的
+   `browsingLevel ?? nsfw ?? publicBrowsingLevelsFlag`（官方 `src/pages/api/v1/images/index.ts:218`）
+   **对带 Key 的请求同样默认只放行 PG**。实测 `imageId=145676405`（Soft）带 Key 不传
+   browsingLevel → `items:[]`；加 `browsingLevel=31` → `items=1`。位掩码
+   `NsfwLevel{PG=1,PG13=2,R=4,X=8,XXX=16}`，全放行即 31。区域受限时服务端会强制降回 SFW，
+   这是账号/地区策略，不是参数能越过的——产物文本要按实际返回说话。
+
+- 唯一出口：`lib/civitai-api.js` 的 `requestData(url, opts)`，所有**数据类**请求都走它，
+  它也是唯一决定 transport 的地方。二进制媒体（封面/配图/模型文件）仍走 `fetchJson`——
+  页面通道只回文本且有 3MB 上限，不适合媒体。
+- 装/拆：offscreen 用 `CFT.api.setFetcher(makePageFetcher(scope))` 在任务开始时安装，
+  `withPageTransport(entries, label, fn)` 在 `finally` 还原；引用计数 + 共享 scope，
+  批量并发 5 个 item 时不会互相踩掉别人的 fetcher。
+- 选标签页：`ptPickTab` 按「页面 URL 精确匹配 → 同 host → 无 host 信息」三级挑，
+  **绝不跨站借页面**（civitai.red 上的模型在 civitai.com 可能 404，借错页面会把 404 读成
+  "这个模型没有评论"）。
+- 白名单（content 侧 `pageFetchRejectReason`）：`https:` + host 属于
+  `civitai.com|civitai.red`（含 `www.`）+ path 前缀 `/api/v1/` 或 `/api/trpc/`，
+  `credentials:'same-origin'`，响应文本 ≤3MB，超限 `truncated:true` 且调用方按失败处理。
+- 超时：`timeoutMs` 由调用方给（默认 `FETCH_TIMEOUT_MS=15000`），content 用它做 abort；
+  offscreen 等 `timeoutMs + PT_REPLY_SLACK_MS(3000)`。content 侧默认 20000 仅在调用方没传时兜底。
+- 短路：同一个 tab 一次不应答就进 `scope.dead`，本任务内不再向它发请求——否则批量 110 页时
+  每组候选入参都要各等一轮超时。
+- 401 熔断按 `procedure + transport` 分路记录（`page` / `direct`）：匿名直连看到的 401
+  不得判死带登录态的页面通道，反之亦然。
+- 回落与文案：页面通道「抛错 / ok:false / 被截断」才回落直连（直连用 `credentials:'include'`，
+  被「通配 ACAO + 凭据」规则拦下时自动降级 `credentials:'omit'` 重试一次，最坏等于改造前行为）。
+  产物文本要写清当次实际通道；"匿名直连拿到 0 条"不能写成"这个模型没有评论"。
+
+### 2.2 C 站内部接口的实测入参/出参（2026-10-16 复测）
+
+请求形态：`GET <base>/api/trpc/<procedure>?input=<urlencoded {"json":{...}}>`，带
+`Sec-Fetch-Site: same-origin` + `Origin` + `Referer` 时**不再 401，而是正常 200/400**，
+所以下面是真实 wire 契约；权威定义另见官方开源仓库 `civitai/civitai`（public, main）的
+`src/server/schema/commentv2.schema.ts`、`src/server/schema/resourceReview.schema.ts`、
+`src/server/services/commentsv2.service.ts`。
+
+`commentv2.getInfinite`（评论）
+- `entityType` **必须小写**：`'model'`。传 `'Model'` → 400 `invalid_value`（合法值含
+  `question/answer/image/post/model/comment/review/article/bounty/bountyEntry/challenge/comicChapter/model3d/model3dReview`）。
+- `entityId` 必填 number（传 `{modelId}` → 400 `path:["entityId"] expected number received undefined`）。
+- `cursor` 只能省略或给 number：**第一页不能带 `cursor:null`** → 400 `expected number, received null`。
+- `sort` ∈ `Newest | Oldest | Most Reactions`（默认 Oldest）；`limit` 1..100（默认 20）。
+- `repliesDepth`（0..20）**必须显式给**，否则回复一条都拿不到：服务层 `depth < 1` 直接
+  `return {threads:[], childlessCommentIds:[]}`。`repliesLimit` 1..50。
+- `authed: true` 不在 schema 里，zod 静默丢弃——旧脚本里那几组 `authed` 候选是玄学。
+- 出参 `result.data.json`：`null` 表示该模型没有 Thread 行（= 真的没有评论区，不是抓取失败）；
+  否则 `{comments, nextCursor, targetComment, replyThreads, childlessCommentIds}`。
+  评论节点字段 `id/createdAt/content/nsfw/hidden/threadId/pinnedAt/reactionCount/user/reactions`，
+  **没有 `children`**；回复在 `replyThreads[]`，每项
+  `{id, commentId, depth, commentCount, comments:[...], nextCursor?}`，`commentId` 是父评论 id。
+  翻页用 `nextCursor`（number），为 null 即到底。
+
+`resourceReview.getPaged`（评价）
+- `modelId` **必填**；`modelVersionId` 是可选过滤（只传 `modelVersionId` → 400
+  `path:["modelId"] expected number received undefined`）。归档单个版本时两者一起传。
+- 分页字段是 **`page`** 不是 `cursor`（`paginationSchema = {limit, page}`；传 `cursor`
+  被静默忽略，于是循环永远停在第 1 页）。出参
+  `{items, totalItems, currentPage, pageSize, totalPages}`，按 `currentPage >= totalPages` 收。
+- **`modelVersionId` 在 schema 里是 optional，但实测必须一起传**：同一 Key 下
+  `{modelId:2989579}` → `items=0 total=0`，`{modelId:2989579, modelVersionId:3389879}` →
+  `items=50 total=67`。只按 modelId 查会拿到"成功的空结果"，别把它当成该版本没有评价。
+- 条目含 `rating`、`details`（正文）、`user`、`nsfw`、`metadata`、`thread{commentCount}`、
+  `modelVersion{id,name,baseModel}`。
+
+匿名形态（影响文案，不能忽略）：实测 most-downloaded 前四模型（4201/4384/133005/43331）匿名请求
+这两个 procedure 全部 **200 但数据为空**。匿名不会报错，只会"成功地拿到 0 条"，所以
+`0 条 + direct 通道` 的文案不能写成"这个模型没有评论/评价"。
+
+### 2.3 桌面端取评论/评价（Python，`civitai_api.py`，本 fork 新增）
+
+- 认证：`Authorization: Bearer <api_key>`，走 `build_opener`；`_NoAuthRedirect`
+  （civitai_api.py:28）会在 307 预签名重定向时剥掉 Authorization，别绕过它把 Key 带进 CDN。
+- 评价：`resourceReview.getPaged {modelId, modelVersionId, limit≤50, page}` 逐页取到
+  `currentPage >= totalPages`；正文在 `details`，另有 `rating/recommended/quality/createdAt/user`。
+- 评论：`commentv2.getInfinite {entityType:'model', entityId, sort:'Newest', limit, repliesDepth}`，
+  第一页不带 cursor，用 `nextCursor`(number) 续页；`json:null` = 该实体没有评论区（不是失败）；
+  回复在 `replyThreads[]`，父评论 id 是 `commentId`。实测 `stats.commentCount` 与 v2 线程不一致
+  （模型 2989579 报 5，但 `entityType:'model'` 返回 null、67 条评价的 `commentCount` 全为 0），
+  所以按实体逐个尝试、空就如实记空，不要把它当抓取失败。
+- 产物：`评论.txt`（与扩展侧同名，扩展写在 `offscreen/archive-worker.js:909`），文本里标条数与来源；
+  无 Key / 401 / 限流一律跳过，**不许影响下载主流程**。
 
 ## 3. 写盘通道（background 统一实现，offscreen 只发 writeFile）
 
