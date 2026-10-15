@@ -146,9 +146,25 @@ SFW 图 145676249 有完整 meta）。**丢的是登录上下文，不是接口*
 - 条目含 `rating`、`details`（正文）、`user`、`nsfw`、`metadata`、`thread{commentCount}`、
   `modelVersion{id,name,baseModel}`。
 
-匿名形态（影响文案，不能忽略）：实测 most-downloaded 前四模型（4201/4384/133005/43331）匿名请求
-这两个 procedure 全部 **200 但数据为空**。匿名不会报错，只会"成功地拿到 0 条"，所以
-`0 条 + direct 通道` 的文案不能写成"这个模型没有评论/评价"。
+三种请求形态实测对照（同一 procedure、同一模型 2989579 / 版本 3389879，2026-10-16 复测）：
+
+| 请求形态 | `resourceReview.getPaged`（两 ID 同传） | `commentv2.getInfinite`（entityType=model） |
+| --- | --- | --- |
+| 裸 GET（无浏览器头、无 Key） | **401** `Please use the public API instead` | **401** |
+| 带 `Sec-Fetch-Site: same-origin` + `Origin` + `Referer`，无 Cookie | **200 + 67 条真实评价** | 200，但 `comments:[]` |
+| 带 `Authorization: Bearer <API Key>`，无浏览器头 | **200 + 67 条真实评价** | 200，该模型 `json:null`（无 Thread 行） |
+
+结论要分开说，别混成"接口关了"：
+- **评价不需要登录态**——只要有请求上下文（浏览器同源）或带 Key 就给真数据。之前记成"匿名拿到空"
+  是因为只传了 `modelId` 没传 `modelVersionId`，那是**假空**（200 + `totalItems:0`）。
+- **评论需要真会话**：带同源头但无 Cookie 仍 `comments:[]`；这条只能靠页面通道（用户已登录的标签页）
+  或用户自己的 Key。
+- `resourceReview.getInfinite` 三种入参都返回 200 但 `items:[]`（同一版本 `getPaged` 有 67 条），
+  **不能当评价的主通道**，只能在版本级一条都没落地时兜底，且要标明它是模型级、只含写了文字的评价。
+- 桌面端**不要靠伪造 `Sec-Fetch-*` 绕过** 401：那是绕过站点"请用公开 API"的门禁。带用户自己的
+  API Key 是官方 token 路径（`commentv2Router.getInfinite` 的 `.meta({requiredScope: TokenScope.MediaRead})`
+  说明 tRPC 本来就认 token），也是扩展与桌面端共用的正当口径。
+- 匿名请求"成功的空"和"真的没有"必须靠通道 + 参数区分，产物文案不能把前者写成"该模型没有评论/评价"。
 
 ### 2.3 桌面端取评论/评价（Python，`civitai_api.py`，本 fork 新增）
 
