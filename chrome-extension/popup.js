@@ -222,13 +222,17 @@ function stopPolling() {
 const ARCH_PHASE_TEXT = { prepare: '阶段 1/3：解析模型并批量提交文件到 CFT 下载…', media: '阶段 2/3：逐页归档封面/配图/提示词…', comments: '阶段 3/3：统一抓取评论与评价…', done: '批量归档完成' };
 function renderArchBatch(s) {
   const panel = $('archBatchPanel');
-  if (!s || (!s.running && s.total === 0)) { panel.hidden = true; archRunning = !!(s && s.running); if (!archRunning) stopArchPolling(); return; }
+  // 拿不到状态、或拿到的是错误信封（{ok:false,msg} / {ok:true,started}）时，total 是 undefined：
+  // 那种情况就是"当前没有批次"，面板必须收起。以前只判 total===0，于是这些回复会被渲染成
+  // "共 undefined 页 · 完成 0 · 跳过(已归档) 0"，把一次通信故障显示成了用户的归档结果。
+  const total = Number(s && s.total);
+  if (!s || !Number.isFinite(total) || (!s.running && total === 0)) { panel.hidden = true; archRunning = !!(s && s.running); if (!archRunning) stopArchPolling(); return; }
   panel.hidden = false;
   $('archPhase').textContent = ARCH_PHASE_TEXT[s.phase] || s.phase || '';
   const done = (s.results || []).filter(r => ['done','skip','failed'].includes(r.status)).length;
   $('archProgress').textContent = s.running
-    ? `进度 ${done}/${s.total}` + (s.current ? ` · 当前：${s.current}` : '')
-    : `共 ${s.total} 页：完成 ${(s.results||[]).filter(r=>r.status==='done').length} · 跳过(已归档) ${s.skipped||0} · 失败 ${s.failed||0}`;
+    ? `进度 ${done}/${total}` + (s.current ? ` · 当前：${s.current}` : '')
+    : `共 ${total} 页：完成 ${(s.results||[]).filter(r=>r.status==='done').length} · 跳过(已归档) ${s.skipped||0} · 失败 ${s.failed||0}`;
   const auto = (s.results || []).filter(r => r.autoChosenFile);
   $('archCounts').textContent = auto.length ? `多文件版本已自动选择主文件 ${auto.length} 页（其他精度可在 CFT 中单独下载）` : '';
   $('archAuto').replaceChildren();
