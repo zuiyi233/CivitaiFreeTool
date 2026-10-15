@@ -317,10 +317,37 @@ async function fetchMediaB64(url) {
   return arrayBufferToB64(await fetchArrayBuffer(url));
 }
 
-async function writeFileToBg(dirName, fileName, dataB64) {
-  const res = await sendBg('writeFile', { relPath: dirName + '/' + fileName, dataB64, overwrite: true });
+// 附属文件（封面/配图/提示词/example.json/评论）统一写盘入口。
+// route（可选，来自 bag 或批量行的 {bundle, destDir, routed}）里有 bundle 时走**新 bundle 通道**：
+// 只传纯文件名 + 令牌，目录由桌面端解析令牌决定，于是附属文件必然和模型本体落在同一个目录里。
+// 没有 bundle（老桌面端 / 桌面端判定不分流）时，请求体与改动前逐字一致（relPath = dirName + '/' + 文件名），
+// 行为完全不变 —— 老桌面端不认 bundle 字段，砍掉这条兼容分支就等于让所有人的归档都降级到浏览器下载目录。
+// relPath 在 bundle 形态下也照样带上：bg 侧软件写盘失败会降级到浏览器下载目录，降级落点需要这个名字。
+async function writeFileToBg(dirName, fileName, dataB64, route) {
+  const r = route || {};
+  const relPath = dirName ? (dirName + '/' + fileName) : fileName;
+  const payload = { relPath, dataB64, overwrite: true };
+  if (r.bundle) { payload.bundle = r.bundle; payload.filename = fileName; }
+  const res = await sendBg('writeFile', payload);
   if (!res || res.ok !== true) throw new Error((res && res.msg) || 'writeFile 失败');
+  // 降级绝不静默：落到浏览器下载目录的文件不会跟模型进同一个目录，必须进 errors 让人看见
+  if (res.degradedMsg && Array.isArray(r.errors)) {
+    r.errors.push('[write:' + String(fileName) + '] ' + res.degradedMsg);
+  }
   return res;
+}
+
+// 本次归档的写入通道描述（bag → writeFileToBg 第 4 参）。
+// 单页/批量的 bag 结构不同（批量行是 res.bundle/res.dirName），统一在这里收敛一次，
+// 免得每个附属文件写入点各自判断"这次到底有没有 bundle"。
+function writeRouteOf(bag) {
+  const b = bag || {};
+  const r = b.route || {};
+  return {
+    bundle: String(r.bundle || b.bundle || ''),
+    destDir: String(r.destDir || b.destDir || ''),
+    errors: Array.isArray(b.errors) ? b.errors : null,
+  };
 }
 
 // ---- 纯逻辑（脚本同语义，可单测） ----
@@ -588,7 +615,8 @@ function countDomCommentLines(commentsText) {
 // opts.batch=true：批量归档媒体阶段调用（契约 8.2）——
 //   短路点：复用 payload.modelData 免重复 fetchModel；跳过 askArchiveConfirm / askFileSelection；
 //   移除逐页 notifyArchiveDone（由批量结束统一重扫）；opts.skipComments 跳过 评论.txt（由批量阶段三统一写）。
-//   返回 {ok, msg, dirName, errors}（单页流程原不取返回值，行为不变）。
+//   返回 {ok, msg, dirName, destDir, routed, errors}（destDir/routed 是桌面端回传的真实落点，
+//   未分流时分别 ''/false；单页流程原不取返回值，行为不变）。
 // payload.dataTabId：只用于「数据请求借哪个标签页发」（页面通道），与 payload.tabId（弹窗/进度/DOM
 // 兜底等 UI 通道）分开——批量里每个 item 都有自己的 tabId 可以借道拿登录态数据，但绝不该因此
 // 给用户的页面弹进度或"归档完成"（契约 8.2：批量阶段无 content 交互）。
@@ -612,15 +640,22 @@ async function runArchiveCore(p, opts) {
   const tabId = p.tabId;
   const errors = [];
   let dirName = '';
+  // 真实落点由桌面端决定（模型按类型分流后目录不再是 <归档根>/<dirName>），这里只承接、不计算：
+  //   bundle   = 附属文件写入令牌（拿到后本次归档全部走 bundle 通道）
+  //   destDir  = 人类可读绝对落点（只用于展示与历史记录，绝不参与拼路径）
+  //   routed   = 桌面端是否真的分流了
+  // 可变对象由 done() 闭包与 runArchiveVersion 共用，所以**不改动 dirName 的语义**：
+  // dirName 仍是本次归档的目录名（历史/archive_done/相对写盘都靠它），destDir 是它现在的完整位置。
+  const route = { bundle: '', destDir: '', routed: false };
   let finished = false;
   let lastResult = null;
   const done = (ok, msg) => {
     if (finished) return;
     finished = true;
-    lastResult = { ok, msg, dirName, errors };
-    clog(ok ? 'info' : 'error', '归档结束: ' + msg, null, { modelId, modelVersionId, dirName });
+    lastResult = { ok, msg, dirName, destDir: route.destDir, routed: route.routed, errors };
+    clog(ok ? 'info' : 'error', '归档结束: ' + msg, null, { modelId, modelVersionId, dirName, destDir: route.destDir });
     reportProgress(tabId, 100, msg, ok ? 'info' : 'error');
-    notifyDone(tabId, { ok, dirName, msg, errors });
+    notifyDone(tabId, { ok, dirName, destDir: route.destDir, msg, errors });
   };
   if (!modelId) { done(false, '缺少模型ID'); return lastResult; }
   let cfg = CFT.config.get();
@@ -703,6 +738,11 @@ async function runArchiveCore(p, opts) {
     } else {
       dirName = archiveDirName(modelName, modelVer, modelVersionId);
     }
+    // 批量：模型本体已在 prepare 阶段提交，落点三件套（bundle/destDir/routed）随 payload 带过来，
+    // 媒体阶段直接复用同一个令牌写附属文件。单页不在这里赋值 —— 由 runArchiveVersion 现场提交后填。
+    if (p.bundle) route.bundle = String(p.bundle);
+    if (p.destDir) route.destDir = String(p.destDir);
+    if (p.routed === true) route.routed = true;
     // raw 仅做封面/配图文件名前缀（保持脚本原语义），目录名统一走 archiveDirName
     const raw = CFT.util.sanitizeFilename(modelNameVer).trim() || ('model_' + (modelVersionId || Date.now()));
     clog('info', '归档开始', null, { modelId, modelVersionId, dirName, modelFile });
@@ -710,7 +750,7 @@ async function runArchiveCore(p, opts) {
     await runArchiveVersion({
       modelId, modelVersionId, modelName, modelVer, modelTypeName, modelFile,
       verItem, files, raw, dirName, aboutText, pageUrl, tabId, cfg, errors, done, modelData,
-      isBatch, batchSkipComments: skipComments,
+      isBatch, batchSkipComments: skipComments, route,
     });
   } catch (e) {
     clog('error', '归档流程异常', e, { modelId });
@@ -748,6 +788,14 @@ async function runArchiveVersion(bag) {
     const overall = bag.totalUnits > 0 ? ((st.completed + v) / bag.totalUnits) * 100 : 0;
     reportProgress(bag.tabId, overall, text || '处理中', 'info');
   };
+  // 模型本体必须先提交、先拿落点，再写任何附属文件。
+  // 为什么不能继续丢进调度器排队：桌面端把模型按类型分流到 <ComfyUI>\models\<类型>\<模型名>\ 之后，
+  // 真实目录只有桌面端知道，而它是通过 /api/download 的响应（bundle 令牌）交出来的。旧写法让
+  // 封面/配图/提示词与"提交模型"并发：附属文件在还没拿到 bundle 时就已经按 relPath 写进
+  // <归档根>/<dirName>/，于是本体在 ComfyUI 目录、图片与提示词留在归档根 —— 同一个模型裂成两半。
+  // /api/download 是「提交即返回」，同步等它不会多等一个文件下载的时间。
+  // 失败仍交给下面 type:'model' 的调度器任务抛出（见 submitModelFile），诚实判定不变。
+  const modelSubmit = await submitModelFile(bag, sendModel);
   const scheduler = CFT.scheduler.createDownloadScheduler({
     order: ['model', 'video', 'image', 'other'],
     concurrencyByType: { model: 1, video: 2, image: 3, other: 2 },
@@ -765,7 +813,7 @@ async function runArchiveVersion(bag) {
     },
   });
   bag.scheduler = scheduler;
-  enqueueModelTask(bag, sendModel);
+  enqueueModelTask(bag, modelSubmit);
   enqueueCoverTask(bag);
   enqueueMediaTasks(bag);
   // 附属文本文件失败不致命：此时调度器已在写同一目录，若异常冒泡到 runArchive 的 catch，
@@ -795,30 +843,71 @@ async function runArchiveVersion(bag) {
   await finishArchiveSuccess(bag);
 }
 
-// 模型文件任务最先入队（OPT-06）
-function enqueueModelTask(bag, sendModel) {
-  if (sendModel && bag.modelFile) {
-    // 下载用户实际选中的那个文件（按名匹配，与 askFileSelection/prepare 的 modelFile 同源）；
-    // 名字没匹配上才回落 primary/首个。命中名字但无下载地址时不替换成别的文件，直接跳过。
-    const chosenFile = bag.files.find((f) => f && f.name === bag.modelFile)
-      || bag.files.find((f) => f && f.primary === true) || bag.files[0];
-    if (chosenFile && chosenFile.downloadUrl) {
-      bag.scheduler.enqueue({
-        type: 'model', media: false,
-        run: async () => {
-          bag.setP(0, '发送模型文件到软件: ' + bag.modelFile);
-          const res = await sendBg('sendModelToSoftware', { downloadUrl: chosenFile.downloadUrl, pageUrl: bag.pageUrl, destSubdir: bag.dirName });
-          if (!res || res.ok !== true) throw new Error((res && res.msg) || '软件下载通道失败');
-          bag.setP(1, '模型文件已发送');
-        },
-      });
-      return;
-    }
+// 主模型文件选取：下载用户实际选中的那个文件（按名匹配，与 askFileSelection/prepare 的 modelFile
+// 同源）；名字没匹配上才回落 primary/首个。命中名字但无下载地址时不替换成别的文件，直接跳过。
+function pickModelFileForSend(bag) {
+  const files = Array.isArray(bag.files) ? bag.files : [];
+  const chosenFile = files.find((f) => f && f.name === bag.modelFile)
+    || files.find((f) => f && f.primary === true) || files[0];
+  return (chosenFile && chosenFile.downloadUrl) ? chosenFile : null;
+}
+
+// 把桌面端回传的落点三件套写进 bag.route（不新增语义、不改 dirName）：
+// bundle 只用来选写入通道，destDir 只用来展示/记历史，扩展绝不按它拼路径。
+function applySoftwareRoute(bag, res) {
+  const r = res || {};
+  const route = bag.route || (bag.route = { bundle: '', destDir: '', routed: false });
+  if (typeof r.bundle === 'string') route.bundle = r.bundle;
+  if (typeof r.destDir === 'string' && r.destDir) route.destDir = r.destDir;
+  if (r.routed === true) route.routed = true;
+  return route;
+}
+
+// 提交模型本体并拿回落点令牌（必须在附属文件写入之前完成，理由见 runArchiveVersion）。
+// 返回 { sent, error }：error 不在这里抛，交给 type:'model' 的调度器任务抛，
+// 这样 stats.byType.model.fail 与「模型文件失败绝不记成功」的诚实判定（runArchiveVersion 末尾）
+// 与改动前完全一致，绝不会因为改成"先同步提交"就把失败吞掉。
+async function submitModelFile(bag, sendModel) {
+  // 批量：prepare 阶段已提交，落点随 payload 带过来了，此处不重复发送
+  if (!sendModel || bag.isBatch) return { sent: false, error: null };
+  if (!bag.modelFile) return { sent: false, error: null };
+  const chosenFile = pickModelFileForSend(bag);
+  if (!chosenFile) {
     clog('warn', '模型文件无下载地址，已跳过（进度计入）', null, { modelFile: bag.modelFile });
-    bag.st.completed += 1;
+    return { sent: false, error: null };
+  }
+  bag.setP(0, '发送模型文件到软件: ' + bag.modelFile);
+  try {
+    const res = await sendBg('sendModelToSoftware', {
+      downloadUrl: chosenFile.downloadUrl, pageUrl: bag.pageUrl, destSubdir: bag.dirName,
+    });
+    if (!res || res.ok !== true) {
+      return { sent: false, error: new Error((res && res.msg) || '软件下载通道失败') };
+    }
+    const route = applySoftwareRoute(bag, res);
+    bag.setP(1, route.bundle ? '模型文件已发送（附属文件将写入同一目录）' : '模型文件已发送');
+    clog('info', '模型已提交，落点: ' + (route.destDir || '（桌面端未回传 dest_dir）')
+      + (route.bundle ? '（bundle 通道已启用）' : '（无 bundle，附属文件按 destSubdir 旧通道写入）'), null,
+      { modelId: bag.modelId, dirName: bag.dirName, routed: route.routed });
+    return { sent: true, error: null };
+  } catch (e) {
+    return { sent: false, error: (e instanceof Error) ? e : new Error(String(e)) };
+  }
+}
+
+// 模型文件任务（OPT-06：模型最先入队）。实际提交已由 submitModelFile 同步完成，这里只把结果
+// 计入调度器：失败必须以 type:'model' 抛错（进 errors + byType.model.fail + st.modelError），
+// 成功/未开启/无文件则只补进度单位，绝不重复提交。
+function enqueueModelTask(bag, modelSubmit) {
+  const s = modelSubmit || {};
+  if (s.error) {
+    bag.scheduler.enqueue({
+      type: 'model', media: false,
+      run: async () => { throw s.error; },
+    });
     return;
   }
-  bag.st.completed += 1; // 未开启或无文件时补进度单位，避免卡进度
+  bag.st.completed += 1; // 已发送 / 未开启 / 无文件时补进度单位，避免卡进度
 }
 
 // 封面任务（脚本 2402-2429 回退链：coverFallbackItems × getCivitaiImageUrlCandidates）
@@ -840,7 +929,7 @@ function enqueueCoverTask(bag) {
         for (const u of U.getCivitaiImageUrlCandidates(item.url)) {
           try {
             const b64 = await fetchMediaB64(u);
-            await writeFileToBg(bag.dirName, fileName, b64);
+            await writeFileToBg(bag.dirName, fileName, b64, writeRouteOf(bag));
             lastErr = null;
             break;
           } catch (e) { lastErr = e; }
@@ -869,7 +958,7 @@ function enqueueMediaTasks(bag) {
         bag.setP(0, '下载配图' + n);
         const name = U.safeFsName(U.buildMediaFilenameFromUrl(item.url, bag.raw + '_' + Date.now() + '_' + n, mExt));
         const b64 = await fetchMediaB64(item.url);
-        await writeFileToBg(bag.dirName, name, b64);
+        await writeFileToBg(bag.dirName, name, b64, writeRouteOf(bag));
         bag.setP(1, '配图' + n + '已写入');
       },
     });
@@ -899,7 +988,7 @@ async function writeInfoText(bag) {
   if (bag.promptGapNote) modelInfoJson['examplePromptNote'] = bag.promptGapNote;
   bag.setP(0, '写入模型信息');
   await writeFileToBg(bag.dirName, U.safeFsName(bag.modelName + '.txt'),
-    utf8ToB64(U.flattenObjectToPlainTextWithHtmlHandling(modelInfoJson)));
+    utf8ToB64(U.flattenObjectToPlainTextWithHtmlHandling(modelInfoJson)), writeRouteOf(bag));
   bag.st.completed += 1;
 }
 
@@ -907,7 +996,7 @@ async function writeInfoText(bag) {
 async function writeExampleJson(bag) {
   bag.setP(0, '写入 example.json');
   const payload = buildExamplePayload(bag.verItem.trainedWords, bag.promptList);
-  await writeFileToBg(bag.dirName, 'example.json', utf8ToB64(JSON.stringify(payload, null, 2)));
+  await writeFileToBg(bag.dirName, 'example.json', utf8ToB64(JSON.stringify(payload, null, 2)), writeRouteOf(bag));
   bag.st.completed += 1;
 }
 
@@ -947,7 +1036,7 @@ async function writeCommentsFile(bag) {
       let text = '';
       if (commentsText) text += commentsText;
       if (reviewsText) text += '\n\n' + reviewsText;
-      await writeFileToBg(bag.dirName, '评论.txt', utf8ToB64(text));
+      await writeFileToBg(bag.dirName, '评论.txt', utf8ToB64(text), writeRouteOf(bag));
     } catch (e) {
       clog('warn', '评论写入失败(已跳过)', e);
       bag.errors.push('[comments] 写入失败: ' + ((e && e.message) || e));
@@ -957,6 +1046,7 @@ async function writeCommentsFile(bag) {
 }
 
 async function finishArchiveSuccess(bag) {
+  const route = bag.route || {};
   const picCount = bag.authImages.filter((m) => m && m.type === 'image').length;
   const videoCount = bag.authImages.filter((m) => m && m.type === 'video').length;
   const record = {
@@ -966,7 +1056,12 @@ async function finishArchiveSuccess(bag) {
     modelVer: bag.modelVer || '',
     modelType: bag.modelTypeName,
     modelUrl: bag.pageUrl,
+    // dirName 语义不变（本次归档的目录名 = 分流后的叶子目录）；destDir 记录桌面端回传的
+    // 真实绝对落点，历史记录/镜像 JSON 里由此能回答"这次到底写到哪了"。老记录没这个字段，
+    // 读取方一律按 '' 处理，不做任何路径推导。
     dirName: bag.dirName,
+    destDir: route.destDir || '',
+    routed: route.routed === true,
     archiveTime: new Date().toISOString(),
     modelFile: bag.modelFile || '',
     commentCount: bag.st.commentCount,
@@ -996,7 +1091,8 @@ async function finishArchiveSuccess(bag) {
     catch (e) { clog('warn', '通知重扫失败(尽力而为)', e); }
   }
   const failNote = bag.st.mediaFail > 0 ? '（' + bag.st.mediaFail + ' 个媒体失败）' : '';
-  bag.done(true, '归档完成：' + bag.dirName + failNote);
+  // 完成消息优先报真实落点（分流后 destDir 才是用户要找的路径），老桌面端没有 destDir 时报 dirName
+  bag.done(true, '归档完成：' + (route.destDir || bag.dirName) + failNote);
 }
 
 // ---- 单图流程（P3，适配脚本 downloadSingleImage 2694-2800） ----
@@ -1123,7 +1219,9 @@ async function runSingleImageCore(p) {
 
 // ---- 批量归档状态机（契约 8.2；模块级 batch，与单页 _running 互斥） ----
 // batch = { jobId, cancel, phase, total, results[], errors[], current }
-// results 项：{tabId,url,modelId,modelVersionId,status,dirName,autoChosenFile?,msg?}
+// results 项：{tabId,url,modelId,modelVersionId,status,dirName,bundle?,destDir?,routed?,autoChosenFile?,msg?}
+//   bundle/destDir/routed 由 prepare 阶段从 /api/download 响应里取（老桌面端没有 → 空/false），
+//   媒体与评论阶段用它把附属文件写进模型本体所在目录；dirName 语义不变，仍是归档目录名。
 //   内部附 modelData/verItem/modelName/modelVer/modelFile/aboutText（阶段间复用，快照时剔除）。
 
 function batchActive() {
@@ -1203,12 +1301,17 @@ async function prepareBatchItem(res, cfg) {
   res.verItem = verItem;
   res.modelName = modelName;
   res.modelVer = modelVer;
-  // 模型文件本体入队（软件侧下载到 <archive_root>/<destSubdir>/）
+  // 模型文件本体入队（桌面端决定落点：老版本按 destSubdir 落 <归档根>/<dirName>/，
+  // 新版本按类型分流并把 bundle 令牌回传，媒体/评论阶段用同一令牌写进本体所在的那个目录）
   if (primaryFile && primaryFile.downloadUrl && cfg.sendModelToSoftware !== false) {
     const sent = await sendBg('sendModelToSoftware', {
       downloadUrl: primaryFile.downloadUrl, pageUrl: res.pageUrl || '', destSubdir: dirName,
     });
     if (!sent || sent.ok !== true) throw new Error('软件下载通道失败: ' + ((sent && sent.msg) || '未知错误'));
+    // 落点三件套挂在行上（不覆盖 dirName：它仍是本次归档的目录名，历史记录/状态区都按它说话）
+    res.bundle = typeof sent.bundle === 'string' ? sent.bundle : '';
+    res.destDir = typeof sent.destDir === 'string' ? sent.destDir : '';
+    res.routed = sent.routed === true;
   }
 }
 
@@ -1247,6 +1350,12 @@ async function runMediaStage(b) {
       modelData: res.modelData,
       verItem: res.verItem,
       modelFile: res.modelFile || '',
+      // 落点三件套：prepare 阶段提交模型本体时桌面端回传的 bundle/destDir/routed。
+      // 媒体阶段拿到 bundle 后，封面/配图/提示词/example.json 全部用令牌写入本体所在目录；
+      // 老桌面端没有这些字段 → 传空，runArchiveVersion 完整退回 dirName 旧行为。
+      bundle: res.bundle || '',
+      destDir: res.destDir || '',
+      routed: res.routed === true,
       // dataTabId：本行自己的标签页，只用来借页面登录态发数据请求（评论/样图元数据）。
       // 依然不带 tabId —— 批量不碰 content 的 UI 通道（askContent/reportProgress/notifyDone 保持 no-op，
       // 契约 8.2），否则 110 页批量会逐页弹进度和"归档完成"。
@@ -1280,7 +1389,19 @@ async function runCommentsStage(b) {
       const text = [got.commentsText, got.reviewsText]
         .filter((s) => s && String(s).length > 0)
         .join('\n\n');
-      if (text) await writeFileToBg(res.dirName, '评论.txt', utf8ToB64(text));
+      // 评论也必须跟模型本体进同一个目录：prepare 阶段拿到过 bundle 就走令牌通道，
+      // 没有 bundle（老桌面端/未分流）时 rel_path 形态与改动前逐字一致。
+      // 写盘降级（落到浏览器下载目录）在这里不能静默 —— 收集进本行的 notes 再并入批级 errors。
+      const writeNotes = [];
+      if (text) {
+        await writeFileToBg(res.dirName, '评论.txt', utf8ToB64(text),
+          Object.assign(writeRouteOf(res), { errors: writeNotes }));
+      }
+      if (writeNotes.length && Array.isArray(b.errors)) {
+        writeNotes.forEach((m) => b.errors.push({
+          modelId: res.modelId, modelVersionId: res.modelVersionId, dirName: res.dirName, msg: m,
+        }));
+      }
       res.dataChannel = got.dataTransport || '';
       // 熔断是全批生效的：批级 errors 只报一次（逐文件的说明已经写在各自 评论.txt 里），
       // 免得 110 页刷出 110 行同义错误把 popup 状态区淹没
@@ -1382,6 +1503,8 @@ function getBatchState() {
     results: batch.results.map((r) => ({
       tabId: r.tabId, url: r.url, modelId: r.modelId, modelVersionId: r.modelVersionId,
       status: r.status, dirName: r.dirName,
+      // 真实落点（桌面端 /api/download 回传，未分流时为空）——只报给 UI，不参与任何路径计算
+      destDir: r.destDir || '', routed: r.routed === true,
       autoChosenFile: r.autoChosenFile || '', msg: r.msg || '',
       dataChannel: r.dataChannel || '', // 评论实际走的通道（page/direct/''），供状态区如实显示
     })),
@@ -1422,7 +1545,7 @@ function handleMessage(msg, sender, sendResponse) {
       results.push({
         tabId: it.tabId, url: String(it.url || ''), modelId: String(it.modelId || ''),
         modelVersionId: String(it.modelVersionId || ''), pageUrl: String(it.pageUrl || String(it.url || '')),
-        aboutText: String(it.aboutText || ''), status: 'queued', dirName: '', msg: '',
+        aboutText: String(it.aboutText || ''), status: 'queued', dirName: '', destDir: '', routed: false, msg: '',
       });
     }
     const jobId = String(payload.jobId || (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)));
@@ -1484,5 +1607,8 @@ try {
     askContent, withPageTransport, pageTransportSummary, ptPickTab, ptHostOf, ptMakeEntry,
     makePageFetcher, anyTaskActive,
     fetchCommentsText, commentsDegradeNote, countDomCommentLines, promptGapNote, collectPromptList,
+    // 落点通道（bundle 令牌）：写盘形态选择与模型提交，node 下可直接驱动 sendBg 的假实现
+    writeFileToBg, writeRouteOf, submitModelFile, pickModelFileForSend, applySoftwareRoute,
+    enqueueModelTask, runArchiveVersion,
   };
 } catch (_) { /* 忽略 */ }

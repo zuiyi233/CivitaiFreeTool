@@ -28,11 +28,22 @@ async function post(url) {
   try {
     const res = await fetch(BRIDGE + '/api/download', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url}), signal:ctrl.signal});
     const data = await res.json();
-    return res.ok && data.ok ? {status:'sent', msg:'已提交，在 CFT 查看解析结果'} : {status:'failed', msg:data.msg || 'CFT 未接受请求'};
+    if (!res.ok || !data.ok) return {status:'failed', msg:data.msg || 'CFT 未接受请求'};
+    return {status:'sent', msg:submitResultMsg(data)};
   } catch (_) {
     // The server may have accepted it before the response was lost. Never retry implicitly.
     return {status:'uncertain', msg:'未收到确认，请在 CFT 核对后再发送'};
   } finally { clearTimeout(timer); }
+}
+// 落点回显（与 Chrome 版同规则）：新桌面端会在 /api/download 响应里带 dest_dir（人类可读绝对
+// 落点）与 routed（是否已按模型类型分流），列表行必须把它显示出来，否则用户提交完就找不到文件了。
+// 两个字段都没有＝老桌面端，文案逐字保持原样。本扩展（Firefox）没有写盘通道，故只回显路径、
+// 不消费桌面端的落点令牌，能力边界不变。
+function submitResultMsg(data) {
+  const d = data || {};
+  const dest = String(d.dest_dir || '').trim();
+  if (!dest) return '已提交，在 CFT 查看解析结果';
+  return (d.routed === true ? '已提交，将按类型保存到 ' : '已提交，将保存到 ') + dest;
 }
 async function run() {
   try {

@@ -633,7 +633,7 @@ function renderArchBatch(s) {
   $('archAuto').replaceChildren();
   for (const r of auto.slice(0, 5)) {
     const p = document.createElement('p'); p.className = 'muted';
-    p.textContent = `· ${r.dirName || r.url}：已自动选择 ${r.autoChosenFile}`;
+    p.textContent = `· ${r.destDir || r.dirName || r.url}：已自动选择 ${r.autoChosenFile}`;
     $('archAuto').append(p);
   }
   if (auto.length > 5) { const p=document.createElement('p');p.className='muted';p.textContent=`… 等 ${auto.length} 页`; $('archAuto').append(p); }

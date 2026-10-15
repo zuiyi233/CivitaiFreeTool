@@ -64,7 +64,7 @@
       return '⚠ 该模型版本已归档过！\n\n模型：' + (r.modelName || r.modelId || '') +
         '\n版本：' + (r.modelVer || r.modelVersionId || '') +
         '\n归档时间：' + (r.archiveTime || '') +
-        '\n保存目录：' + (r.dirName || '（未知）') +
+        '\n保存目录：' + (r.destDir || r.dirName || '（未知）') +
         '\n\n【确定】= 仍然重新下载（会覆盖原目录内同名文件）\n【取消】= 放弃本次下载';
     } catch (_) { return '该模型版本已归档过，确定重新下载？'; }
   }
@@ -344,7 +344,8 @@
     } catch (e) { warn('applyProgress failed', e); }
   }
 
-  // archiveDone {ok, dirName, msg, errors}：展示结果 3s 后恢复可点击
+  // archiveDone {ok, dirName, destDir, msg, errors}：展示结果 3s 后恢复可点击
+  // destDir 是桌面端按类型分流后的真实绝对落点（老软件不回传 → 空，继续显示 dirName）
   function applyArchiveDone(r) {
     try {
       var btn = getButton();
@@ -358,7 +359,7 @@
         btn.classList.add('cft-done');
         setFill(100);
         setLabel('✓ 已归档 ' + (r.dirName || ''));
-        showToast('归档完成：' + (r.dirName || ''), false);
+        showToast('归档完成：' + (r.destDir || r.dirName || ''), false);
       } else {
         btn.classList.remove('cft-done');
         btn.classList.add('cft-error');

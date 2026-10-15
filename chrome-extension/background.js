@@ -62,11 +62,22 @@ async function post(url) {
   try {
     const res = await fetch(BRIDGE + '/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }), signal: ctrl.signal });
     const data = await res.json();
-    return res.ok && data.ok ? { status: 'sent', msg: '已提交，在 CFT 查看解析结果' } : { status: 'failed', msg: data.msg || 'CFT 未接受请求' };
+    if (!res.ok || !data.ok) return { status: 'failed', msg: data.msg || 'CFT 未接受请求' };
+    return { status: 'sent', msg: submitResultMsg(data) };
   } catch (_) {
     // The server may have accepted it before the response was lost. Never retry implicitly.
     return { status: 'uncertain', msg: '未收到确认，请在 CFT 核对后再发送' };
   } finally { clearTimeout(timer); }
+}
+// 落点回显（新桌面端 /api/download 会带 dest_dir + routed）：老版本没有这两个字段时
+// 文案逐字不变，避免"扩展升到新协议、桌面还是旧版"时列表行冒出看不出所以然的话。
+// 注意：**绝不把 bundle 令牌写进 job/存储** —— 令牌是一次性落点凭据，行状态会被持久化到
+// storage.local 并在重启后恢复，把令牌显示出来只会诱导用户复制一个已经无意义的字符串。
+function submitResultMsg(data) {
+  const d = data || {};
+  const dest = String(d.dest_dir || '').trim();
+  if (!dest) return '已提交，在 CFT 查看解析结果';
+  return (d.routed === true ? '已提交，将按类型保存到 ' : '已提交，将保存到 ') + dest;
 }
 async function run() {
   try {
@@ -187,7 +198,10 @@ async function handleGetArchiveConfig() {
   if (_archiveCfgCache && now - _archiveCfgCache.at < ARCHIVE_CONFIG_TTL_MS) {
     return _archiveCfgCache.value;
   }
-  // archiveRoot=软件归档根（落盘实际位置），downloadDir=软件下载目录（仅展示，二者可不同）
+  // archiveRoot=软件归档根（旧语义：落盘实际位置）。分流落地后模型本体其实在
+  // <ComfyUI>\models\<类型>\ 下，这里只是附属文件与历史镜像所在的根；弹层把它当"实际落点"
+  // 展示已经不再准确，真实落点要看 /api/download 回包的 dest_dir（见 submitResultMsg）。
+  // downloadDir=软件下载目录（仅展示，二者可不同）
   const out = { softwareOnline: false, archiveRoot: '', channel: 'downloads', downloadDir: '', version: '', reason: 'offline' };
   try {
     const h = await bridgeFetch('/api/health', { timeoutMs: 2500 });
@@ -221,15 +235,35 @@ async function handleGetArchiveConfig() {
 }
 
 // ---- writeFile（通道顺序：软件 POST → downloads data:URL 降级，降级必须可见） ----
-async function trySoftwareWrite(relPath, dataB64) {
+// 两种请求形态（与桌面端 browser_bridge.py 约定，两端都要向后兼容）：
+//   新：{bundle, filename, data_b64} —— bundle 是 /api/download 返回的不透明落点令牌，
+//       filename 必须是**纯文件名**（不含路径分隔符），目录由桌面端解析令牌决定，
+//       于是图片/提示词/example.json/评论能跟模型本体进同一个嵌套目录。
+//   旧：{rel_path, data_b64} —— 老桌面端、以及"桌面端判定不分流"（没有 bundle）时继续走这条，
+//       行为与历史完全一致（rel_path 相对软件归档根）。
+// 判定权在桌面端：扩展只负责「有令牌就用令牌」，绝不自己算分流目录（扩展看不到文件头/类型）。
+function pureBundleFilename(name) {
+  const s = String(name || '');
+  if (!s || s === '.' || s === '..') return '';
+  // 含路径分隔符就不是"纯文件名"：不送进 bundle 通道（否则桌面端 4xx，或更糟——写到令牌目录之外）
+  if (/[\\/]/.test(s)) return '';
+  return s;
+}
+async function trySoftwareWrite(target, dataB64) {
   const rawSize = Math.floor(dataB64.length * 3 / 4);
   const mb = Math.max(1, Math.ceil(rawSize / 1048576));
+  const body = target.bundle
+    ? { bundle: target.bundle, filename: target.filename, data_b64: dataB64 }
+    : { rel_path: target.relPath, data_b64: dataB64 };
   const r = await bridgeFetch('/api/archive/file', {
     method: 'POST',
-    body: { rel_path: relPath, data_b64: dataB64 },
+    body,
     timeoutMs: Math.min(SW_WRITE_TIMEOUT_MAX_MS, SW_WRITE_TIMEOUT_BASE_MS + mb * SW_WRITE_TIMEOUT_PER_MB_MS),
   });
-  return !!(r.httpOk && r.data && r.data.ok);
+  const ok = !!(r.httpOk && r.data && r.data.ok);
+  // 失败原因要带出来（令牌过期/文件名非法这类 4xx 只有桌面端知道），否则降级文案只能说"写盘失败"
+  const msg = ok ? '' : String((r.data && (r.data.msg || r.data.error)) || ('软件写盘失败（HTTP ' + r.status + '）'));
+  return { ok, msg };
 }
 async function tryDownloadsWrite(relPath, dataB64) {
   const cfg = CFT.config.get() || {};
@@ -248,7 +282,18 @@ async function handleWriteFile(payload) {
   const p = payload || {};
   const relPath = String(p.relPath || p.rel_path || '');
   const dataB64 = String(p.dataB64 || p.data_b64 || '');
-  if (!relPath || !dataB64) return { ok: false, saved: '', channel: 'downloads', msg: 'relPath 与 dataB64 不能为空' };
+  const bundle = String(p.bundle || '');
+  const filename = pureBundleFilename(p.filename);
+  const useBundle = !!(bundle && filename);
+  // bundle 形态缺 filename（或 filename 带路径分隔符）时退回 rel_path：调用方传了 relPath 就还有
+  // 老通道可用；两者都没有才是真的参数错误。
+  if (useBundle ? !dataB64 : (!relPath || !dataB64)) {
+    return { ok: false, saved: '', channel: 'downloads', msg: useBundle ? 'dataB64 不能为空' : 'relPath 与 dataB64 不能为空' };
+  }
+  const target = useBundle ? { bundle, filename, relPath } : { relPath };
+  // downloads 降级时的落点名：bundle 形态理论上不依赖 relPath，但调用方一般两者都带；
+  // 只带了 bundle 就用纯文件名兜底，绝不因为走了新形态就把文件丢掉。
+  const downloadsRelPath = relPath || filename;
   const rawSize = Math.floor(dataB64.length * 3 / 4);
   if (rawSize > RAW_SIZE_SOFTWARE_MAX) {
     return { ok: false, saved: '', channel: 'downloads', msg: '文件过大（约 ' + (rawSize / 1048576).toFixed(1) + 'MB，超过 32MB 上限）' };
@@ -256,57 +301,77 @@ async function handleWriteFile(payload) {
   const cfg = await handleGetArchiveConfig();
   // 软件通道本该可用 → 后面任何 downloads 落盘/放弃都算「降级」，要在响应里显式暴露
   const degraded = cfg.channel === 'software';
+  let softwareErrMsg = '';
   if (degraded) {
     try {
-      if (await trySoftwareWrite(relPath, dataB64)) {
+      const w = await trySoftwareWrite(target, dataB64);
+      if (w.ok) {
         return { ok: true, saved: 'software', channel: 'software', msg: '' };
       }
+      softwareErrMsg = w.msg;
       invalidateArchiveConfigCache('软件写盘返回失败，缓存的软件通道已不可信');
-      bgLog('warn', '软件写盘返回失败，降级 downloads: ' + relPath);
+      bgLog('warn', '软件写盘返回失败，降级 downloads: ' + (useBundle ? 'bundle:' + filename : relPath) + ' — ' + w.msg);
     } catch (e) {
+      softwareErrMsg = String((e && e.message) || e);
       invalidateArchiveConfigCache('软件写盘异常，缓存的软件通道已不可信');
-      bgLog('warn', '软件写盘异常，降级 downloads: ' + relPath, e);
+      bgLog('warn', '软件写盘异常，降级 downloads: ' + (useBundle ? 'bundle:' + filename : relPath), e);
     }
   }
   if (rawSize > RAW_SIZE_DOWNLOADS_MAX) {
     return {
       ok: false, saved: '', channel: cfg.channel, degraded,
       msg: (degraded ? '软件写盘失败，且文件过大无法降级（约 ' : '文件过大且软件未在线（约 ') + (rawSize / 1048576).toFixed(1) + 'MB，降级上限 20MB）',
-      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '（该文件未落任何目录）' : '',
+      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '（该文件未落任何目录）' + (softwareErrMsg ? '：' + softwareErrMsg : '') : '',
     };
   }
   try {
-    const savedName = await tryDownloadsWrite(relPath, dataB64);
+    const savedName = await tryDownloadsWrite(downloadsRelPath, dataB64);
     return {
       ok: true, saved: 'downloads', channel: 'downloads', msg: '', degraded,
-      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '：' + savedName : '',
+      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '：' + savedName + (softwareErrMsg ? '（软件侧原因: ' + softwareErrMsg + '）' : '') : '',
     };
   } catch (e) {
     return {
       ok: false, saved: '', channel: 'downloads', degraded,
       msg: '浏览器下载失败: ' + String((e && e.message) || e),
-      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '（浏览器下载也失败）' : '',
+      degradedMsg: degraded ? DEGRADED_SOFTWARE_MSG + '（浏览器下载也失败）' + (softwareErrMsg ? '：' + softwareErrMsg : '') : '',
     };
   }
 }
 
 // ---- sendModelToSoftware（模型本体转发软件下载，10s 超时 + badge） ----
+// 响应除 {ok, msg} 外，还要把桌面端的落点三件套原样回传给 offscreen：
+//   bundle   —— 本次模型的不透明落点令牌，后续附属文件（封面/配图/提示词/example.json/评论）
+//                用它写进"模型本体真正所在的那个目录"；老桌面端没有 → 空串
+//   dest_dir —— 人类可读的绝对落点（只用于展示，扩展绝不解析它来拼路径）
+//   routed   —— 桌面端是否真的按类型分流了
+// 三者缺失时形状保持不变（空串/false），worker 会完整退回旧的 destSubdir/dirName 行为。
+function softwareRouteInfo(data) {
+  const d = data || {};
+  return {
+    bundle: typeof d.bundle === 'string' ? d.bundle : '',
+    destDir: typeof d.dest_dir === 'string' ? d.dest_dir : '',
+    routed: d.routed === true,
+  };
+}
 async function handleSendModelToSoftware(payload) {
   const url = String((payload && (payload.downloadUrl || payload.url)) || '');
-  if (!url || !CIVITAI_RE.test(url)) return { ok: false, msg: '仅支持 Civitai 模型页链接' };
+  if (!url || !CIVITAI_RE.test(url)) return { ok: false, msg: '仅支持 Civitai 模型页链接', ...softwareRouteInfo(null) };
   try {
     const r = await bridgeFetch('/api/download', {
       method: 'POST', body: { url, dest_subdir: String((payload && payload.destSubdir) || '') }, timeoutMs: 10000,
     });
+    const route = softwareRouteInfo(r.data);
     if (r.httpOk && r.data && r.data.ok) {
       badge('✓', '#1a73e8', 3000);
-      return { ok: true, msg: r.data.msg || '已开始下载' };
+      return { ok: true, msg: r.data.msg || '已开始下载', ...route };
     }
     badge('!', '#d93025', 3000);
-    return { ok: false, msg: (r.data && r.data.msg) || '下载启动失败' };
+    // 失败也带回 dest_dir：桌面端多半已经把任务落到某个目录了，用户看得到位置比只看"失败"有用
+    return { ok: false, msg: (r.data && r.data.msg) || '下载启动失败', ...route };
   } catch (_) {
     badge('!', '#d93025', 3000);
-    return { ok: false, msg: '无法连接 CivitaiFreeTool（请先打开软件）' };
+    return { ok: false, msg: '无法连接 CivitaiFreeTool（请先打开软件）', ...softwareRouteInfo(null) };
   }
 }
 
