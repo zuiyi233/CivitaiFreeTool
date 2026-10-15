@@ -32,8 +32,19 @@ class GalleryTests(unittest.TestCase):
     def test_image_metadata_api_uses_with_meta_and_checks_returned_id(self):
         import civitai_api
         client=civitai_api.CivitaiAPI();client._get=Mock(return_value={'items':[{'id':99,'meta':{'prompt':'wrong image'}}]})
-        self.assertEqual(client.get_image_metadata(7),{});client._get.assert_called_once_with('/images',params={'imageId':'7','withMeta':'true','limit':1},retries=1)
+        # browsingLevel=31 必须在参数里：官方过滤是 `browsingLevel ?? nsfw ?? publicBrowsingLevelsFlag`，
+        # 不显式给就只放行 PG，非 PG 样图连图带提示词一起静默丢失（实测 Soft 图不带参数 items:[]）。
+        self.assertEqual(client.get_image_metadata(7),{})
+        client._get.assert_called_once_with('/images',params={'imageId':'7','withMeta':'true','limit':1,'browsingLevel':'31'},retries=1)
         with self.assertRaises(ValueError):client.get_image_metadata('bad/id')
+
+    def test_image_metadata_browsing_level_can_be_narrowed(self):
+        import civitai_api
+        client=civitai_api.CivitaiAPI();client._get=Mock(return_value={'items':[]})
+        client.get_image_metadata(7,browsing_level=1)
+        self.assertEqual(client._get.call_args.kwargs['params']['browsingLevel'],'1')
+        client.get_image_metadata(7,browsing_level=0)      # 非法档位：宁可不传也不编造
+        self.assertNotIn('browsingLevel',client._get.call_args.kwargs['params'])
 
     def test_comfy_generation_reads_connected_sampler_and_not_unrelated_text(self):
         graph={'1':{'class_type':'KSampler','inputs':{'positive':['2',0],'negative':['3',0],'model':['4',0],'steps':20,'cfg':6,'seed':7}},'2':{'class_type':'CLIPTextEncode','inputs':{'text':'mountain landscape'}},'3':{'class_type':'CLIPTextEncode','inputs':{'text':'blur'}},'4':{'class_type':'CheckpointLoaderSimple','inputs':{'ckpt_name':'demo.safetensors'}},'5':{'class_type':'CLIPTextEncode','inputs':{'text':'unconnected not used'}}}

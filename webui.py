@@ -67,6 +67,9 @@ def _pick_cover_url(imgs):
 
 
 _VIDEO_LIMIT_PER_MODEL = 3  # 每模型自动/批量落盘的视频数上限（防止单模型拉爆带宽）
+# 评论/评价 sidecar：桌面端下载是「模型 + 一堆同名前缀的附属文件」，所以不能像扩展那样
+# 只叫 评论.txt（同目录多个模型会互相覆盖），前缀用模型文件名，内容口径与扩展一致。
+_COMMENTS_SIDECAR_SUFFIX = "_评论.txt"
 # 取首帧用的视频档：只为出像素，出完即删，绝不冒充模型的原片。
 # 实测同一条视频 original 档 8,921,366 字节、width=460 档 2,314,133 字节（CDN 对 .mp4 也按 width 转码，
 # 但返回的仍是 content-type: video/mp4——它不会给首帧 JPEG，format=/resize= 一律被忽略）。
@@ -850,6 +853,16 @@ class Api:
                             json.dump(sd, f, ensure_ascii=False, indent=2)
                 except Exception:
                     pass
+            # 1.5) 评论/评价文本（<名>_评论.txt）：评论只有 C 站 tRPC 拿得到，公开 /api/v1 没这个能力。
+            #      没 Key / Key 失效 / 限流一律跳过并写进 error.log，绝不让下载主流程失败。
+            if self.cfg.get("archive_comments", True):
+                try:
+                    self._archive_comments_sidecar(task, base)
+                except Exception as e:      # 尽力而为的补充产物：出问题只留日志
+                    try:
+                        self.log_error("comments", "评论归档异常（已跳过，不影响下载）: %s" % e)
+                    except Exception:
+                        pass
             # 2) 封面下载（后台，已存在则跳过；走代理，直连 C 站图片 CDN 会被墙）
             #    + 视频项 mp4 落盘（后台 daemon 线程，不阻塞完成回调；跳过已存在）
             if self.cfg.get("download_cover", True):
@@ -886,7 +899,8 @@ class Api:
                         od = os.path.dirname(old)
                         ob = os.path.splitext(os.path.basename(old))[0]
                         side = [os.path.join(od, ob + s) for s in
-                                (".preview.png", ".preview.jpg", ".preview.webp", ".txt", ".json", ".civitai.info")
+                                (".preview.png", ".preview.jpg", ".preview.webp", ".txt", ".json",
+                                 ".civitai.info", _COMMENTS_SIDECAR_SUFFIX)
                                 if os.path.exists(os.path.join(od, ob + s))]
                         if side:
                             if posix_compat.IS_WINDOWS:
@@ -908,6 +922,107 @@ class Api:
         finally:
             self._cache_history_task(task)
 
+    # ---------------- 评论/评价归档（下载完成路径：tRPC + API Key，不经浏览器） ----------------
+    @staticmethod
+    def _comments_source_ids(task):
+        """从任务的 info / meta 里取 (model_id, version_id)；取不到就返回 None，绝不猜。"""
+        info = (task.info or {}) if isinstance(getattr(task, "info", None), dict) else {}
+        meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+        m = meta.get("info") if isinstance(meta.get("info"), dict) else {}
+        v = m.get("version") if isinstance(m.get("version"), dict) else {}
+        model_id = info.get("model_id") or m.get("modelId") or m.get("id")
+        version_id = info.get("version_id") or m.get("versionId") or v.get("id")
+        return model_id, version_id
+
+    def _archive_comments_sidecar(self, task, base):
+        """把评论 + 评价写成 `<模型名>_评论.txt`。
+
+        产物名与扩展侧对齐（扩展在归档目录里写 `评论.txt`，桌面端下载是扁平 sidecar，
+        必须带模型名前缀才不会互相覆盖）。
+
+        门禁沿用 `requires_civitai_key` 的既有约定：**没有 Key 就一个在线请求都不发** ——
+        匿名 tRPC 是「成功地拿到空结果」，落成文件只会被读成「这个模型没人评论」。
+        civitai_api 的 tRPC 层不抛错，真抛了也只进 error.log：下载已经完成，
+        附属文本缺不缺绝不能改变任务状态。"""
+        cfg = self.cfg or {}
+        if not str(cfg.get("api_key") or "").strip():
+            self.log_error("comments", "未配置 Civitai API Key：跳过评论/评价归档"
+                                       "（匿名请求拿不到受限内容，桌面端不发起在线请求）")
+            return {"ok": False, "skipped": "no_api_key",
+                    "msg": "未配置 Civitai API Key：已跳过评论/评价归档"}
+        model_id, version_id = self._comments_source_ids(task)
+        if not str(model_id or "").isdigit():
+            self.log_error("comments", "任务里没有模型 ID，无法按实体查评论（已跳过，不影响下载）: %s"
+                           % os.path.basename(str(getattr(task, "filename", "") or "")))
+            return {"ok": False, "skipped": "no_model_id", "msg": "任务缺少模型 ID，已跳过评论归档"}
+        try:
+            client = self._new_api()          # Key/代理/ssl 校验全部沿用 _new_api
+            comments = client.fetch_comments(model_id)
+            reviews = client.fetch_reviews(model_id, version_id)
+        except Exception as e:
+            self.log_error("comments", "取评论/评价失败（已跳过，不影响下载）: %s" % e)
+            return {"ok": False, "skipped": "error", "msg": str(e)[:200]}
+        status = {"ok": True, "model_id": model_id, "version_id": version_id,
+                  "comments": len(comments.get("items") or []),
+                  "reviews": len(reviews.get("items") or []),
+                  "comment_status": comments.get("status"),
+                  "review_status": reviews.get("status")}
+        for res, label in ((comments, "评论"), (reviews, "评价")):
+            if res.get("status") == "ok" and (res.get("items") or []):
+                continue
+            self.log_error("comments", "%s归档（%s，模型ID %s）：status=%s，拿到 %d 条，原因: %s"
+                           % (label, res.get("procedure") or "?", model_id, res.get("status"),
+                              len(res.get("items") or []), res.get("error") or "接口无错误详情"))
+        path = base + _COMMENTS_SIDECAR_SUFFIX
+        # 与补帧/封面同一道守卫：sidecar 目标本身是链接/junction 时拒绝，别顺着写到模型目录外
+        if _is_reparse_path(path):
+            status.update({"ok": False, "skipped": "reparse",
+                           "msg": "评论文件目标是符号链接/junction，已拒绝写入"})
+            self.log_error("comments", "%s: %s" % (status["msg"], path))
+            return status
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(civitai_api.build_comments_document(comments, reviews, model_id, version_id))
+        except Exception as e:
+            status.update({"ok": False, "skipped": "write_error", "msg": str(e)[:200]})
+            self.log_error("comments", "评论文件写入失败（不影响下载）: %s" % e)
+            return status
+        status["path"] = path
+        try:
+            if isinstance(task.info, dict):
+                task.info["comments_archive"] = status
+        except Exception:
+            pass
+        return status
+
+    @requires_civitai_key("json")
+    def fetch_model_comments(self, model_id, version_id=""):
+        """按需取一个模型的评论/评价文本（前端与扩展都能经 /api/rpc 调；与下载归档同一通道）。
+
+        只读接口：不写盘、不动任务。返回 json —— `{ok, text, comments, reviews,
+        comment_status, review_status, msg}`；措辞按 docs §2.2 分「拿到 N 条 / 返回 null=没有评论区 /
+        拿不到受限内容」三种情况。没有 Key 时装饰器直接拦下（requires_civitai_key），不会出网。"""
+        mid = str(model_id or "").strip()
+        if not mid.isdigit():
+            return json.dumps({"ok": False, "msg": "模型 ID 无效，未发起在线请求"}, ensure_ascii=False)
+        try:
+            client = self._new_api()
+            comments = client.fetch_comments(mid)
+            reviews = client.fetch_reviews(mid, str(version_id or "").strip())
+        except Exception as e:
+            self.log_error("comments", "取评论/评价失败: %s" % e)
+            return json.dumps({"ok": False, "msg": str(e)[:200]}, ensure_ascii=False)
+        text = civitai_api.build_comments_document(comments, reviews, mid, version_id or "")
+        return json.dumps({"ok": True, "text": text,
+                           "comments": len(comments.get("items") or []),
+                           "reviews": len(reviews.get("items") or []),
+                           "comment_status": comments.get("status"),
+                           "review_status": reviews.get("status"),
+                           "msg": "" if (comments.get("items") or reviews.get("items")) else
+                                ("接口未返回可保存的内容（%s / %s）"
+                                 % (comments.get("status"), reviews.get("status")))},
+                          ensure_ascii=False)
+
     def move_file_to(self, path, dest_dir):
         """把模型（含 json/预览图等附属）移动到目标文件夹，并更新任务持久化"""
         path = (path or "").strip()
@@ -924,7 +1039,8 @@ class Api:
                 return {"ok":False,"msg":"该模型正在下载，请先暂停再移动"}
         base = os.path.splitext(os.path.basename(path))[0]
         src_dir = os.path.dirname(path)
-        candidates = [path] + [os.path.join(src_dir,base+suffix) for suffix in model_manager._SIDE_EXTS+(".images",)]
+        candidates = [path] + [os.path.join(src_dir,base+suffix) for suffix in
+                               model_manager._SIDE_EXTS+(".images", _COMMENTS_SIDECAR_SUFFIX)]
         if any(os.path.lexists(os.path.join(dest_dir, os.path.basename(f))) for f in candidates if os.path.lexists(f)):
             return {"ok": False, "msg": "目标存在同名模型或附属文件，请先处理冲突"}
         moved = []
@@ -3215,7 +3331,7 @@ class Api:
         try:
             sidecars = [os.path.join(d, base + s) for s in
                         (".preview.png", ".preview.jpg", ".preview.webp",
-                         ".txt", ".json", ".civitai.info")
+                         ".txt", ".json", ".civitai.info", _COMMENTS_SIDECAR_SUFFIX)
                         if os.path.exists(os.path.join(d, base + s))]
             if posix_compat.IS_WINDOWS:
                 _recycle_to_trash(sidecars)
@@ -4440,7 +4556,8 @@ class Api:
                         d = os.path.dirname(p)
                         b = os.path.splitext(os.path.basename(p))[0]
                         orphan = [os.path.join(d, b + s) for s in
-                                  (".preview.png", ".preview.jpg", ".preview.webp", ".txt", ".json", ".civitai.info")
+                                  (".preview.png", ".preview.jpg", ".preview.webp", ".txt", ".json",
+                                   ".civitai.info", _COMMENTS_SIDECAR_SUFFIX)
                                   if os.path.exists(os.path.join(d, b + s))]
                         if orphan:
                             _trash_paths(orphan, 15)
@@ -4462,7 +4579,8 @@ class Api:
                         d = os.path.dirname(p)
                         b = os.path.splitext(os.path.basename(p))[0]
                         side = [os.path.join(d, b + s) for s in
-                                (".preview.png", ".preview.jpg", ".preview.webp", ".txt", ".json", ".civitai.info")
+                                (".preview.png", ".preview.jpg", ".preview.webp", ".txt", ".json",
+                                 ".civitai.info", _COMMENTS_SIDECAR_SUFFIX)
                                 if os.path.exists(os.path.join(d, b + s))]
                         if side:
                             _trash_paths(side, 15)
