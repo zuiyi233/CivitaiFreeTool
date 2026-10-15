@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CivitaiFreeTool 一键下载",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "模型页一键下载/批量标签页提交到 CivitaiFreeTool；一键归档（封面/配图/评论/模型信息）到本地归档目录，软件离线时降级为浏览器下载",
   "permissions": [
     "tabs",

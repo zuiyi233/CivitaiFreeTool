@@ -1,4 +1,4 @@
-# CivitaiFreeTool 扩展 2.1.0 · Chrome / Edge
+# CivitaiFreeTool 扩展 2.2.0 · Chrome / Edge
 
 ## 安装 / 更新
 解压后打开 chrome://extensions，启用开发者模式，加载已解压目录。更新原目录后点击“重新加载”。

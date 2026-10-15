@@ -1,4 +1,4 @@
-# CivitaiFreeTool 更新日志（v1.5.1 → v2.6.30）
+# CivitaiFreeTool 更新日志（v1.5.1 → v2.6.31）
 
 ## 🌐 局域网无头服务器资产接入（本 fork 新增）
 
@@ -15,6 +15,31 @@
 - 仅限局域网使用，不要把 445 端口暴露到公网；建议账号密码登录而非免密 guest
 
 ---
+
+## v2.6.31：扩展↔桌面端这条链路修通，评价/评论回到归档里
+
+这一版全部围绕一件事：**"油猴脚本能下评论、详情图和提示词，做成桌面端+扩展之后就不行了"**。逐条实测之后，原因是四个不同的洞，不是一个。
+
+### 修复（用户能直接感觉到）
+1. **扩展"发送当前页到 CFT"自 5ba4e53 起全量 HTTP 500**：桥固定按 `fn(url, dest_subdir)` 两参调用处理函数，注册方 `dl_submit_url` 却只收一参。注册函数换过一次，注释没跟上，所以看起来"接口挂了"其实是 arity 崩了。现在两参契约写回注释并加了回归用例（用 `inspect.signature` 钉住）。
+2. **非 PG 分级的示例图连图带提示词静默丢失**：官方 `/api/v1/images` 的过滤是 `browsingLevel ?? nsfw ?? publicBrowsingLevelsFlag`，**带 API Key 也默认只放行 PG**。实测同一张 Soft 图：`browsingLevel=1 → items=0`、`=31 → items=1`。桌面端此前从不传这个参数。
+3. **归档状态面板把"拿不到状态"渲染成"共 undefined 页 · 完成 0 · 跳过(已归档) 0"**，一次通信故障被说成用户的归档结果。
+4. **镜像站上的单图归档会把跨站匿名请求记成"带你的登录状态"**：请求链路里没人带发起页 URL，站点判定退化成默认 `civitai.com`，于是 civitai.red 的图页真的向 civitai.com 发了请求（跨站时 `credentials:'same-origin'` 等于不带 Cookie），却被记成页面通道成功。现在单图必带发起页 URL、**host 判不出就绝不借道**、单图与批量共用同一把防重入锁。
+
+### 新增
+- **下载完成后自动抓评价/评论**，落成 `<模型名>_评论.txt`，随模型一起移动/回收站/更新替换。走桌面端自己的路径：`Authorization: Bearer <已保存的 Key>` 打 C 站 tRPC，**不依赖浏览器扩展**。实测某模型版本拿到 67 条评价、接口报 `totalItems=67 / totalPages=2`、翻页 2 页拿全。
+- **扩展的评论/评价/样图提示词改借你已登录的 C 站标签页同源代发**。此前把它判成"站点关闭了内部 tRPC"是错的：401 拒绝的是**没有请求上下文的裸探测**，丢的是登录上下文，不是功能。同时把 tRPC 入参按站点当前 schema 重写（`entityType` 小写、第一页不能带 `cursor:null`、不给 `repliesDepth` 就永远没有回复、评价按 `page` 翻页且 `modelId`+`modelVersionId` 必须同传、评论节点早已没有 `children`），401 熔断改成按 `procedure + 通道` 分别记录。
+- **扩展弹层补齐筛选与联动**：列表只列 C 站模型页，汇总行把筛掉了多少说成事实（`共 4 个标签页 · C 站 3 · 可提交模型页 3 · 重复合并 1 · 非 C 站已忽略 1 · 跨 2 个窗口`）；每行显示类型/底模/版本/大小/缩略图，`需登录态`、`限流退避`、`本站 404`、`取数失败`、`旧缓存值` 各自成徽章，一律不塌成"没有数据"；新增任务区显示"发送到 CFT 之后"的解析/下载进度（排队·百分比·速度·落盘目录·已完成/失败），快照存扩展 storage，关掉小窗再打开还在。
+- 浏览器扩展版本 Chrome 侧 2.1.0 → 2.2.0；Firefox 侧同步筛选/富化/任务区（Firefox 没有 offscreen，归档类能力仍只在 Chrome，差异写进其 README）。
+
+### 已知边界（不粉饰）
+- **评论正文需要真登录会话，API Key 也不行**：带 Key 对 `model/image/post/article/review` 各种 `entityType` 的 `commentv2.getCount` 一律返回 0，v1 的 `comment.getInfinite` 线上 404；未登录时模型页 DOM 连 Comments 标签都不渲染。所以纯桌面端流程只保证评价，评论要走扩展+已登录标签页。**"登录会话能拿到非空评论正文"这一跳至今没有被任何路径实测证实**，产物文案也不承诺"已拿到全部评论"。
+- 评价翻页上限固定 5 页 × 50 条 = 250 条（热门版本实测有 18481 条），超出时文件里如实写"站点共 N 条，本次只保存前 250 条"。
+- `model_manager.rename_to_civitai` 的 sidecar 名单未含 `_评论.txt`：按 C 站名改名后评论文件会留在旧名前缀下。
+- 不做历史模型回填，只有新下载完成才生成。
+
+### 测试基座
+`tests/test_extension_batch.cjs` 自 2.1.0 起就没跑过（`background.js` 加了 `import` 之后 `vm` 直接 SyntaxError），"pytest 全绿"一直掩盖着扩展侧零回归。修好之后新增 `test_page_transport.cjs`(13) / `test_extension_trpc.cjs`(8) / `test_popup_integration.cjs`(10) / `lib/enrich.test.cjs`(37) / `tests/test_trpc_comments.py`(29)，Python 侧 808 passed。
 
 ## v2.6.30：示例图本地永久缓存 + 视频首帧不再空白
 
