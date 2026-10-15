@@ -1,1 +1,47 @@
 *{box-sizing:border-box} :root{color-scheme:light dark;--bg:#f3f5fa;--card:#fff;--text:#202b3b;--dim:#647185;--line:#dce2ed;--accent:#167be8;--soft:#edf4ff} @media(prefers-color-scheme:dark){:root{--bg:#111a29;--card:#182438;--text:#e6edfa;--dim:#a9b7cd;--line:#33445e;--soft:#223650}} body{width:420px;margin:0;background:var(--bg);color:var(--text);font:13px/1.5 "Segoe UI","Microsoft YaHei",sans-serif} .card{padding:16px} header{display:flex;align-items:center;gap:9px;margin-bottom:14px} header img{width:32px;height:32px;border-radius:50%} header strong{font-size:16px} header small{display:block;color:var(--dim);font-size:11px} #connection{margin-left:auto;font-size:11px;color:var(--dim)} #connection.connected{color:#238b60} nav{display:flex;padding:4px;border:1px solid var(--line);border-radius:12px;margin-bottom:14px;gap:4px} button,select,input{font:inherit} button{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:8px 12px;cursor:pointer} nav button{flex:1;border:0;background:transparent} nav button.active{background:var(--soft);color:var(--accent);font-weight:600} button.primary{width:100%;border:0;background:var(--accent);color:white;font-weight:600;margin-top:12px} button:disabled{opacity:.45;cursor:default} button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px} h2{font-size:16px;overflow-wrap:anywhere} .muted,footer{color:var(--dim);font-size:11px;overflow-wrap:anywhere} .tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:10px 0} select,input[type=search]{border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);padding:7px} input[type=search]{width:100%} input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);flex-shrink:0;vertical-align:middle} #tabList{max-height:250px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)} .tab-row{display:flex;align-items:center;gap:10px;padding:11px;border-bottom:1px solid var(--line);cursor:pointer}.tab-row:last-child{border:0}.tab-row:hover{background:var(--soft)}.tab-row span{min-width:0}.tab-row strong{display:block;font-size:13px;overflow-wrap:anywhere;line-height:1.4}.tab-row small{display:block;color:var(--dim);font-size:11px;margin-top:3px} .empty{text-align:center;color:var(--dim);padding:20px} #feedback{font-size:12px;overflow-wrap:anywhere} details{border-top:1px solid var(--line);padding-top:10px;font-size:12px} summary{cursor:pointer} #resultList{max-height:130px;overflow:auto}.result{margin:7px 0}.sent{color:#238b60}.failed,.uncertain{color:#ce6b38} footer{margin-top:14px;border-top:1px solid var(--line);padding-top:10px} [hidden]{display:none!important}
+
+/* ---- 连接状态与「按钮为什么不能点」提示：区分 未打开 / 不是 CFT / 版本过旧 / 缺 API Key ---- */
+#connection{max-width:158px;text-align:right;overflow-wrap:anywhere}
+#connection.warn{color:#ce6b38}
+#sendHint{margin:6px 0 0;line-height:1.45}
+#sendHint.warn{color:#ce6b38}
+/* 缺 Key 是待办不是失败：用中性色，避免和 .failed/.uncertain 的橙色失败态混淆 */
+.result.needskey{color:var(--dim)}
+
+/* ---- 本浏览器做不到的能力：必须说人话，且不许留一个点了没反应的按钮 ---- */
+.notice{margin:10px 0 0;padding:9px 10px;border:1px solid var(--line);border-left:3px solid #ce6b38;border-radius:8px;background:var(--soft);color:var(--dim);font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+.notice b{color:var(--text)}
+
+/* ---- 筛选行：控件多了一排，必须比 .tools 更紧凑，否则 420px 宽的小窗装不下 ---- */
+.filters{margin:6px 0;flex-wrap:wrap;gap:6px}
+.filters label{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--dim)}
+.filters select{font-size:11px;padding:5px 6px;max-width:132px}
+#sort{max-width:118px}
+
+/* ---- 列表行：富化结果（缩略图/类型/底模/大小）与「为什么这行是灰的」 ---- */
+#tabList{max-height:230px}
+.tab-row img.thumb{width:42px;height:42px;object-fit:cover;border-radius:6px;flex-shrink:0;background:var(--soft)}
+.tab-row .row-state{display:inline-block;margin-left:4px;padding:0 5px;border:1px solid var(--line);border-radius:7px;font-size:10px;color:var(--dim)}
+.tab-row .row-state.needs-login,.tab-row .row-state.rate-limited{color:#ce6b38;border-color:#e6c3a8}
+.tab-row .row-state.missing,.tab-row .row-state.error{color:#c23d50;border-color:#e7b6bd}
+.tab-row .row-state.stale{color:#8a6d3b;border-color:#dccfb4}
+.tab-row.nosub{opacity:.62}
+
+/* ---- 发送到 CFT 之后：任务区。状态点用颜色分「在跑 / 完成 / 失败」，
+       文字里再分开写「扩展：已提交」与「CFT：…」，避免把提交当成下载完成 ---- */
+#taskPanel{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+#taskPanel h3{font-size:13px;margin:0}
+#taskHint{line-height:1.45}
+#taskList{border:1px solid var(--line);border-radius:10px;background:var(--card);max-height:190px;overflow:auto}
+.task-item{display:flex;gap:8px;align-items:flex-start;padding:9px 10px;border-bottom:1px solid var(--line);font-size:12px}
+.task-item:last-child{border-bottom:0}
+.task-item .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0;margin-top:5px}
+.task-item.downloading .dot{background:var(--accent)}
+.task-item.done .dot{background:#238b60}
+.task-item.error .dot,.task-item.failed .dot{background:#c23d50}
+.task-item.waiting .dot{background:#ce6b38}
+.task-item.library .dot{background:#8a6d3b}
+.task-item b{display:block;font-weight:600;overflow-wrap:anywhere}
+.task-item small{display:block;color:var(--dim);font-size:11px;margin-top:2px;overflow-wrap:anywhere}
+.task-item .grow{min-width:0;flex:1}
+button.quiet{background:transparent;border:0;color:var(--dim);font-size:11px;padding:4px 0;margin-top:6px;text-decoration:underline}

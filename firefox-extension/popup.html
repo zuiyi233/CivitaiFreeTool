@@ -3,9 +3,36 @@
 <body><main class="card">
 <header><img src="icons/icon32.png" alt=""/><div><strong>CivitaiFreeTool</strong><small>一键发送 · 标签页批量下载</small></div><span id="connection" role="status">连接中…</span></header>
 <nav aria-label="发送模式"><button id="modeCurrent" class="active" aria-pressed="true">当前页面</button><button id="modeBatch" aria-pressed="false">批量标签页</button></nav>
-<section id="currentPanel"><h2 id="modelName">正在读取…</h2><p id="modelUrl" class="muted"></p><button id="sendCurrent" class="primary" disabled>发送当前页到 CFT</button></section>
-<section id="batchPanel" hidden><div class="tools"><label>范围 <select id="scope"><option value="all">所有浏览器窗口</option><option value="current">当前窗口</option></select></label><button id="refresh">刷新</button></div><input id="search" type="search" placeholder="搜索模型名或 ID" aria-label="搜索模型标签页"/><div class="tools"><label><input id="selectAll" type="checkbox"/> 全选当前列表</label><span id="selectionCount"></span></div><div id="tabList" aria-label="可发送的模型标签页"></div><p class="muted" id="tabSummary"></p><button id="sendBatch" class="primary" disabled>发送选中到 CFT</button></section>
+<p id="sendHint" class="muted" hidden></p>
+<section id="currentPanel"><h2 id="modelName">正在读取…</h2><p id="modelUrl" class="muted"></p><button id="sendCurrent" class="primary" disabled>发送当前页到 CFT</button>
+<p id="capNote" class="notice">这个按钮只做一件事：把模型链接交给 CFT 下载。<br/>Firefox 版<b>没有「一键归档」</b>——本扩展不注入网页、也没有后台归档页面，做不到抓评论/详情图。要用归档请把模型页开在 Chrome 或 Edge 版扩展里，并且你在那个浏览器里已登录 C 站。</p></section>
+<section id="batchPanel" hidden>
+<div class="tools"><label>范围 <select id="scope"><option value="all">所有浏览器窗口</option><option value="current">当前窗口</option></select></label><button id="refresh">刷新</button></div>
+<input id="search" type="search" placeholder="搜索模型名、ID、类型、底模或标签" aria-label="搜索模型标签页"/>
+<div class="tools filters">
+<label>类型 <select id="fType" aria-label="按模型类型筛选"><option value="">全部类型</option></select></label>
+<label>底模 <select id="fBase" aria-label="按底模筛选"><option value="">全部底模</option></select></label>
+</div>
+<div class="tools filters">
+<label>补全 <select id="fState" aria-label="按信息补全状态筛选"><option value="">全部状态</option><option value="ready">已补全</option><option value="loading">待补全</option><option value="needs-login">需登录态</option><option value="rate-limited">限流退避</option><option value="missing">本站不存在</option><option value="error">取数失败</option><option value="skipped">未取数</option></select></label>
+<label>提交 <select id="fSub" aria-label="按是否可提交筛选"><option value="">全部行</option><option value="yes">仅可提交</option><option value="no">仅不可提交</option></select></label>
+<label>排序 <select id="sort" aria-label="列表排序"><option value="tab">按标签页顺序</option><option value="title">按标题</option><option value="type">按类型</option><option value="size">按文件大小</option><option value="downloads">按下载量</option><option value="published">按发布时间</option><option value="window">按窗口</option></select></label>
+</div>
+<div class="tools"><label><input id="selectAll" type="checkbox"/> 全选当前列表</label><span id="selectionCount"></span></div>
+<div id="tabList" aria-label="可发送的模型标签页"></div>
+<p class="muted" id="tabSummary"></p>
+<p class="muted" id="enrichSummary"></p>
+<p class="muted" id="rateNote" hidden></p>
+<div class="tools"><button id="sendBatch" class="primary" disabled>发送选中到 CFT</button></div>
+<p class="notice" id="capNoteBatch">「批量归档」也只在 Chrome/Edge 版有；这里勾选后只能把链接发送到 CFT 下载。</p></section>
+<section id="taskPanel" hidden aria-label="发送到 CFT 之后的状态">
+<div class="tools"><h3>发送到 CFT 之后</h3><button id="taskRefresh">查询最新状态</button></div>
+<p class="muted" id="taskHint">「已提交」只代表扩展把链接交给了 CFT，解析与下载都发生在软件里；下面这几行才是 CFT 的实际状态，只有显示「已完成」才算下到本地。</p>
+<p class="muted" id="taskSummary"></p>
+<div id="taskList"></div>
+<button id="clearTasks" class="quiet">清除下载状态跟踪（不影响 CFT 里的任务）</button>
+</section>
 <p id="feedback" role="status" aria-live="polite"></p><details id="results" hidden><summary id="resultSummary"></summary><div id="resultList"></div></details>
 <button id="clearResults" hidden>清除提交记录（允许重新发送）</button>
-<footer>仅发送勾选的 C 站模型链接，重复页自动合并。<br/>提交后可关闭小窗；多文件选择和下载进度在 CFT 查看。</footer>
-</main><script src="tabs-common.js"></script><script src="popup.js"></script></body></html>
+<footer>列表只列 C 站模型页，非 C 站／CDN／列表页被筛掉的数量写在列表下方那两行里；只读取标签页标题和链接，不读取网页内容。<br/>模型类型/底模/大小/缩略图来自 C 站公开接口，按每个标签页自己的站点（civitai.com 与 civitai.red 是两套数据）补全，补不到的地方标原因，不拿另一站的数据冒充。<br/>提交后可关闭小窗；下载状态会记在扩展里，重开小窗还能看到。</footer>
+</main><script src="tabs-common.js"></script><script src="lib/tabrows.js"></script><script src="lib/enrich.js"></script><script src="popup.js"></script></body></html>
