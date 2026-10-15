@@ -383,7 +383,9 @@ async function handleStartArchive(payload, sendResponse) {
   }
   chrome.runtime.sendMessage({
     __cft: true, to: 'offscreen', type: 'archive',
-    payload: { ...collected, tabId: tab.id },
+    // pageUrl 与单图链路同一条硬约束（契约 §2.1）：offscreen 靠它定站点、决定能不能借这个 tab。
+    // content 报空时用 tab.url 兜底 —— bg 手里就有这个 tab，留空只会把登录态取数降级成匿名直连。
+    payload: { ...collected, tabId: tab.id, pageUrl: String(collected.pageUrl || tab.url || '') },
   }).catch(() => {});
   sendResponse({ ok: true, msg: '归档已开始' });
 }
@@ -472,10 +474,16 @@ function handleArchiveBadge(payload) {
 // ---- saveSingleImage：ensureOffscreen 后原样重发给 offscreen，再把应答 relay 回 content ----
 // 说明：B 侧 offscreen 可能直接应答 content 的原消息；此处 relay 保证即使它只应答
 // 转发消息，content 也能拿到结果（重复 sendResponse 会被浏览器忽略，无害）。
+// pageUrl 是单图链路的硬约束（契约 §2.1）：offscreen 靠它判站点、决定借哪个标签页发数据请求。
+// content 应当自带发起文档的 URL；缺失时用 sender.tab.url 兜底（bg 拿得到），绝不留空 ——
+// 空 pageUrl 会让 offscreen 把一个站点未知的 tab 当候选借出去，跨站请求被记成"带登录态"。
 function forwardSaveSingleImage(payload, sender, sendResponse) {
-  const tabId = (payload && payload.tabId) || (sender && sender.tab && sender.tab.id) || 0;
+  const p = (payload && typeof payload === 'object') ? payload : {};
+  const tab = (sender && sender.tab) || null;
+  const tabId = p.tabId || (tab && tab.id) || 0;
+  const pageUrl = String(p.pageUrl || (tab && tab.url) || '');
   ensureOffscreen().then(() => chrome.runtime.sendMessage({
-    __cft: true, to: 'offscreen', type: 'saveSingleImage', payload: { ...(payload || {}), tabId },
+    __cft: true, to: 'offscreen', type: 'saveSingleImage', payload: { ...p, tabId, pageUrl },
   })).then((r) => {
     try {
       sendResponse(r && typeof r === 'object' ? r : { ok: true });

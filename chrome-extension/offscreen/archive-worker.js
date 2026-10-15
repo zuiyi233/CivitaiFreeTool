@@ -2,9 +2,11 @@
 // 运行环境：offscreen document（有 DOM/fetch，无 showDirectoryPicker，不能调 chrome.downloads）。
 // 写盘一律经 sendBg('writeFile') 发给 background；进度/弹窗一律经 sendContent 发给 content。
 // 数据请求（模型详情/评论/评价/样图元数据）一律经 CFT.api.requestData，并由 withPageTransport
-// 给当前任务装好「页面通道」fetcher：请求先在用户的模型页里同源发出（带登录 Cookie），页面不在/
-// 不应答/超时/返回 ok:false 时才回落扩展直连（带 credentials:'include'）。油猴脚本时代这些请求本来就
-// 在页面里发，移植后变成跨站匿名请求才出现 tRPC 401 与公开 API 空 items —— 见 lib 文件头 7)。
+// 给当前任务装好「页面通道」fetcher：请求只在**与这条请求同站点**的用户页面里同源发出（带登录
+// Cookie）——发起页 URL 缺失、站点判不出、host 对不上、页面不在/不应答/超时/返回 ok:false 时一律
+// 回落扩展直连（带 credentials:'include'），并把真实通道写进产物，绝不把匿名跨站请求记成登录态
+// 取数。油猴脚本时代这些请求本来就在页面里发，移植后变成跨站匿名请求才出现 tRPC 401 与公开 API
+// 空 items —— 见 lib 文件头 7)。
 // 媒体二进制（封面/配图/模型文件）不走页面通道：只回文本且有 3MB 上限，且不需要登录态。
 // 参考源：油猴脚本 saveCivitaiModelInfo（2098-2570）、downloadSingleImage（2694-2800）。
 import '../lib/util.js';
@@ -22,8 +24,17 @@ const B64_CHUNK = 0x8000;       // arrayBuffer → base64 分段
 const MODEL_TYPE_MAP = { 1: 'CheckPoint', 2: 'embedding', 3: 'HYPERNETWORK', 4: 'AESTHETIC GRADIENT', 5: 'Lora', 6: 'LyCORIS', 9: 'WILDCARDS' };
 
 let _running = false;           // 防重入锁（单页归档）
+let _singleRunning = false;     // 防重入锁（单图归档，理由见 anyTaskActive）
 let batch = null;               // 批量归档状态机（契约 8.2）；空闲为 null
 const _pending = new Map();     // cid -> resolve（请求-答复等待表）
+
+// 同一时刻只允许一个归档任务。为什么单图也要占这把锁：页面通道的 fetcher 是 lib 的**模块级单例**
+// （CFT.api.setFetcher），_ptScope 也只有一份；两个任务并发时后装的 fetcher 会盖掉前一个，
+// ptBegin 又会把后来的 entries 并进同一个 scope，「谁的请求该打到谁的 tab」就失控了。
+// 给 scope 加 taskKey 只挡得住「合并 entries」，挡不住「共用一个全局 fetcher」，所以选锁不选 key。
+function anyTaskActive() {
+  return _running === true || _singleRunning === true || batchActive();
+}
 
 function newCid() {
   return String(Date.now()) + '.' + Math.random().toString(36).slice(2);
@@ -61,12 +72,21 @@ function sendContent(tabId, type, payload) {
 
 // 请求-答复：payload 自动带 cid；超时或 content 不可达时 resolve(null)（按取消处理）
 // timeoutMs 可覆盖等待上限（页面数据通道用的就是这一套请求-答复机制，只是超时跟着请求走）
+// 答复有两条路：content 的 sendResponse（就是这里的 resolve 值）和它的 runtime 广播（由
+// handleMessage 消费）。真 Chrome 两条都能送达，resolveCid 先到先得、不会重复计数，所以
+// resolve 值也必须喂进去 —— 否则广播链路一断，一条合法 200 会白等满 timeoutMs+3000 再把
+// 那个 tab 永久短路（页面通道整批退化成匿名直连）。
 function askContent(tabId, type, payload, timeoutMs) {
   if (tabId == null) return Promise.resolve(null);
   const cid = newCid();
   const ms = (Number(timeoutMs) > 0) ? Number(timeoutMs) : ASK_TIMEOUT_MS;
   const p = waitCid(cid, ms);
-  sendContent(tabId, type, Object.assign({}, payload, { cid })).catch(() => {
+  sendContent(tabId, type, Object.assign({}, payload, { cid })).then((env) => {
+    // content 的 answer() 回的是完整信封 {__cft,to,type,payload}；解包形状与 bg 的 collectPage 一致
+    if (!env || typeof env !== 'object') return;
+    const pl = (env.__cft === true && env.payload) ? env.payload : env;
+    if (pl.cid == null || String(pl.cid) === String(cid)) resolveCid(cid, pl);
+  }).catch(() => {
     resolveCid(cid, null);
   });
   return p;
@@ -77,15 +97,22 @@ function askContent(tabId, type, payload, timeoutMs) {
 // Cookie），移植到 offscreen 后源变成 chrome-extension://、请求变匿名 → tRPC 401、公开 API
 // 把受限结果清成 {"items":[]}。content 侧（model-page.js / image-badge.js）已实现 pageFetch
 // 处理器（白名单 https + civitai.com|civitai.red + /api/v1/|/api/trpc/，credentials:'same-origin'，
-// 3MB 上限），这里负责把它接进 lib 的传输层：
+// 重定向不跟随，3MB 上限），这里负责把它接进 lib 的传输层：
 //   · 装 fetcher 的唯一入口是 CFT.api.setFetcher，lib 的 requestData 是唯一选通道的地方；
 //   · withPageTransport(entries, label, fn) 给「当前任务」安装，fn 结束 finally 还原；
 //     引用计数 + 共享 scope，所以批量阶段并发 5 个 item 时不会互相踩掉别人的 fetcher；
-//   · 每个 item 用自己的 tabId（按页面 URL / 站点 host 匹配，见 ptPickTab）；
+//     跨任务不并发：archive / archiveBatch / saveSingleImage 由 anyTaskActive() 互斥；
+//   · 每个 item 用自己的 tabId（页面 URL 或站点 host 双方都对得上才借，见 ptPickTab）；
 //   · 哪条通道真的拿到了数据记进 scope.stats + 每条产物的 [通道] 说明，不粉饰也不冤枉接口。
 // 媒体（封面/配图/模型文件）不走这里：页面通道只回文本且有 3MB 上限，二进制仍走 fetchJson。
 const PT_REPLY_SLACK_MS = 3000;      // 页面侧超时 + 消息往返余量；再不到就判「标签页不应答」
 const PT_MAX_BODY_HINT = '3MB';      // 与 content 侧 PAGE_FETCH_MAX_BODY_CHARS 一致
+// 页面侧 fetch 的**硬上限**：必须明显小于调用方的请求-答复等待，否则是「页面还在跑、调用方先超时」，
+// 随后到达的 pageFetchResult 会因为 cid 已被 waitCid 删掉而整个丢弃（契约 §2 的 15s 兜底）。
+// 12000 + 3000 = 15000，正好等于契约值，且 content 一定还有 3s 把应答送回来。
+// content 侧 PAGE_FETCH_DEFAULT_TIMEOUT_MS 是 20s，比这个还大 —— 所以这条钳位不是保险，是必需的：
+// lib 传来的 timeoutMs 缺省时绝不许落到 content 的默认值上。
+const PT_PAGE_FETCH_TIMEOUT_MS = 12000;
 
 let _ptScope = null;                 // 当前任务作用域（引用计数；最外层负责还原 fetcher）
 
@@ -98,9 +125,14 @@ function ptHostOf(u) {
 function ptMakeEntry(entry) {
   const e = entry || {};
   const tabId = (e.tabId == null || e.tabId === '') ? null : Number(e.tabId);
-  if (!Number.isFinite(tabId) || tabId < 0) return null;
+  if (!Number.isFinite(tabId) || tabId <= 0) return null;
   const pageUrl = String(e.pageUrl || '');
-  return { tabId, pageUrl, host: ptHostOf(pageUrl) }; // host=='' → 站点未知的 tab（单图流），只能兜底借道
+  const host = ptHostOf(pageUrl);
+  // 站点判不出的条目不登记：没有 host 就无法证明「这个 tab 与这条请求同站」，登记进来只会被
+  // 当成候选借出去 —— 跨站借道时 content 的 credentials:'same-origin' 不带 Cookie，拿回的
+  // 其实是匿名数据，却会被记成「页面通道（带你的登录状态）」（契约 §2.1 硬约束）。
+  if (!host) return null;
+  return { tabId, pageUrl, host };
 }
 
 function ptAddEntries(scope, entries) {
@@ -109,29 +141,31 @@ function ptAddEntries(scope, entries) {
   for (const raw of list) {
     const e = ptMakeEntry(raw);
     if (!e) continue;
-    const hit = scope.entries.find((x) => x.tabId === e.tabId);
-    if (hit) { if (!hit.pageUrl && e.pageUrl) { hit.pageUrl = e.pageUrl; hit.host = e.host; } continue; }
+    // 同一个 tab 只登记一次：条目必然同站点（host 是登记门槛），换 URL 也只是同一个站里翻页，
+    // 登录上下文完全相同，保留首次的 pageUrl 让「页面 URL 精确匹配」那条规则稳定生效
+    if (scope.entries.some((x) => x.tabId === e.tabId)) continue;
     scope.entries.push(e);
   }
 }
 
-// 选标签页：① 页面 URL 完全一致（批量里每个 item 用自己的 tab）② 同站点 host ③ 站点未知的 tab 兜底。
-// host 对不上时宁可不借：从 civitai.red 的页面里发 civitai.com 的请求是跨站，页面侧
-// credentials:'same-origin' 反而不带 Cookie，借了等于又退回匿名。
+// 选标签页，两条规则都要求「请求的站点 host 与 tab 的站点 host 双方都能确定且相等」：
+//   ① 页面 URL 完全一致（批量里每个 item 用自己的 tab）② 同站点 host。
+// 除此之外一律返回 null，由调用方回落扩展直连。host 判不出时宁可不借：从 civitai.red 的页面里
+// 发 civitai.com 的请求是跨站，页面侧 credentials:'same-origin' 反而不带 Cookie，借了等于又退回
+// 匿名，还会把这次匿名取数记成带登录态（旧实现的 alive[0] 与「无 host 信息」两条兜底就在这上面
+// 骗人，已删）。
 function ptPickTab(scope, url, pageUrlOrHost) {
   if (!scope) return null;
-  const alive = scope.entries.filter((e) => e && e.tabId != null && !scope.dead.has(e.tabId));
+  const alive = scope.entries.filter((e) => e && e.tabId != null && e.host && !scope.dead.has(e.tabId));
   if (!alive.length) return null;
   const want = ptHostOf(pageUrlOrHost) || ptHostOf(url);
-  if (!want) return alive[0].tabId;
+  if (!want) return null;
   if (pageUrlOrHost) {
-    const exact = alive.find((e) => e.pageUrl && String(e.pageUrl) === String(pageUrlOrHost) && ptHostOf(e.pageUrl) === want);
+    const exact = alive.find((e) => String(e.pageUrl) === String(pageUrlOrHost) && e.host === want);
     if (exact) return exact.tabId;
   }
   const same = alive.find((e) => e.host === want);
-  if (same) return same.tabId;
-  const wild = alive.find((e) => !e.host);
-  return wild ? wild.tabId : null;
+  return same ? same.tabId : null;
 }
 
 // 交给 CFT.api.setFetcher 的 fetcher：发 pageFetch → 等同 cid 的 pageFetchResult。
@@ -140,14 +174,17 @@ function ptPickTab(scope, url, pageUrlOrHost) {
 function makePageFetcher(scope) {
   return async function pageFetcher(url, opts) {
     const o = opts || {};
-    const timeoutMs = Math.max(1000, Number(o.timeoutMs) || FETCH_TIMEOUT_MS);
+    // 钳到 PT_PAGE_FETCH_TIMEOUT_MS 以内：调用方的等待 = 本值 + PT_REPLY_SLACK_MS，
+    // 页面必须先放弃并回话，不能让迟到的应答被丢弃（见上面常量注释 / lib 文件头 8)i.）
+    const wanted = Math.max(1000, Number(o.timeoutMs) || FETCH_TIMEOUT_MS);
+    const timeoutMs = Math.min(wanted, PT_PAGE_FETCH_TIMEOUT_MS);
     const tabId = ptPickTab(scope, url, o.pageUrlOrHost);
     if (tabId == null) {
       // 区分「本来就没有 tab」和「tab 都在短路名单里」——后者是这次任务的页面通道挂过，不是没接
       const deadList = Array.from(scope.dead);
       scope.lastPageError = (scope.entries.length && deadList.length >= scope.entries.length)
         ? '已短路：标签页 ' + deadList.join(', ') + ' ' + (scope.deadReason.get(deadList[0]) || '之前未应答')
-        : '不可用：没有与该请求站点匹配的标签页（页面通道未安装或站点不同）';
+        : '不可用：没有与该请求站点匹配的标签页（发起页 URL 缺失或站点不同，绝不跨站借道）';
       throw new Error(scope.lastPageError);
     }
     if (scope.dead.has(tabId)) {
@@ -201,7 +238,7 @@ function ptBegin(entries, label) {
     scope.installed = true;
   } else {
     scope.lastPageError = scope.entries.length ? 'lib 未提供 setFetcher（版本不匹配），只能用扩展直连'
-      : '任务没有可用标签页，页面通道未安装（全部请求走扩展直连）';
+      : '任务没有可登记的标签页（没有 tabId，或发起页 URL 缺失/站点判不出），页面通道未安装（全部请求走扩展直连）';
   }
   _ptScope = scope;
 }
@@ -449,7 +486,9 @@ async function fetchCommentsText(modelId, versionId, tabId, pageUrl) {
   const ptBefore = pageTransportSummary();
   const settled = await Promise.allSettled([
     CFT.api.fetchCivitaiComments(modelId, domFallbackFn, pageUrl),
-    CFT.api.fetchCivitaiReviews(versionId, pageUrl),
+    // 第三个参数是 modelId：resourceReview 无论哪个通道都要按模型/版本 ID 查（lib 文件头 8)c.），
+    // 只给 versionId 会让 getInfinite 退到版本级、getPaged 直接 400 —— 这里两个 ID 本来就都有
+    CFT.api.fetchCivitaiReviews(versionId, pageUrl, modelId),
   ]);
   // 熔断状态直接问 lib（别靠匹配文案）：哪条 procedure 的哪条通道已经因 401 停调，一目了然
   const gateState = typeof CFT.api.trpcUnauthorizedState === 'function' ? CFT.api.trpcUnauthorizedState() : {};
@@ -492,7 +531,9 @@ async function fetchCommentsText(modelId, versionId, tabId, pageUrl) {
 // 说"接口已被站点关闭"（那是匿名直连的结论），也没有降级可言，直接返回空串。
 function commentsDegradeNote(gatedEntries, savedCount, info) {
   const api = CFT.api;
-  const known = [api.COMMENTS_PROCEDURE, api.REVIEWS_PROCEDURE];
+  // 评价有两个 procedure（getInfinite 主通道 + getPaged 兜底，见 lib 8)c./d.），熔断表里
+  // 出现任何一个都算评价降级 —— 漏掉 getInfinite 会让「主通道被判死」静默消失在 errors 里
+  const known = [api.COMMENTS_PROCEDURE, api.REVIEWS_PROCEDURE, api.REVIEWS_INFINITE_PROCEDURE];
   // 允许传旧的 procedure 字符串数组（无通道信息时按「匿名直连被判死」处理）
   const gates = (Array.isArray(gatedEntries) ? gatedEntries : []).map((g) => {
     if (typeof g === 'string') return { procedure: g, transport: api.TRANSPORT_DIRECT };
@@ -959,12 +1000,14 @@ async function finishArchiveSuccess(bag) {
 }
 
 // ---- 单图流程（P3，适配脚本 downloadSingleImage 2694-2800） ----
-// 单图同样需要登录态上下文：bg 的 saveSingleImage 会带上发起动作的 tabId（payload.tabId 或
-// sender.tab.id），这里把它登记给页面通道；拿不到 tab 时静默回落扩展直连（行为与改造前一致）。
+// pageUrl 是单图链路的硬约束（契约 §2.1）：必须由发起动作的 content 带上、bg 用 sender.tab.url 兜底，
+// 这里再拿它登记页面通道。它同时决定 getImageGenerationData 打到哪个站点 —— 少了它既会选错站点，
+// 也会让 ptPickTab 无从判断 tab 与请求是否同站（判不出就不借，回落匿名直连）。
+// tabId<=0 是 bg 拿不到 sender.tab 时的占位值，不是真标签页，所以这里不当 entry 登记。
 async function runSingleImage(payload) {
   const p = payload || {};
   const raw = (p.tabId != null && p.tabId !== '') ? Number(p.tabId) : NaN;
-  const entries = Number.isFinite(raw) && raw >= 0 ? [{ tabId: raw, pageUrl: String(p.pageUrl || '') }] : [];
+  const entries = Number.isFinite(raw) && raw > 0 ? [{ tabId: raw, pageUrl: String(p.pageUrl || '') }] : [];
   return withPageTransport(entries, 'single-image:' + String(p.imageId || ''), () => runSingleImageCore(p));
 }
 
@@ -1108,8 +1151,9 @@ async function runPool(items, limit, fn) {
 }
 
 // 阶段 prepare 单页：fetchModel → 定位版本 → dirName → 多文件选主文件 → 已归档预检 → 模型文件入队
-// 每个 item 用自己的 res.tabId 装页面通道（并发 5 个 item 共用同一个引用计数 scope，
-// ptPickTab 按页面 URL / 站点 host 精确路由，绝不会 A 的请求借到 B 的 tab）
+// 每个 item 用自己的 res.tabId 装页面通道（并发 5 个 item 共用同一个引用计数 scope）：
+// ptPickTab 先按页面 URL 精确命中本 item 自己的 tab，命中不到才退到"同一个站点 host 的其它 tab"
+// （同站 = 同一份 Cookie，取回的数据一样）；跨站绝不借，所以 A 的请求不会打到另一个站的 tab 上。
 async function prepareBatchItem(res, cfg) {
   const modelId = String(res.modelId || '');
   const payloadVersionId = String(res.modelVersionId || '');
@@ -1355,7 +1399,7 @@ function handleMessage(msg, sender, sendResponse) {
     return false;
   }
   if (type === 'archive') {
-    if (_running || batchActive()) {
+    if (anyTaskActive()) {
       try { sendResponse({ ok: false, msg: '归档任务进行中' }); } catch (_) { /* 忽略 */ }
       return false;
     }
@@ -1367,7 +1411,7 @@ function handleMessage(msg, sender, sendResponse) {
     return false;
   }
   if (type === 'archiveBatch') {
-    if (_running || batchActive()) {
+    if (anyTaskActive()) {
       try { sendResponse({ ok: false, msg: '批量归档任务进行中' }); } catch (_) { /* 忽略 */ }
       return false;
     }
@@ -1405,9 +1449,18 @@ function handleMessage(msg, sender, sendResponse) {
     return false;
   }
   if (type === 'saveSingleImage') {
-    runSingleImage(payload).then(
-      (res) => { try { sendResponse(res); } catch (_) { /* 忽略 */ } },
-      (e) => { try { sendResponse({ ok: false, msg: '单图归档失败：' + ((e && e.message) || e) }); } catch (_) { /* 忽略 */ } });
+    if (anyTaskActive()) {
+      // 单图不能叠在批量/单页归档上：见 anyTaskActive 的理由（共用一份全局 fetcher 与 _ptScope）
+      try { sendResponse({ ok: false, msg: '归档任务进行中，请稍后再归档这张图' }); } catch (_) { /* 忽略 */ }
+      return false;
+    }
+    _singleRunning = true;
+    const reply = (res) => { try { sendResponse(res); } catch (_) { /* 忽略 */ } };
+    runSingleImage(payload)
+      .then(
+        (res) => reply(res),
+        (e) => reply({ ok: false, msg: '单图归档失败：' + ((e && e.message) || e) }))
+      .finally(() => { _singleRunning = false; });
     return true;
   }
   return false;
@@ -1428,7 +1481,8 @@ try {
     getBatchState, runBatchStage, runPool,
     prepareBatchItem, runPrepareStage, runMediaStage, runCommentsStage, finishBatch,
     // 页面数据通道（pageFetch）与通道文案
-    askContent, withPageTransport, pageTransportSummary, ptPickTab, ptHostOf, makePageFetcher,
+    askContent, withPageTransport, pageTransportSummary, ptPickTab, ptHostOf, ptMakeEntry,
+    makePageFetcher, anyTaskActive,
     fetchCommentsText, commentsDegradeNote, countDomCommentLines, promptGapNote, collectPromptList,
   };
 } catch (_) { /* 忽略 */ }

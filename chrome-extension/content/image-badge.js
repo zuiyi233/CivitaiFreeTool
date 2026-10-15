@@ -68,6 +68,37 @@
     }
   }
 
+  // 当前文档 URL：单图归档必须带上它（契约 §2.1 硬约束）。offscreen 用它决定
+  // ① 元数据请求打到 civitai.com 还是 civitai.red（镜像站数据独立，选错站就是拿另一个站的图）
+  // ② 能不能借本标签页发同源请求（host 判不出就不借，回落匿名直连）。
+  // bg 拿得到 sender.tab.url 会兜底，但那是"请求来自哪个 tab"的近似值；发起文档自己报最准。
+  function currentPageUrl() {
+    try {
+      if (typeof window !== 'undefined' && window.location && window.location.href) return String(window.location.href);
+    } catch (_) { /* 忽略 */ }
+    try {
+      var d = doc();
+      if (d && (d.URL || d.documentURI)) return String(d.URL || d.documentURI);
+    } catch (_) { /* 忽略 */ }
+    return '';
+  }
+
+  // 徽章点击 → bg 的 saveSingleImage 信封（纯函数，便于在 node 下钉住 payload 形状）
+  function buildSaveSingleImageRequest(ctx, pageUrl) {
+    var c = ctx || {};
+    return {
+      __cft: true,
+      to: 'bg',
+      type: 'saveSingleImage',
+      payload: {
+        imageId: String(c.imageId == null ? '' : c.imageId),
+        originalUrl: String(c.originalUrl == null ? '' : c.originalUrl),
+        ext: String(c.ext == null ? '' : c.ext),
+        pageUrl: String(pageUrl == null ? '' : pageUrl),
+      },
+    };
+  }
+
   // idb 原始值 → id 数组（兼容新格式 {[id]:{time}} 与脚本旧格式 [{id,...}]）
   function normalizeSavedIds(raw) {
     var ids = [];
@@ -92,6 +123,9 @@
   var PAGE_FETCH_HOSTS = ['civitai.com', 'civitai.red'];
   var PAGE_FETCH_PATHS = ['/api/v1/', '/api/trpc/'];
   var PAGE_FETCH_REJECT = 'url 不在白名单';
+  // 两种拒绝必须分开说：白名单拒绝是扩展一个字节都没发出去；重定向拒发是站点确实改了跳转目标、
+  // 页面通道不跟发（跟发就可能拿登录 Cookie 打到白名单外）。调用方文案与排错方向完全不同。
+  var PAGE_FETCH_REDIRECT_REJECT = '站点返回重定向，页面通道不跟随（重定向目标未经白名单复核）';
   var PAGE_FETCH_DEFAULT_TIMEOUT_MS = 20000;
   var PAGE_FETCH_MAX_BODY_CHARS = 3 * 1024 * 1024; // 模型详情约 16KB，上限只为防跑飞响应打爆消息通道
   var PAGE_FETCH_CLAIM_CAP = 128;                  // 已应答 cid 记忆表容量（防无界增长）
@@ -233,7 +267,7 @@
         return onSaveResult(ctx, { ok: false, msg: '扩展运行时不可用' });
       }
       chrome.runtime.sendMessage(
-        { __cft: true, to: 'bg', type: 'saveSingleImage', payload: { imageId: imageId, originalUrl: ctx.originalUrl, ext: ctx.ext } },
+        buildSaveSingleImageRequest(ctx, currentPageUrl()),
         function (resp) {
           var err = null;
           try { err = chrome.runtime.lastError; } catch (_) { /* 忽略 */ }
@@ -593,14 +627,26 @@
           timer = setTimeout(function () { try { controller.abort(); } catch (_) { /* 忽略 */ } }, timeoutMs);
         } catch (_) { timer = 0; }
       }
+      // 不跟随重定向，且用 redirect:'manual' 而不是 'error'：Chromium 实测（headless Chromium +
+      // 本地 302/307 服务）'error' 收到 3xx 抛的是 TypeError("Failed to fetch")，与 CORS/网络失败
+      // 同一句话，应答里只能说"可能是重定向"；'manual' 把 3xx 变成 opaqueredirect(status 0)，
+      // 既不向跳转目标发出第二个请求（实测目标站命中 0 次、200 响应不受影响），又能把
+      // "被重定向拒发"与"白名单拒绝"分开写清楚。
       fetch(String(p.url), {
         method: 'GET',
         credentials: 'same-origin',
         headers: { Accept: 'application/json' },
+        redirect: 'manual',
         signal: controller ? controller.signal : undefined
       }).then(function (res) {
         var status = (res && typeof res.status === 'number') ? res.status : 0;
         var ok = !!(res && res.ok);
+        // 站点把请求重定向了（307 预签名跳转就是这个形状）：目标地址可能已跳出白名单，
+        // 所以这里绝不跟发，也绝不把 status 0 的空体当成"成功但没数据"
+        if (res && res.type === 'opaqueredirect') {
+          settle({ ok: false, status: 0, err: PAGE_FETCH_REDIRECT_REJECT });
+          return;
+        }
         return res.text().then(function (raw) {
           var text = String(raw == null ? '' : raw);
           var truncated = text.length > PAGE_FETCH_MAX_BODY_CHARS;
@@ -680,6 +726,8 @@
       getImageIdFromHref: getImageIdFromHref,
       buildOriginalUrl: buildOriginalUrl,
       normalizeSavedIds: normalizeSavedIds,
+      currentPageUrl: currentPageUrl,
+      buildSaveSingleImageRequest: buildSaveSingleImageRequest,
       pageFetchRejectReason: pageFetchRejectReason,
       handleMessage: onRuntimeMessage
     };

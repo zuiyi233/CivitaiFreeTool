@@ -58,7 +58,7 @@ chrome-extension/
 | content → offscreen | `userSelection` | `{fileName}`（对 askFileSelection 的答复） | P2 |
 | content → offscreen | `archiveConfirm` | `{proceed}` | P3 |
 | content → offscreen | `domComments` | `{cid, results:[...]}`（同上结构；offscreen 并入 trpc 结果走统一 formatter） | P2 |
-| content → bg | `saveSingleImage` | `{imageId, originalUrl, ext}` → `{ok}` | P3 |
+| content → bg | `saveSingleImage` | `{imageId, originalUrl, ext, pageUrl}` → `{ok}`；`pageUrl` 是发起文档 URL（content 必带，bg 缺省时用 `sender.tab.url` 兜底），offscreen 用它定站点并登记页面通道，见 §2.1 硬约束 1 | P3 |
 | offscreen → content | `savedImageDone` | `{ok, imageId}`（bg 经 tabs.sendMessage 广播到所有 images/posts 页，刷新徽章 SAVED） |
 | offscreen → content | `pageFetch` | `{url, timeoutMs}`（cid 由 askContent 注入）→ content 在页面里**同源代发** GET，见 §2.1 |
 | content → offscreen | `pageFetchResult` | `{cid, ok, status, body, err, truncated}`（sendResponse + runtime 广播双路，resolveCid 先到先得） |
@@ -94,14 +94,38 @@ SFW 图 145676249 有完整 meta）。**丢的是登录上下文，不是接口*
 - 装/拆：offscreen 用 `CFT.api.setFetcher(makePageFetcher(scope))` 在任务开始时安装，
   `withPageTransport(entries, label, fn)` 在 `finally` 还原；引用计数 + 共享 scope，
   批量并发 5 个 item 时不会互相踩掉别人的 fetcher。
-- 选标签页：`ptPickTab` 按「页面 URL 精确匹配 → 同 host → 无 host 信息」三级挑，
-  **绝不跨站借页面**（civitai.red 上的模型在 civitai.com 可能 404，借错页面会把 404 读成
-  "这个模型没有评论"）。
+- 选标签页（`ptPickTab`）：只有「这条请求的站点 host」与「这个 tab 所在页面的站点 host」**双方都能
+  确定且相等**时才借，匹配顺序是「页面 URL 完全一致 → 同站点 host」，除此之外一律返回 `null` 并
+  回落扩展直连。**判不出站点就绝不借道**（`ptMakeEntry` 连登记都不登记）：跨站借页面时 content 侧
+  是 `credentials:'same-origin'`，跨站等于不带 Cookie，拿回来的是匿名数据，却被 `makePageFetcher`
+  记成 `pageOk` / `transport=page`，产物就会写"数据来自页面通道（带你的登录状态）"——那是把匿名
+  跨站请求粉饰成登录态取数。civitai.red 上的模型/图在 civitai.com 可能 404 或另一个结果，借错
+  页面还会把 404 读成"这个模型没有评论"。
+  （旧实现里 `alive[0]` 与「entry 无 host 信息」两条兜底正是这么骗人的，已删；不要再加回来。）
+- 硬约束（三条，实现与测试 tests/test_page_transport.cjs 都要钉住）：
+  1. **单图链路必须带发起页 URL**：`image-badge.js` 的 `saveSingleImage` payload 必带当前文档 URL
+     （`currentPageUrl()`）；`background.js` 的 `forwardSaveSingleImage` 在 payload 缺 `pageUrl` 时用
+     `sender.tab.url` 兜底（content 自己报的优先，不覆盖）；`runSingleImage` 消费它。它同时决定
+     元数据请求打到 `civitai.com` 还是 `civitai.red`（`civitaiBaseUrl(pageUrl)`，镜像站数据独立），
+     以及能不能借这个 tab。两处都拿不到时 `pageUrl` 保持空串 → 页面通道不安装 → 走直连并在产物里
+     如实写"扩展直连（多半按匿名处理）"。
+  2. **host 判不出即不借**：见上一条。拿不到可用 tab 时走"不可用：没有与该请求站点匹配的标签页"
+     分支，让调用方如实回落直连，而不是借一个错的 tab。
+  3. **重定向不跟随**：content 侧 `runPageFetch` 用 `redirect:'manual'`，收到 3xx 时应答
+     `ok:false` + 专门文案（"站点返回重定向，页面通道不跟随…"），绝不向跳转目标发第二个请求。
+     选 `'manual'` 而不是 `'error'` 是实测结论：Chromium 在 `redirect:'error'` 下抛
+     `TypeError("Failed to fetch")`，与 CORS/网络失败同一句话，文案只能说"可能是重定向"；
+     `manual` 给出 `type:'opaqueredirect'` + `status:0` + 空体，跳转目标命中 0 次（真浏览器断言见
+     tests/test_page_transport.cjs），且 200 响应完全不受影响。"白名单拒绝"与"被重定向拒发"两种
+     文案必须分开——前者是扩展一个字节都没发出去，后者是站点确实改了跳转目标。
 - 白名单（content 侧 `pageFetchRejectReason`）：`https:` + host 属于
   `civitai.com|civitai.red`（含 `www.`）+ path 前缀 `/api/v1/` 或 `/api/trpc/`，
   `credentials:'same-origin'`，响应文本 ≤3MB，超限 `truncated:true` 且调用方按失败处理。
 - 超时：`timeoutMs` 由调用方给（默认 `FETCH_TIMEOUT_MS=15000`），content 用它做 abort；
   offscreen 等 `timeoutMs + PT_REPLY_SLACK_MS(3000)`。content 侧默认 20000 仅在调用方没传时兜底。
+  content 的 `pageFetchResult` 走 sendResponse 与 runtime 广播**两条路**，`askContent` 必须两边都消费
+  （`resolveCid` 先到先得、天然去重）：只认广播那条路时，广播一断一条合法 200 会白等满超时并把该 tab
+  永久短路。
 - 短路：同一个 tab 一次不应答就进 `scope.dead`，本任务内不再向它发请求——否则批量 110 页时
   每组候选入参都要各等一轮超时。
 - 401 熔断按 `procedure + transport` 分路记录（`page` / `direct`）：匿名直连看到的 401
@@ -157,14 +181,25 @@ SFW 图 145676249 有完整 meta）。**丢的是登录上下文，不是接口*
 结论要分开说，别混成"接口关了"：
 - **评价不需要登录态**——只要有请求上下文（浏览器同源）或带 Key 就给真数据。之前记成"匿名拿到空"
   是因为只传了 `modelId` 没传 `modelVersionId`，那是**假空**（200 + `totalItems:0`）。
-- **评论需要真会话**：带同源头但无 Cookie 仍 `comments:[]`；这条只能靠页面通道（用户已登录的标签页）
-  或用户自己的 Key。
+- **评论需要真会话**：带同源头但无 Cookie 仍 `comments:[]`；而且**API Key 也不行**——带 Key 对
+  `model/image/post/article/review` 各种 entityType 的 `commentv2.getCount` 一律返回 0，v1 的
+  `comment.getInfinite` 线上 404。所以评论正文只有"用户已登录的标签页代发"这一条路。
 - `resourceReview.getInfinite` 三种入参都返回 200 但 `items:[]`（同一版本 `getPaged` 有 67 条），
   **不能当评价的主通道**，只能在版本级一条都没落地时兜底，且要标明它是模型级、只含写了文字的评价。
 - 桌面端**不要靠伪造 `Sec-Fetch-*` 绕过** 401：那是绕过站点"请用公开 API"的门禁。带用户自己的
   API Key 是官方 token 路径（`commentv2Router.getInfinite` 的 `.meta({requiredScope: TokenScope.MediaRead})`
   说明 tRPC 本来就认 token），也是扩展与桌面端共用的正当口径。
 - 匿名请求"成功的空"和"真的没有"必须靠通道 + 参数区分，产物文案不能把前者写成"该模型没有评论/评价"。
+
+登录态实测补记（2026-10-16，在本机 Chrome 打开的 civitai.com 模型页里做同源只读请求）：
+- 那次浏览器**未登录**（`GET /api/v1/me` → 401），所以只验证到"契约形状正确"：
+  `commentv2.getInfinite` 200 返回 `{comments,nextCursor,targetComment,replyThreads,childlessCommentIds}`；
+  存在的模型 → `comments:[]`，不存在的模型（123456）→ `json:null`。**这两个分支正是代码判定的实测依据。**
+- 未登录时模型页 DOM **连 Comments 标签都不渲染**（整页文本里没有 "comments"），
+  与"评论要登录会话"一致，而不是"这些热门模型恰好没评论"。
+- **仍未被任何路径证实**：带真实登录会话时页面通道能否拿到非空评论正文。要证它需要一个已登录的
+  C 站标签页。在此之前，评论功能一律按"通道已接通、非空结果未证实"交付，产物文案也不得写
+  "已拿到全部评论"。
 
 ### 2.3 桌面端取评论/评价（Python，`civitai_api.py`，本 fork 新增）
 
@@ -286,6 +321,11 @@ batch = { jobId, cancel:false, phase:'prepare'|'media'|'comments'|'done',
 - **阶段 comments（串行）**：对 status='done' 页逐页 fetchCommentsText（**纯 tRPC，跳过 DOM 兜底**——页面可能已关）→ writeFileToBg(dirName/'评论.txt')；失败记 errors 不阻断。
 - **结束**：phase='done'；发一次 `notifyArchiveDone`（统一重扫）；badge 清空。
 - 单页归档（`archive` 消息）行为不变；batch 与单页互斥（一方在跑另一方拒绝）。
+- **单图（`saveSingleImage`）同样占这把锁**：`archive` / `archiveBatch` / `saveSingleImage` 三个入口
+  由同一个 `anyTaskActive()` 互斥。理由是页面通道的 fetcher 是 lib 的模块级单例（`CFT.api.setFetcher`）
+  且 `_ptScope` 只有一份——两个任务并发时后装的会盖掉前一个、entries 还会被 `ptBegin` 并到同一个 scope，
+  「谁的请求打到谁的 tab」就失控了（旧实现里单图那个 host='' 的 tab 正是这么被并进批量 scope 的）。
+  给 scope 加 taskKey 只挡得住"合并 entries"，挡不住"共用一个全局 fetcher"，所以选锁不选 key。
 
 ### 8.3 bg 职责
 

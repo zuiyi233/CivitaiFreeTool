@@ -74,6 +74,9 @@
   var PAGE_FETCH_HOSTS = ['civitai.com', 'civitai.red'];
   var PAGE_FETCH_PATHS = ['/api/v1/', '/api/trpc/'];
   var PAGE_FETCH_REJECT = 'url 不在白名单';
+  // 两种拒绝必须分开说：白名单拒绝是扩展一个字节都没发出去；重定向拒发是站点确实改了跳转目标、
+  // 页面通道不跟发（跟发就可能拿登录 Cookie 打到白名单外）。调用方文案与排错方向完全不同。
+  var PAGE_FETCH_REDIRECT_REJECT = '站点返回重定向，页面通道不跟随（重定向目标未经白名单复核）';
   var PAGE_FETCH_DEFAULT_TIMEOUT_MS = 20000;
   var PAGE_FETCH_MAX_BODY_CHARS = 3 * 1024 * 1024; // 模型详情约 16KB，上限只为防跑飞响应打爆消息通道
   var PAGE_FETCH_CLAIM_CAP = 128;                  // 已应答 cid 记忆表容量（防无界增长）
@@ -540,14 +543,26 @@
           timer = setTimeout(function () { try { controller.abort(); } catch (_) { /* 忽略 */ } }, timeoutMs);
         } catch (_) { timer = 0; }
       }
+      // 不跟随重定向，且用 redirect:'manual' 而不是 'error'：Chromium 实测（headless Chromium +
+      // 本地 302/307 服务）'error' 收到 3xx 抛的是 TypeError("Failed to fetch")，与 CORS/网络失败
+      // 同一句话，应答里只能说"可能是重定向"；'manual' 把 3xx 变成 opaqueredirect(status 0)，
+      // 既不向跳转目标发出第二个请求（实测目标站命中 0 次、200 响应不受影响），又能把
+      // "被重定向拒发"与"白名单拒绝"分开写清楚。
       fetch(String(p.url), {
         method: 'GET',
         credentials: 'same-origin',
         headers: { Accept: 'application/json' },
+        redirect: 'manual',
         signal: controller ? controller.signal : undefined
       }).then(function (res) {
         var status = (res && typeof res.status === 'number') ? res.status : 0;
         var ok = !!(res && res.ok);
+        // 站点把请求重定向了（307 预签名跳转就是这个形状）：目标地址可能已跳出白名单，
+        // 所以这里绝不跟发，也绝不把 status 0 的空体当成"成功但没数据"
+        if (res && res.type === 'opaqueredirect') {
+          settle({ ok: false, status: 0, err: PAGE_FETCH_REDIRECT_REJECT });
+          return;
+        }
         return res.text().then(function (raw) {
           var text = String(raw == null ? '' : raw);
           var truncated = text.length > PAGE_FETCH_MAX_BODY_CHARS;
