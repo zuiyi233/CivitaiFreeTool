@@ -97,8 +97,27 @@ const wait=async f=>{for(let i=0;i<200;i++){if(await f())return;await new Promis
    const all=[{id:1,windowId:1,title:'Demo A | Civitai',url:'https://civitai.red/models/1/a?modelVersionId=11'},{id:2,windowId:1,title:'Demo A duplicate',url:'https://civitai.com/models/1/b?modelVersionId=11'},{id:3,windowId:2,title:'Demo B | Civitai',url:'https://civitai.red/models/2/b'},{id:4,windowId:1,title:'Not a model',url:'https://example.invalid/private'}];
    window.chrome={tabs:{query:async q=>q.active?[all[3]]:q.currentWindow?all.filter(t=>t.windowId===1):all},runtime:{sendMessage:async m=>{if(m.type==='cft-batch-start'){window.sent.push(m.urls);window.job={id:'job',running:false,items:m.urls.map(url=>({...CftTabs.modelLink(url),status:'sent',msg:'accepted'}))};}if(m.type==='cft-batch-clear')window.job=null;return {ok:true,job:window.job};}}};
    // 假桥必须回**真的 CFT 健康体**（ok + app + version≥MIN_APP_VERSION）：popup 的发送按钮
-   // 现在按 cftHealth 的判定禁用，随便回 {ok:true} 会被判成"不是 CFT"，测的就是按钮禁用了
-   window.fetch=async()=>({ok:true,json:async()=>({ok:true,app:'CivitaiFreeTool',version:'2.6.30',mode:'browser',window:false})});
+   // 现在按 cftHealth 的判定禁用，随便回 {ok:true} 会被判成"不是 CFT"，测的就是按钮禁用了。
+   // 假 Response 还要同时给 json() 和 text()（lib 的 fetchJson 读的是 resp.text()），并按真实
+   // 字段形状回 C 站公开接口——否则整批富化"取数失败"，界面截图就成了假的故障现场。
+   // 模型名沿用行标题（Demo A / Demo B），免得下面按 hasText 过滤的断言漂走。
+   window.fetch=async(u)=>{
+     const url=String(u), NAMES={1:'Demo A',2:'Demo B'};
+     let body;
+     if(url.indexOf('/api/v1/models/')>=0){
+       const id=String(url.split('/').pop());
+       body={id:Number(id)||1,name:NAMES[id]||('Demo Model '+id),type:'LORA',tags:['demo'],nsfw:false,
+         stats:{downloadCount:1234,ratingCount:56},
+         modelVersions:[{id:11,name:'v1.0',baseModel:'SD 1.5',trainedWords:['demo'],
+           files:[{name:'demo.safetensors',sizeKB:102400}],
+           images:[{url:'https://image.civitai.com/x/demo/original=true/1.jpeg',width:1024,height:1024,nsfwLevel:1}]}]};
+     }else if(url.indexOf('/api/v1/model-versions/mini/')>=0){
+       body={id:11,modelId:1,name:'v1.0',baseModel:'SD 1.5',type:'LORA'};
+     }else{
+       body={ok:true,app:'CivitaiFreeTool',version:'2.6.30',mode:'browser',window:false};
+     }
+     return {ok:true,status:200,json:async()=>body,text:async()=>JSON.stringify(body)};
+   };
   });
   await page.goto('http://127.0.0.1:'+server.address().port+'/popup.html');await page.waitForFunction(()=>document.querySelectorAll('.tab-row').length===2);assert(await page.locator('#batchPanel').isVisible());ok('当前页非模型时仍可批量其它已打开模型页');await page.setViewportSize({width:420,height:640});await page.screenshot({path:path.join(root,'docs/screenshots/extension-batch.png')});
   assert.equal(await page.locator('.tab-row input:checked').count(),2);await page.locator('.tab-row').filter({hasText:'Demo B'}).locator('input').uncheck();await page.locator('#sendBatch').click();await page.waitForFunction(()=>window.sent.length===1);assert.deepEqual(await page.evaluate(()=>window.sent),[['https://civitai.red/models/1/a?modelVersionId=11']]);ok('按勾选精确发送，不包含未选或其它网页');

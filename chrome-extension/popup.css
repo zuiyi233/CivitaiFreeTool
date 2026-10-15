@@ -13,3 +13,36 @@
 #sendHint.warn{color:#ce6b38}
 /* 缺 Key 是待办不是失败：用中性色，避免和 .failed/.uncertain 的橙色失败态混淆 */
 .result.needskey{color:var(--dim)}
+
+/* ---- 筛选行：控件多了一排，必须比 .tools 更紧凑，否则 420px 宽的小窗装不下 ---- */
+.filters{margin:6px 0;flex-wrap:wrap;gap:6px}
+.filters label{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--dim)}
+.filters select{font-size:11px;padding:5px 6px;max-width:132px}
+#sort{max-width:118px}
+
+/* ---- 列表行：富化结果（缩略图/类型/底模/大小）与「为什么这行是灰的」 ---- */
+#tabList{max-height:230px}
+.tab-row img.thumb{width:42px;height:42px;object-fit:cover;border-radius:6px;flex-shrink:0;background:var(--soft)}
+.tab-row .row-state{display:inline-block;margin-left:4px;padding:0 5px;border:1px solid var(--line);border-radius:7px;font-size:10px;color:var(--dim)}
+.tab-row .row-state.needs-login,.tab-row .row-state.rate-limited{color:#ce6b38;border-color:#e6c3a8}
+.tab-row .row-state.missing,.tab-row .row-state.error{color:#c23d50;border-color:#e7b6bd}
+.tab-row .row-state.stale{color:#8a6d3b;border-color:#dccfb4}
+.tab-row.nosub{opacity:.62}
+
+/* ---- 发送到 CFT 之后：任务区。状态点用颜色分「在跑 / 完成 / 失败」，
+       文字里再分开写「扩展：已提交」与「CFT：…」，避免把提交当成下载完成 ---- */
+#taskPanel{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+#taskPanel h3{font-size:13px;margin:0}
+#taskHint{line-height:1.45}
+#taskList{border:1px solid var(--line);border-radius:10px;background:var(--card);max-height:190px;overflow:auto}
+.task-item{display:flex;gap:8px;align-items:flex-start;padding:9px 10px;border-bottom:1px solid var(--line);font-size:12px}
+.task-item:last-child{border-bottom:0}
+.task-item .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0;margin-top:5px}
+.task-item.downloading .dot,.task-item.parsing .dot{background:var(--accent)}
+.task-item.done .dot{background:#238b60}
+.task-item.error .dot,.task-item.failed .dot{background:#c23d50}
+.task-item.waiting .dot{background:#ce6b38}
+.task-item b{display:block;font-weight:600;overflow-wrap:anywhere}
+.task-item small{display:block;color:var(--dim);font-size:11px;margin-top:2px;overflow-wrap:anywhere}
+.task-item .grow{min-width:0;flex:1}
+button.quiet{background:transparent;border:0;color:var(--dim);font-size:11px;padding:4px 0;margin-top:6px;text-decoration:underline}
