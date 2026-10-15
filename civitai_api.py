@@ -31,6 +31,46 @@ DOWNLOAD_URL_RE = re.compile(
 # 版本号可能出现在查询串里（任意位置/顺序）：modelVersionId=123 / modelVersionId=123 等
 _VERSION_QUERY_KEYS = ("modelversionid", "modelversion", "versionid")
 
+# ============================================================================
+# Civitai `files[].type` 权威枚举（来源：官方仓库 civitai/civitai 的 prisma 常量，共 17 值）：
+#   Model / Text Encoder / Vision Encoder / Pruned Model / Negative / Training Data / VAE /
+#   Config / Archive / UNet / Diffusion Model / CLIPVision / ControlNet / Workflow / Upscaler /
+#   Enhancement LoRA / Other
+# 历史数据里还混存已废弃的旧值（TrainData / InpaintMask / Template），比对前统一归一化
+# （去掉空格/下划线/连字符再小写），因此下面这些集合全部是**归一化后的形式**。
+# ============================================================================
+CIVITAI_FILE_TYPES = (
+    "model", "textencoder", "visionencoder", "prunedmodel", "negative", "trainingdata",
+    "vae", "config", "archive", "unet", "diffusionmodel", "clipvision", "controlnet",
+    "workflow", "upscaler", "enhancementlora", "other",
+    "traindata", "inpaintmask", "template",          # 已废弃但仍出现在旧数据里
+)
+# 真正的权重文件 = 可以当「主模型」下载的类型（Civitai 对 Config/Archive/Workflow 也打 primary，
+# 所以 pick_file 必须先用这个白名单过滤，不能只看 primary）。
+WEIGHT_FILE_TYPES = ("model", "prunedmodel", "diffusionmodel", "unet")
+# 附件：既不可下载也不能当主模型（negative 单独说明见下）。
+ATTACHMENT_FILE_TYPES = ("trainingdata", "traindata", "config", "archive", "image",
+                         "workflow", "inpaintmask", "template", "other")
+# 可下载的模型变体。注意 negative 是 .safetensors 负面嵌入，历史上一直允许下载，
+# 这里保持现状不缩小可下载范围，但它**永远不能**被 pick_file 选为主文件。
+DOWNLOADABLE_FILE_TYPES = WEIGHT_FILE_TYPES + (
+    "vae", "textencoder", "visionencoder", "clipvision", "clip", "controlnet",
+    "upscaler", "enhancementlora", "negative",
+    # 兼容 model.type 混进 files[].type 的历史数据/别名
+    "checkpoint", "lora", "locon", "dora", "lycoris", "embedding", "textualinversion",
+    "hypernetwork", "aestheticgradient",
+)
+
+
+def normalize_file_type(file):
+    """files[].type → 归一化形式（'Text Encoder'/'text_encoder'/'ControlNet' → textencoder/controlnet）"""
+    return re.sub(r"[\s_-]", "", str((file or {}).get("type", "Model"))).lower()
+
+
+def _pickable_file_items(files):
+    """ [(index, file)]，只留 dict 项（保持原顺序，index 是 version["files"] 里的下标）"""
+    return [(i, f) for i, f in enumerate(files or []) if isinstance(f, dict)]
+
 
 class CivitaiError(Exception):
     """status = HTTP 状态码（网络错误/解析失败时为 None）：tRPC 的降级文案要能分清 401 与断网"""
@@ -378,28 +418,60 @@ class CivitaiAPI:
         raise CivitaiError("无法解析 URL: %s" % url)
 
     def pick_file(self, version):
-        """从版本信息中挑选主模型文件：优先主文件且非负面嵌入，返回 (file, file_index)"""
+        """从版本信息中挑主模型文件，返回 (file, file_index)。
+
+        Civitai 会对**非权重文件**也打 `primary`（一个 Checkpoint 版本的 primary 完全可能是
+        Config/Archive/Training Data/Workflow），所以旧写法「primary 且不是 Negative 就返回」
+        会把 zip 或工作流当模型下载。改成分层挑选，语义仍是 primary 优先：
+        ① 权重类型（Model / Pruned Model / Diffusion Model / UNet），primary 里的优先；
+        ② 其余「非附属类型」（VAE / Text Encoder / ControlNet / Upscaler 这类模型本身就只有
+        这种文件，以及未来新增的类型），同样 primary 优先；
+        ③ 两层全空（只有 Negative/训练集/配置/工作流包）→ 抛 CivitaiError，绝不静默返回附件。
+        返回值仍是 (file, index) 二元组，调用方（webui/gui/browser_bridge）不用改。
+        """
         files = version.get("files") or []
         if not files:
             raise CivitaiError("该版本没有文件")
-        primary = [f for f in files if f.get("primary")]
-        if not primary:
-            primary = files
-        for f in primary:
-            if f.get("type") != "Negative":
-                return f, files.index(f)
-        return primary[0], files.index(primary[0])
+        items = _pickable_file_items(files)
+        if not items:
+            raise CivitaiError("该版本的文件列表格式异常，无法挑选主模型")
+        primary = [(i, f) for i, f in items if f.get("primary")] or items
+
+        def _first(pool, keep):
+            for i, f in pool:
+                if keep(normalize_file_type(f)):
+                    return f, i
+            return None
+
+        weight = _first(primary, lambda kind: kind in WEIGHT_FILE_TYPES) \
+            or _first(items, lambda kind: kind in WEIGHT_FILE_TYPES)
+        if weight:
+            return weight
+        # 退回「非附属类型」：附件集合是显式的，负嵌入也在这里被排除（主模型绝不能是 negative）
+        rest = _first(primary, lambda kind: kind not in ATTACHMENT_FILE_TYPES
+                                            and kind != "negative") \
+            or _first(items, lambda kind: kind not in ATTACHMENT_FILE_TYPES
+                                           and kind != "negative")
+        if rest:
+            return rest
+        raise CivitaiError("该版本只有负面嵌入/训练集/配置/工作流等附件，没有主模型文件，已取消下载")
 
     def model_files(self, version):
-        """Only downloadable model variants, not training archives / config attachments."""
+        """Only downloadable model variants, not training archives / config attachments.
+
+        包含项与排除项都用显式的 files[].type 集合（归一化后比对），不再靠「扩展名恰好在 weights 里」
+        兜住已知类型；扩展名兜底只保留给**未来新增/未知类型**（见 test_diffusion_models_and_future_weight_types_not_dropped），
+        这样已知类型不会因为后缀冷门（.gguf/.onnx/.sft…）而漏掉可下载文件。
+        """
         weights = {'.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.gguf', '.onnx', '.sft'}
         def downloadable(f):
-            kind = re.sub(r'[\s_-]', '', str(f.get('type', 'Model'))).lower()
-            if kind in ('trainingdata', 'config', 'archive', 'image', 'other'):
+            kind = normalize_file_type(f)
+            if kind in ATTACHMENT_FILE_TYPES:
                 return False
-            ext = '.' + str(f.get('name', '')).rsplit('.', 1)[-1].lower()
-            return kind in ('model', 'negative', 'diffusionmodel', 'vae', 'textencoder', 'clip',
-                            'checkpoint', 'lora', 'locon', 'controlnet', 'embedding') or ext in weights
+            if kind in DOWNLOADABLE_FILE_TYPES:
+                return True
+            # 未知/未来类型：仍然按扩展名放行，不缩小既有的可下载范围
+            return "." + str(f.get('name', '')).rsplit('.', 1)[-1].lower() in weights
         candidates = [f for f in version.get("files", []) if isinstance(f, dict) and
                       f.get('name') and downloadable(f)]
         if not candidates:

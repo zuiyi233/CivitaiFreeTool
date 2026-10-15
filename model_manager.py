@@ -22,6 +22,8 @@ _SIDE_EXTS = (
 ) + tuple(sorted(IMAGE_EXTS))
 
 # 已知 C 站类型白名单（其他类型如 AnimateDiff/ONNX/Clip 等目录一律不动）
+# ⚠️ 类型→目录映射的**权威表在 model_routing.py**（新分流功能的唯一事实来源），
+#    此处仅供旧的「整理模型」流程使用，不要在这里补全新类型。
 KNOWN_TYPES = {
     "LORA", "LoRA", "Checkpoint", "VAE", "TextualInversion", "Embedding",
     "ControlNet", "Controlnet", "LoCon", "DoRA", "Hypernetwork",
@@ -38,6 +40,8 @@ ENV_DIRS = {
         "ControlNet": "ControlNet", "Controlnet": "ControlNet",
         "Hypernetwork": "hypernetworks",
     },
+    # ⚠️ 类型→目录映射的权威表在 model_routing.py（新分流功能的唯一事实来源），
+    #    这里这份旧表故意不补全（缺 UNet/TextEncoder/Upscaler/CLIPVision 等），仅供旧整理流程使用。
     "comfyui": {
         "LORA": "loras", "LoRA": "loras", "LoCon": "loras", "DoRA": "loras",
         "Checkpoint": "checkpoints",
