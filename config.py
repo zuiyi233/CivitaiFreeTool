@@ -40,6 +40,10 @@ DEFAULTS = {
     "window_style": "mica",             # mica / acrylic / none
     "ask_move_after_download": True,    # 下载完成后询问移动位置
     "download_target_dir": "",          # 下载落地文件夹（下载页/设置里选；空 = 用 download_dir）
+    # —— 按类型分流（model_routing 决策层 + webui._route_dest_dir 接入，落点形状 <root>\<类型key>\<模型名>\）——
+    "comfyui_models_root": "",           # ComfyUI 的 models 根目录绝对路径；空/不存在 = 不分流
+    "route_by_type": False,              # 默认关：保守发布。开=模型本体与全部附属文件落进嵌套类型目录
+    "route_unclassified": "keep",        # 判不出类型时：keep=保持现有落盘并在原因里说明（当前唯一实现值）
     "gen_metadata": True,               # 下载完成后自动生成 json/info
     "download_cover": True,             # 下载完成后自动下载封面
     "update_keep_old": "keep",           # 更新下载完成后旧版处理：keep=保留（默认）/ delete=移入回收站（可还原）
@@ -221,6 +225,10 @@ def normalize_ui_preferences(cfg):
         try:value=int(cfg.get(key,default));cfg[key]=0 if key=="effects_fps_limit" and value==0 else max(lo,min(hi,value))
         except (TypeError,ValueError,OverflowError):cfg[key]=default
     cfg['images_dir_autofill']=cfg.get('images_dir_autofill',True) is not False   # 默认开；只有显式 false 才关
+    # —— 分流：默认关，只有显式 true 才开（脏值 "true"/1 一律当关，避免半开状态）——
+    cfg['route_by_type']=cfg.get('route_by_type') is True
+    cfg['comfyui_models_root']=str(cfg.get('comfyui_models_root') or '').strip()
+    cfg['route_unclassified']=str(cfg.get('route_unclassified') or 'keep').strip().lower() or 'keep'
     cfg['shortcuts_enabled']=cfg.get('shortcuts_enabled') is True
     legacy_shortcuts=cfg.pop("shortcuts_preset", None)
     bindings=cfg.get('shortcuts_bindings')

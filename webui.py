@@ -1241,9 +1241,15 @@ class Api:
         return {"path": path, **path_util.check_reachable(path)}
 
     def _models_roots(self):
-        """有效的模型管理目录列表（多目录支持：models_dirs + 兼容 models_dir）"""
-        return [r["path"] for r in self._model_roots_with_status()
-                if r.get("status") == "ok"]
+        """有效的模型管理目录列表（多目录支持：models_dirs + 兼容 models_dir）。
+
+        分流开启且 comfyui_models_root 有效时并入：否则落进 <root>\\vae、<root>\\controlnet 的文件
+        软件自己看不见（_target_allowed 会拒绝、模型管理扫描也扫不到）。"""
+        roots = [r["path"] for r in self._model_roots_with_status() if r.get("status") == "ok"]
+        extra = path_util.norm_root(str(self.cfg.get("comfyui_models_root") or ""))
+        if self.cfg.get("route_by_type") and extra and os.path.isdir(extra) and extra not in roots:
+            roots.append(extra)
+        return roots
 
     def _root_of(self, path):
         """返回包含该文件的模型目录根（多目录时定位归属）"""
@@ -1551,9 +1557,17 @@ class Api:
                             expected_sha256=hashes.get("SHA256") or "",
                             info={"fileId": f.get("id"), "modelName": model_name,
                                   "versionName": version.get("name", ""), "url": u, "meta": meta})
+                        # 按类型分流（与 _enqueue_one 同一判定）：这条是下载页主链路，漏了它分流就不生效
+                        routed, route_reason, route_source = self._route_dest_dir(
+                            model_obj, version, f, os.path.splitext(fname)[0])
+                        task.info["route_reason"] = route_reason
+                        task.info["route_source"] = route_source
+                        if routed:
+                            task.info["routed_dir"] = routed
                         self._prefetch_task_cover(task)
                         self.dl.add_task(task)
-                        state["items"].append({"url": u, "ok": True, "msg": "已加入: %s" % fname})
+                        state["items"].append({"url": u, "ok": True, "msg": "已加入: %s" % fname,
+                                               "dest_dir": routed or "", "route_reason": route_reason})
                 except Exception as e:
                     state["items"].append({"url": u, "ok": False, "msg": str(e)[:120]})
                 state["done"] += 1
@@ -1578,6 +1592,9 @@ class Api:
                     "progress": t.progress, "speed": t.speed,
                     "downloaded": t.downloaded, "total": t.total,
                     "error": t.error, "dest_dir": t.dest_dir,
+                    # 分流任务的 dest_dir 在「下载开始那一刻」才写入，列表要先看到落点与原因
+                    "routed_dir": (t.info or {}).get("routed_dir", ""),
+                    "route_reason": (t.info or {}).get("route_reason", ""),
                     "hash_mismatch": t.status == downloader.ST_ERROR and "SHA256 校验失败" in t.error,
                     "manual_binding": download_binding.binding_matches(t),
                     "url": (t.info or {}).get("url", ""),
@@ -2866,6 +2883,155 @@ class Api:
         st = getattr(self, "_img_dl_state", None)
         return json.dumps(st or {"total": 0, "done": 0})
 
+    # ---------------- 按类型分流（ComfyUI models 目录） ----------------
+    _SNIFF_TIMEOUT_S = 10
+    """单次嗅探请求的读超时（秒）。"""
+
+    _SNIFF_BUDGET_S = 8
+    """整次嗅探的总时限（秒，两段 Range 合起来算）。dl_enqueue_url_sync 是归档桥的同步入口，
+    嗅探再慢也不能把入队请求拖成超时 —— 超预算直接放弃嗅探，退化为「只按类型映射」。"""
+
+    _SNIFF_MAX_BYTES = 16 * 1024 * 1024
+    """头部总读取上限（字节），并再被 model_routing.MAX_HEADER_SIZE 夹一次。
+    实测 Pony SDXL 头 365KB、kohya LoRA 头 80KB，16MB 足够宽；上限只是「别被离谱的长度字段拖垮」。"""
+
+    def _route_dest_dir(self, model_obj, version, f, base_name):
+        """算「模型本体该落进哪个嵌套类型目录」：`<comfyui_models_root>\\<类型key>\\<模型名>\\`。
+
+        返回 (绝对落点 or None, 人类可读原因（含为什么没分流）, 判定来源）。硬约束：
+        - 任何一步失败只降级成「不分流」：绝不抛异常、绝不阻塞入队、绝不让下载失败。
+        - resolve_dest_dir 返回 None **不是错误**（类型目录不存在/不可写/同名占用）→ 保持现有落盘，
+          并且绝不新建 `<类型key>` 目录（没被 folder_paths 注册的新目录只会变成垃圾目录）。
+        - 建目录只在「分流成功」时做：`<类型key>` 已存在，建它下面的模型名目录是允许的。
+        """
+        try:
+            if not self.cfg.get("route_by_type"):
+                return None, "未开启分流", "none"
+            models_root = str(self.cfg.get("comfyui_models_root") or "").strip()
+            if not models_root or not os.path.isdir(models_root):
+                return None, "未开启分流（ComfyUI models 根目录未填写或不存在）", "none"
+            import model_routing
+            model_obj = model_obj if isinstance(model_obj, dict) else {}
+            version = version if isinstance(version, dict) else {}
+            f = f if isinstance(f, dict) else {}
+            model_type = model_obj.get("type")
+            file_type = f.get("type")
+            base_model = version.get("baseModel")
+            fname = str(f.get("name") or base_name or "")
+            decision = model_routing.classify(model_type, file_type, base_model)
+            # Checkpoint / Model 这一类 checkpoints 与 diffusion_models 分不清，才值得读文件头
+            if self._needs_header_probe(fname, file_type, decision):
+                header = self._sniff_safetensors_header(version, f)
+                if header:
+                    decision = model_routing.classify(model_type, file_type, base_model, header)
+            if not decision.folder:
+                mode = str(self.cfg.get("route_unclassified") or "keep").strip().lower() or "keep"
+                # 目前只有 keep 一档（保持现有落盘并如实说明原因）；未来加档位在这里分支，不猜目录
+                return None, "未分流：%s（route_unclassified=%s）" % (decision.reason, mode), decision.source
+            bundle = model_routing.bundle_name_for(model_obj.get("name") or base_name,
+                                                   version.get("name") or "")
+            dest = model_routing.resolve_dest_dir(models_root, decision.folder, bundle)
+            if not dest:
+                # 落点原因要先落成变量：写成 `return None, (原因, 来源)` 会变成 2 元组，调用方解包直接炸
+                blocked = ("未分流：%s，但 %s\\%s 不存在、不可写或被同名文件占用，"
+                           "保持现有落盘（不新建类型目录）"
+                           % (decision.reason, decision.folder, bundle))
+                return None, blocked, decision.source
+            try:
+                os.makedirs(dest, exist_ok=True)
+            except OSError as e:
+                return None, "未分流：落点目录创建失败（%s）" % str(e)[:80], decision.source
+            return dest, "%s → %s" % (decision.reason, dest), decision.source
+        except Exception as e:
+            try:
+                self.log_error("route", "分流判定异常（已保持现有落盘）: %s" % e)
+            except Exception:
+                pass
+            return None, "未分流：判定异常（%s）" % str(e)[:80], "none"
+
+    def _needs_header_probe(self, fname, file_type, decision):
+        """值不值得花两次 Range 请求去读 safetensors 头：
+        · 类型指向 checkpoints（Checkpoint / Model 家族：全量 FT 与单挑 unet 都标这个）
+        · 类型判不出（folder=None）但文件类型确实是权重（Model / Pruned Model / Diffusion Model / UNet）
+        其余一律不嗅探 —— GGUF/.pth/.ckpt 不是 safetensors，读头只会拿到脏字节。"""
+        import model_routing
+        if os.path.splitext(str(fname or ""))[1].lower() != ".safetensors":
+            return False
+        if decision.folder == "checkpoints":
+            return True
+        return (not decision.folder) and str(file_type or "") in model_routing.WEIGHT_FILE_TYPES
+
+    def _sniff_safetensors_header(self, version, f):
+        """两段式只读文件头（长度 + 头 JSON）；任何失败返回 None → 降级为「只按类型映射」。
+
+        实测坑：受限/NSFW 版本没权限时下载 307 会跳 auth.civitai.com/login 并回 200 text/html，
+        不严格校验状态码与 Content-Type 就会把 HTML 当 safetensors 头解析。"""
+        import model_routing
+        try:
+            url = str(self.api.file_download_url(version, f) or "")
+        except Exception:
+            return None
+        if not url:
+            return None
+        cap = min(self._SNIFF_MAX_BYTES, model_routing.MAX_HEADER_SIZE)
+        deadline = time.monotonic() + self._SNIFF_BUDGET_S
+        try:
+            return model_routing.probe_header(self._make_header_fetch(url, cap, deadline), max_bytes=cap)
+        except Exception:
+            return None
+
+    def _make_header_fetch(self, url, cap, deadline):
+        """生成 model_routing.probe_header 需要的 fetch(start, end)（HTTP Range 是**闭区间**）。
+
+        校验不过一律返回 None（probe_header 把它当嗅探失败处理，不抛错）：
+        - 走 civitai_api.build_opener：307 跳预签名 URL 时必须剥掉 Authorization，
+          否则 R2 报签名错（见 _NoAuthRedirect 同一说明）；有 Key 才带 Bearer。
+        - 只接受 206：200 说明 Range 被忽略或跳到了登录页，字节偏移对不上，绝不采信。
+        - Content-Type 必须是 application/octet-stream：text/html / application/json 都是 C 站限制页。
+        - 头 JSON 段（start==8）必须以 `{` 开头。
+        - 读满 expect 才算数，且总字节被 cap 夹住、请求带超时。
+        - 超过 deadline（_SNIFF_BUDGET_S）直接放弃：同步入队链路不能被嗅探拖住。
+        """
+        import urllib.request
+
+        def fetch(start, end):
+            try:
+                if end < start or end + 1 > cap or end - start + 1 > cap:
+                    return None
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                headers = {"User-Agent": "Mozilla/5.0 (CivitaiFreeTool)",
+                           "Range": "bytes=%d-%d" % (start, end)}
+                key = str(self.cfg.get("api_key") or "").strip()
+                if key:
+                    headers["Authorization"] = "Bearer " + key
+                req = urllib.request.Request(url, headers=headers)
+                opener = civitai_api.build_opener(
+                    self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
+                    self.cfg.get("ssl_verify", True))
+                expect = end - start + 1
+                with opener.open(req, timeout=min(self._SNIFF_TIMEOUT_S, max(1.0, left))) as resp:
+                    status = getattr(resp, "status", None) or resp.getcode()
+                    if status != 206:
+                        return None
+                    if "octet-stream" not in (resp.headers.get("Content-Type") or "").lower():
+                        return None
+                    data = b""
+                    while len(data) < expect:
+                        chunk = resp.read(min(expect - len(data), 64 * 1024))
+                        if not chunk:
+                            break
+                        data += chunk
+                    if len(data) != expect:
+                        return None
+                    if start == 8 and not data.startswith(b"{"):
+                        return None
+                    return data
+            except Exception:
+                return None
+        return fetch
+
     @requires_civitai_key("dict")
     def _enqueue_one(self, url, dest_dir=None, skip_if_exists=False, _version=None, _file=None, _model_id=None, dest_subdir=""):
         """同步解析单条 URL 并入队（忽略付费状态）。返回 item dict：{url, ok, msg, task_id?}
@@ -2955,13 +3121,23 @@ class Api:
                 # 归档桥指定子目录：落盘到归档根下该子目录（逃逸校验复用 _safe_archive_path）
                 dest_dir = self._safe_archive_path(self._archive_root(), dest_subdir)
                 info["dest_explicit"] = True      # 同样标记，不被全局目标/自动归位搬走
+            # —— 按类型分流：显式落点（更新下载 / 归档子目录）优先级最高，此时不判定也不嗅探 ——
+            if info.get("dest_explicit"):
+                info["route_reason"] = "指定落点优先（更新下载/归档子目录），未分流"
+                info["route_source"] = "none"
+            else:
+                routed, route_reason, route_source = self._route_dest_dir(model_obj, version, f, base_name)
+                info["route_reason"] = route_reason
+                info["route_source"] = route_source
+                if routed:
+                    info["routed_dir"] = routed    # 绝对落点；downloader._resolve_dest 认它，压过全局目标
             dl_url = api.file_download_url(version, f)
             if not dl_url:
                 item["msg"] = "无下载链接"
                 return item
             # ★ 防重复（更新下载专用）：同一版反复点「更新」不再重复入队/重复下载
             if skip_if_exists:
-                tdir = (dest_dir or "").strip()
+                tdir = (dest_dir or info.get("routed_dir") or "").strip()
                 fname = base_name + src_ext
                 if tdir and os.path.exists(os.path.join(tdir, fname)):
                     item.update({"msg": "已经在目标文件夹里了：%s（要重新下载请先删掉它）" % fname, "skipped": True})
@@ -2976,6 +3152,11 @@ class Api:
             self._prefetch_task_cover(task)
             self.dl.add_task(task)
             item.update({"ok": True, "msg": "已加入队列: %s" % (base_name + src_ext), "task_id": task.id})
+            # 落点信息给下载列表展示（前端字段由后续任务接；这里保证后端齐全）：
+            # dest_dir = 已确定的绝对落点（分流成功或显式指定），空 = 下载开始那一刻才解析全局目标
+            item["dest_dir"] = info.get("routed_dir") or dest_dir
+            item["route_reason"] = info.get("route_reason", "")
+            item["route_source"] = info.get("route_source", "")
         except civitai_api.CivitaiError as e:
             item["msg"] = _friendly_api_error(str(e))[:300]
         except Exception as e:

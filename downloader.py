@@ -314,6 +314,9 @@ class Downloader:
                 ((task.info or {}).get("manual_binding") or {}).get('actual_sha256') == task.actual_sha256 and task.actual_sha256 else None,
             "modelName": (task.info or {}).get("modelName", ""),
             "versionName": (task.info or {}).get("versionName", ""),
+            # 分流落点与「为什么分流/为什么没分流」：历史列表要能如实显示（dest_dir 已是最终落点）
+            "routed_dir": (task.info or {}).get("routed_dir", ""),
+            "route_reason": (task.info or {}).get("route_reason", ""),
         }
 
     def get_history(self):
@@ -360,14 +363,24 @@ class Downloader:
                 pass
 
     def _resolve_dest(self, task):
-        """决定任务落地目录：单独指定过的最优先；否则「当前」全局目标（含 HF 相对子目录）；
-        再退回任务自带目录 → 默认下载目录。
+        """决定任务落地目录，优先级从高到低：
+
+        1. `dest_explicit` + `task.dest_dir`：用户单独指定过的落点（更新下载、归档桥子目录、
+           下载管理「保存到」列）—— 显式意图永远压过分流与全局目标。
+        2. `info["routed_dir"]`：按类型分流的嵌套落点 `<models_root>\\<类型key>\\<模型名>\\`
+           （由 webui._route_dest_dir 在入队时算好）。**目录已不存在/不可写就回落**，
+           绝不在这里 mkdir 分流目录（用户手删或换盘时不能报错，也不能造出扫不到的空目录）。
+        3. 「当前」全局目标 `download_target_dir`（含 HF 相对子目录）→ 任务自带目录 → 默认下载目录。
 
         注意：老任务（v2.1.18 及以前）的 dest_dir 是入队时烤进去的旧全局目标，
-        没有 dest_explicit 标记，所以按「当前全局目标」走 —— 用户改了目标就跟着改。"""
+        没有 dest_explicit 标记，所以按「当前全局目标」走 —— 用户改了目标就跟着改。
+        分流任务的 dest_dir 入队时留空（同老任务），靠 routed_dir 压过全局目标才不被搬走。"""
         info = task.info or {}
         if info.get("dest_explicit") and task.dest_dir:
             return task.dest_dir
+        routed = str(info.get("routed_dir") or "").strip()
+        if routed and os.path.isdir(routed) and os.access(routed, os.W_OK):
+            return routed
         t = (self.cfg.get("download_target_dir") or "").strip()
         base = t if (t and os.path.isdir(t)) else ""
         if not base:
