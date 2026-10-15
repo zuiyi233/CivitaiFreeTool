@@ -1,6 +1,11 @@
 // offscreen/archive-worker.js —— 归档编排器（P1+P2+P3+P4）
 // 运行环境：offscreen document（有 DOM/fetch，无 showDirectoryPicker，不能调 chrome.downloads）。
 // 写盘一律经 sendBg('writeFile') 发给 background；进度/弹窗一律经 sendContent 发给 content。
+// 数据请求（模型详情/评论/评价/样图元数据）一律经 CFT.api.requestData，并由 withPageTransport
+// 给当前任务装好「页面通道」fetcher：请求先在用户的模型页里同源发出（带登录 Cookie），页面不在/
+// 不应答/超时/返回 ok:false 时才回落扩展直连（带 credentials:'include'）。油猴脚本时代这些请求本来就
+// 在页面里发，移植后变成跨站匿名请求才出现 tRPC 401 与公开 API 空 items —— 见 lib 文件头 7)。
+// 媒体二进制（封面/配图/模型文件）不走页面通道：只回文本且有 3MB 上限，且不需要登录态。
 // 参考源：油猴脚本 saveCivitaiModelInfo（2098-2570）、downloadSingleImage（2694-2800）。
 import '../lib/util.js';
 import '../lib/civitai-api.js';
@@ -55,14 +60,181 @@ function sendContent(tabId, type, payload) {
 }
 
 // 请求-答复：payload 自动带 cid；超时或 content 不可达时 resolve(null)（按取消处理）
-function askContent(tabId, type, payload) {
+// timeoutMs 可覆盖等待上限（页面数据通道用的就是这一套请求-答复机制，只是超时跟着请求走）
+function askContent(tabId, type, payload, timeoutMs) {
   if (tabId == null) return Promise.resolve(null);
   const cid = newCid();
-  const p = waitCid(cid, ASK_TIMEOUT_MS);
+  const ms = (Number(timeoutMs) > 0) ? Number(timeoutMs) : ASK_TIMEOUT_MS;
+  const p = waitCid(cid, ms);
   sendContent(tabId, type, Object.assign({}, payload, { cid })).catch(() => {
     resolveCid(cid, null);
   });
   return p;
+}
+
+// ---- 页面数据通道（pageFetch）----
+// 为什么必须有：油猴脚本时代所有 Civitai 数据请求都发生在页面里（同源 + 浏览器自动带登录
+// Cookie），移植到 offscreen 后源变成 chrome-extension://、请求变匿名 → tRPC 401、公开 API
+// 把受限结果清成 {"items":[]}。content 侧（model-page.js / image-badge.js）已实现 pageFetch
+// 处理器（白名单 https + civitai.com|civitai.red + /api/v1/|/api/trpc/，credentials:'same-origin'，
+// 3MB 上限），这里负责把它接进 lib 的传输层：
+//   · 装 fetcher 的唯一入口是 CFT.api.setFetcher，lib 的 requestData 是唯一选通道的地方；
+//   · withPageTransport(entries, label, fn) 给「当前任务」安装，fn 结束 finally 还原；
+//     引用计数 + 共享 scope，所以批量阶段并发 5 个 item 时不会互相踩掉别人的 fetcher；
+//   · 每个 item 用自己的 tabId（按页面 URL / 站点 host 匹配，见 ptPickTab）；
+//   · 哪条通道真的拿到了数据记进 scope.stats + 每条产物的 [通道] 说明，不粉饰也不冤枉接口。
+// 媒体（封面/配图/模型文件）不走这里：页面通道只回文本且有 3MB 上限，二进制仍走 fetchJson。
+const PT_REPLY_SLACK_MS = 3000;      // 页面侧超时 + 消息往返余量；再不到就判「标签页不应答」
+const PT_MAX_BODY_HINT = '3MB';      // 与 content 侧 PAGE_FETCH_MAX_BODY_CHARS 一致
+
+let _ptScope = null;                 // 当前任务作用域（引用计数；最外层负责还原 fetcher）
+
+// 只认白名单站点（复用 lib 的判定，避免这里再写一套 host 正则）；www. 前缀不参与比较
+function ptHostOf(u) {
+  const h = String((CFT.api && typeof CFT.api.civitaiHostFrom === 'function') ? CFT.api.civitaiHostFrom(u) : '');
+  return h.replace(/^www\./i, '').toLowerCase();
+}
+
+function ptMakeEntry(entry) {
+  const e = entry || {};
+  const tabId = (e.tabId == null || e.tabId === '') ? null : Number(e.tabId);
+  if (!Number.isFinite(tabId) || tabId < 0) return null;
+  const pageUrl = String(e.pageUrl || '');
+  return { tabId, pageUrl, host: ptHostOf(pageUrl) }; // host=='' → 站点未知的 tab（单图流），只能兜底借道
+}
+
+function ptAddEntries(scope, entries) {
+  if (!scope) return;
+  const list = Array.isArray(entries) ? entries : (entries ? [entries] : []);
+  for (const raw of list) {
+    const e = ptMakeEntry(raw);
+    if (!e) continue;
+    const hit = scope.entries.find((x) => x.tabId === e.tabId);
+    if (hit) { if (!hit.pageUrl && e.pageUrl) { hit.pageUrl = e.pageUrl; hit.host = e.host; } continue; }
+    scope.entries.push(e);
+  }
+}
+
+// 选标签页：① 页面 URL 完全一致（批量里每个 item 用自己的 tab）② 同站点 host ③ 站点未知的 tab 兜底。
+// host 对不上时宁可不借：从 civitai.red 的页面里发 civitai.com 的请求是跨站，页面侧
+// credentials:'same-origin' 反而不带 Cookie，借了等于又退回匿名。
+function ptPickTab(scope, url, pageUrlOrHost) {
+  if (!scope) return null;
+  const alive = scope.entries.filter((e) => e && e.tabId != null && !scope.dead.has(e.tabId));
+  if (!alive.length) return null;
+  const want = ptHostOf(pageUrlOrHost) || ptHostOf(url);
+  if (!want) return alive[0].tabId;
+  if (pageUrlOrHost) {
+    const exact = alive.find((e) => e.pageUrl && String(e.pageUrl) === String(pageUrlOrHost) && ptHostOf(e.pageUrl) === want);
+    if (exact) return exact.tabId;
+  }
+  const same = alive.find((e) => e.host === want);
+  if (same) return same.tabId;
+  const wild = alive.find((e) => !e.host);
+  return wild ? wild.tabId : null;
+}
+
+// 交给 CFT.api.setFetcher 的 fetcher：发 pageFetch → 等同 cid 的 pageFetchResult。
+// 契约返回形状 {ok, status, text}；不可用（无 tab / 不应答 / 结构异常）时抛错，由 lib 回落直连。
+// 注意：ok:false 也照样把 status 带回去（401 必须由 lib 记到 page 这一路，不能被当成"没跑过"）。
+function makePageFetcher(scope) {
+  return async function pageFetcher(url, opts) {
+    const o = opts || {};
+    const timeoutMs = Math.max(1000, Number(o.timeoutMs) || FETCH_TIMEOUT_MS);
+    const tabId = ptPickTab(scope, url, o.pageUrlOrHost);
+    if (tabId == null) {
+      // 区分「本来就没有 tab」和「tab 都在短路名单里」——后者是这次任务的页面通道挂过，不是没接
+      const deadList = Array.from(scope.dead);
+      scope.lastPageError = (scope.entries.length && deadList.length >= scope.entries.length)
+        ? '已短路：标签页 ' + deadList.join(', ') + ' ' + (scope.deadReason.get(deadList[0]) || '之前未应答')
+        : '不可用：没有与该请求站点匹配的标签页（页面通道未安装或站点不同）';
+      throw new Error(scope.lastPageError);
+    }
+    if (scope.dead.has(tabId)) {
+      throw new Error('已短路：标签页 ' + tabId + ' ' + (scope.deadReason.get(tabId) || '之前未应答'));
+    }
+    const ans = await askContent(tabId, 'pageFetch', { url, timeoutMs }, timeoutMs + PT_REPLY_SLACK_MS);
+    if (!ans || typeof ans !== 'object') {
+      // 标签页已关 / content 未接入：同一个 tab 不会第二次应答，本任务内直接短路，
+      // 免得 5 组候选入参各等一次超时（批量 110 页会把时间全耗在等人不回的消息上）
+      scope.dead.add(tabId);
+      scope.deadReason.set(tabId, '超时未应答');
+      scope.stats.noAnswer += 1;
+      scope.lastPageError = '无应答（标签页 ' + tabId + ' 可能已关闭或页面未接入助手，' + timeoutMs + 'ms 超时）';
+      throw new Error(scope.lastPageError);
+    }
+    const status = Number(ans.status) || 0;
+    const body = typeof ans.body === 'string' ? ans.body : '';
+    const truncated = ans.truncated === true;
+    if (ans.ok === true && !truncated) {
+      scope.stats.pageOk += 1;
+      scope.stats.lastPageTransport = CFT.api.TRANSPORT_PAGE;
+      return { ok: true, status: status || 200, text: body };
+    }
+    scope.stats.pageFail += 1;
+    scope.lastPageError = ans.err ? String(ans.err)
+      : (truncated ? '返回体超过 ' + PT_MAX_BODY_HINT + ' 上限被截断（JSON 不可用）'
+        : '返回 ok=false（status ' + status + '）');
+    // 状态原样回传：401 必须由 lib 记到 page 这一路（不能让它以为"页面通道没跑过"）
+    return { ok: false, status, text: body, err: scope.lastPageError, truncated };
+  };
+}
+
+function ptBegin(entries, label) {
+  if (_ptScope) {
+    _ptScope.depth += 1;
+    ptAddEntries(_ptScope, entries);
+    if (!_ptScope.installed && _ptScope.entries.length) {
+      _ptScope.prevFetcher = (typeof CFT.api.setFetcher === 'function') ? CFT.api.setFetcher(makePageFetcher(_ptScope)) : null;
+      _ptScope.installed = true;
+    }
+    return;
+  }
+  const scope = {
+    label: String(label || ''), depth: 1, entries: [], dead: new Set(), deadReason: new Map(),
+    lastPageError: '', installed: false, prevFetcher: null,
+    stats: { pageOk: 0, pageFail: 0, noAnswer: 0, lastPageTransport: '' },
+  };
+  ptAddEntries(scope, entries);
+  if (scope.entries.length && typeof CFT.api.setFetcher === 'function') {
+    scope.prevFetcher = CFT.api.setFetcher(makePageFetcher(scope));
+    scope.installed = true;
+  } else {
+    scope.lastPageError = scope.entries.length ? 'lib 未提供 setFetcher（版本不匹配），只能用扩展直连'
+      : '任务没有可用标签页，页面通道未安装（全部请求走扩展直连）';
+  }
+  _ptScope = scope;
+}
+
+function ptEnd() {
+  const scope = _ptScope;
+  if (!scope) return;
+  scope.depth -= 1;
+  if (scope.depth > 0) return;
+  if (scope.installed) {
+    try { CFT.api.setFetcher(scope.prevFetcher || null); } // 还原默认（= 只剩带 Cookie 的直连）
+    catch (e) { clog('warn', '还原默认 fetcher 失败', e); }
+  }
+  if (_ptScope === scope) _ptScope = null;
+}
+
+// 任务级安装：fn 全程可用页面通道，结束时（含抛错）必还原
+async function withPageTransport(entries, label, fn) {
+  ptBegin(entries, label);
+  try { return await fn(); } finally { ptEnd(); }
+}
+
+// 页面通道的实话（供产物文本引用）
+function pageTransportSummary() {
+  const scope = _ptScope;
+  if (!scope) {
+    return { installed: false, active: false, pageOk: 0, pageFail: 0, noAnswer: 0, tabs: 0, lastPageError: '', deadTabs: [] };
+  }
+  return {
+    installed: !!scope.installed, active: true, tabs: scope.entries.length,
+    pageOk: scope.stats.pageOk, pageFail: scope.stats.pageFail, noAnswer: scope.stats.noAnswer,
+    lastPageError: scope.lastPageError || '', deadTabs: Array.from(scope.dead), label: scope.label,
+  };
 }
 
 function reportProgress(tabId, percent, text, level) {
@@ -90,6 +262,8 @@ function utf8ToB64(str) {
   return btoa(unescape(encodeURIComponent(String(str == null ? '' : str))));
 }
 
+// 媒体二进制下载（封面/配图/单图）：仍走扩展直连 fetchJson —— 页面通道只回文本且有 3MB 上限，
+// 而且 CDN 资源不需要登录态（数据类接口才需要，见上面 PT 段）。
 async function fetchArrayBuffer(url) {
   let lastErr = null;
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt += 1) {
@@ -177,10 +351,15 @@ async function collectPromptList(verItem, pageUrl) {
     return String(seg).split('.')[0];
   }).filter((id) => /^\d+$/.test(id));
   const promptList = [];
-  const gaps = { noMeta: [], failed: 0, lastReason: '', lastErr: '' };
+  // transports/lastPageError：把「这条数据是哪条通道拿的」原样带出来（页面登录态 vs 扩展匿名直连），
+  // 因为「空 items」在两种上下文里的含义完全不同，产物文本必须按当次实际情况说话
+  const gaps = { noMeta: [], failed: 0, lastReason: '', lastErr: '', transports: {}, pageTried: 0, lastPageError: '' };
+  const tally = (t) => { if (t) gaps.transports[t] = (gaps.transports[t] || 0) + 1; };
   for (const imageId of imageIds.slice(0, 20)) {
     try {
       const core = await CFT.api.getImageGenerationData(imageId, pageUrl);
+      tally(core && core.transport);
+      if (core && core.pageError) { gaps.pageTried += 1; gaps.lastPageError = String(core.pageError); }
       const meta = core && core.meta;
       if (core && core.found === true && meta && (core.type === 'image' || core.type === 'video')) {
         promptList.push({
@@ -201,6 +380,7 @@ async function collectPromptList(verItem, pageUrl) {
       gaps.lastErr = (e && e.message) || String(e);
     }
   }
+  gaps.lastPageError = gaps.lastPageError || pageTransportSummary().lastPageError;
   return { authImages, promptList, gaps };
 }
 
@@ -208,33 +388,57 @@ function rawImagesOf(verItem) {
   return Array.isArray(verItem && verItem.images) ? verItem.images : [];
 }
 
+// 样图元数据请求实际走的通道（不留空白让人猜"是没登录还是真没有"）
+function describePromptTransports(gaps) {
+  const g = gaps || {};
+  const t = g.transports || {};
+  const page = Number(t[CFT.api.TRANSPORT_PAGE]) || 0;
+  const direct = Number(t[CFT.api.TRANSPORT_DIRECT]) || 0;
+  if (!page && !direct) return '';
+  const parts = [];
+  if (page) parts.push('页面通道（借模型页同源、带你的登录状态）' + page + ' 次');
+  if (direct) parts.push('扩展直连（chrome-extension 源，站点多半按匿名处理）' + direct + ' 次');
+  let s = '；本次请求通道：' + parts.join(' + ');
+  if (!page) s += '；页面通道未完成：' + (g.lastPageError || pageTransportSummary().lastPageError || '页面通道未安装');
+  return s;
+}
+
 // example.json 少提示词的真实原因（绝不写成「该图没有提示词」）：
 // 站点公开 API 在不带 API key 时对 NSFW/受限图直接返回 {"items":[]}（实测 imageId=145224191,
 // nsfwLevel 4 → 空；SFW 的 145676249 → 完整 meta）。扩展没有也不申请 key，所以这部分样图的
 // 提示词/参数注定拿不到，必须把原因摆到产物里，而不是留一个空 samples 让用户误判。
+// 加了页面登录态通道之后这句话要说清「当次到底走的哪条通道」：带登录态仍空 items 和
+// 压根没登录态（匿名直连）是两个不同的结论，不能都写成"公开 API 不给 NSFW"。
 function promptGapNote(gaps, gotCount) {
   const g = gaps || { noMeta: [], failed: 0 };
   const noMeta = (g.noMeta || []).length;
   const failed = Number(g.failed) || 0;
   if (!noMeta && !failed) return '';
   const total = noMeta + failed + (Number(gotCount) || 0);
+  const t = g.transports || {};
+  const pageUsed = (Number(t[CFT.api.TRANSPORT_PAGE]) || 0) > 0;
   const parts = [];
   if (noMeta) {
-    parts.push(noMeta + '/' + total + ' 张样图站点公开 API 未返回生成数据'
-      + '（公开 API 在不带 API key 时不返回 NSFW/受限图的元数据，实测返回 {"items":[]}'
-      + (g.lastReason ? '，reason=' + g.lastReason : '')
-      + '；本扩展无 API key 且不做申请，因此这些样图的提示词/参数无法保存——'
-      + '这不代表这些图没有提示词）');
+    parts.push(noMeta + '/' + total + ' 张样图站点接口未返回生成数据'
+      + '（' + (pageUsed
+        ? '本次已借道页面通道、带你的登录状态，公开 API 仍返回空 items —— 说明这些图在登录态下也不公开元数据'
+        : '公开 API 在不带 API key / 不带登录态时不返回 NSFW/受限图的元数据，实测返回 {"items":[]}'
+          + (g.lastReason ? '，reason=' + g.lastReason : '')
+          // 这句只对本会话实测过的匿名 curl/直连成立；带登录态时是否放开没有实测依据，所以不写"必然"
+          + '；本扩展无 API key 且不做申请，且本次页面通道没有参与这些请求'
+          + (g.lastPageError ? '（' + String(g.lastPageError) + '）' : ''))
+      + '），因此这些样图的提示词/参数无法保存——这不代表这些图没有提示词');
   }
   if (failed) {
     parts.push(failed + '/' + total + ' 张样图元数据请求失败' + (g.lastErr ? '：' + g.lastErr : ''));
   }
-  return parts.join('；') + '。已保存 ' + (Number(gotCount) || 0) + ' 条提示词样本。';
+  return parts.join('；') + '。已保存 ' + (Number(gotCount) || 0) + ' 条提示词样本'
+    + describePromptTransports(g) + '。';
 }
 
 // 评论 + 评价（trpc 主通道 + DOM 兜底，失败不中断；返回拼接前的两段文本）
-// trpc 已被站点 401 关闭时，lib 侧会熔断并在文本里写清原因（评论走页面抓取兜底，评价没有
-// 兜底通道所以只留原因）；这里不吞掉文本，空串才代表"真的没有内容"。
+// 通道：lib 侧 requestData 先走页面（本页 tab，带登录态）、不成回落扩展直连；
+// 只有确实被 401 判死的那一路会被熔断，所以这里报出的 gated 明细是「procedure + transport」。
 async function fetchCommentsText(modelId, versionId, tabId, pageUrl) {
   const domFallbackFn = async () => {
     const ans = await askContent(tabId, 'requestDomComments', {});
@@ -242,16 +446,40 @@ async function fetchCommentsText(modelId, versionId, tabId, pageUrl) {
     if (ans && Array.isArray(ans.results)) return ans.results;
     return [];
   };
+  const ptBefore = pageTransportSummary();
   const settled = await Promise.allSettled([
     CFT.api.fetchCivitaiComments(modelId, domFallbackFn, pageUrl),
     CFT.api.fetchCivitaiReviews(versionId, pageUrl),
   ]);
-  // 熔断状态直接问 lib（别靠匹配文案）：哪些 procedure 已经因 401 停调，一目了然
+  // 熔断状态直接问 lib（别靠匹配文案）：哪条 procedure 的哪条通道已经因 401 停调，一目了然
   const gateState = typeof CFT.api.trpcUnauthorizedState === 'function' ? CFT.api.trpcUnauthorizedState() : {};
+  const gates = Object.keys(gateState).map((k) => {
+    const v = gateState[k] || {};
+    return {
+      key: k,
+      procedure: v.procedure || String(k).split('|')[0],
+      transport: v.transport || (String(k).indexOf('|page') > 0 ? CFT.api.TRANSPORT_PAGE : CFT.api.TRANSPORT_DIRECT),
+      httpStatus: v.httpStatus,
+    };
+  });
+  const ptAfter = pageTransportSummary();
+  const commentsText = settled[0].status === 'fulfilled' ? (settled[0].value || '') : '';
   return {
-    commentsText: settled[0].status === 'fulfilled' ? (settled[0].value || '') : '',
+    commentsText,
     reviewsText: settled[1].status === 'fulfilled' ? (settled[1].value || '') : '',
-    gatedProcedures: Object.keys(gateState),
+    gates,
+    // 兼容旧字段名（值现在是 {procedure,transport} 明细）
+    gatedProcedures: gates,
+    dataTransport: CFT.api.textDataChannel ? CFT.api.textDataChannel(commentsText) : '',
+    domCount: countDomCommentLines(commentsText),
+    page: {
+      pageOk: Math.max(ptAfter.pageOk - ptBefore.pageOk, 0),
+      pageFail: Math.max(ptAfter.pageFail - ptBefore.pageFail, 0),
+      noAnswer: ptAfter.noAnswer,
+      installed: ptAfter.installed,
+      tabs: ptAfter.tabs,
+      lastPageError: ptAfter.lastPageError || '',
+    },
     failures: [settled[0].reason, settled[1].reason]
       .filter((e) => e)
       .map((e) => ((e && e.message) || String(e))),
@@ -259,19 +487,48 @@ async function fetchCommentsText(modelId, versionId, tabId, pageUrl) {
 }
 
 // 降级说明（单页进 bag.errors，批量进 batch.errors；评论.txt 里的同名单已由 lib 写好）
-// savedCount = 文本里真正落盘的评论条数，用它区分"存到了页面评论"和"一条都没存到"，
-// 免得说明本身写成半句假话（明明没评论却说"已保存页面评论"）。
-function commentsDegradeNote(gatedProcedures, savedCount) {
-  const list = Array.isArray(gatedProcedures) ? gatedProcedures.filter((p) =>
-    p === CFT.api.COMMENTS_PROCEDURE || p === CFT.api.REVIEWS_PROCEDURE) : [];
-  if (!list.length) return '';
-  const reason = CFT.api.TRPC_CLOSED_REASON || '评论/评价接口已被站点关闭（401）';
+// savedCount = 文本里真正落盘的评论条数；domCount = 其中来自页面抓取的部分。
+// info.dataTransport 是「评论.txt 里实际写明的数据通道」——页面通道拿到数据时这里绝不能再
+// 说"接口已被站点关闭"（那是匿名直连的结论），也没有降级可言，直接返回空串。
+function commentsDegradeNote(gatedEntries, savedCount, info) {
+  const api = CFT.api;
+  const known = [api.COMMENTS_PROCEDURE, api.REVIEWS_PROCEDURE];
+  // 允许传旧的 procedure 字符串数组（无通道信息时按「匿名直连被判死」处理）
+  const gates = (Array.isArray(gatedEntries) ? gatedEntries : []).map((g) => {
+    if (typeof g === 'string') return { procedure: g, transport: api.TRANSPORT_DIRECT };
+    return { procedure: String((g && g.procedure) || ''), transport: (g && g.transport) || api.TRANSPORT_DIRECT };
+  }).filter((g) => known.indexOf(g.procedure) >= 0);
+  if (!gates.length) return '';
+  const i = info || {};
   const n = Number(savedCount) || 0;
+  const domOnly = n > 0 && Number(i.domCount || 0) === n;
+  const viaPage = i.dataTransport === api.TRANSPORT_PAGE;
+  if (viaPage && !domOnly) return ''; // 页面登录态通道把数据拿到了：没有降级，通道说明已写进 评论.txt
+  const byProc = {};
+  gates.forEach((g) => { (byProc[g.procedure] = byProc[g.procedure] || {})[g.transport] = true; });
+  const detail = Object.keys(byProc).map((p) => {
+    const chans = [];
+    if (byProc[p][api.TRANSPORT_DIRECT]) chans.push('扩展匿名直连');
+    if (byProc[p][api.TRANSPORT_PAGE]) chans.push('页面登录态通道');
+    return p + '（' + chans.join(' + ') + ' 返回 401）';
+  }).join('；');
+  // 真因文案交给 lib：两路都 401 才允许说"接口已被站点关闭"
+  const reason = api.trpcReasonText({
+    directGated: gates.some((g) => g.transport === api.TRANSPORT_DIRECT),
+    pageGated: gates.some((g) => g.transport === api.TRANSPORT_PAGE),
+    pageTried: !!((i.page && (i.page.pageOk || i.page.pageFail || i.page.noAnswer)) || i.pageError),
+    pageError: i.pageError || (i.page && i.page.lastPageError) || '',
+    pageAvailable: !!(i.page && i.page.installed),
+  });
   const tail = n > 0
-    ? '，已保存 ' + n + ' 条页面上已渲染的评论（每条带 [页面抓取] 标记），未加载出来的历史评论无法保存'
-    : '，页面上没有已渲染的评论（评价也没有页面抓取通道），本次未能保存任何评论';
-  return reason + tail + '；已停调的接口: ' + list.join(', ')
-    + '。归档前先在模型页展开评论区并等待加载完成，可多保存一些评论。';
+    ? (domOnly
+      ? '，已保存 ' + n + ' 条页面上已渲染的评论（每条带 [页面抓取] 标记），未加载出来的历史评论无法保存'
+      : '，已保存 ' + n + ' 条评论（数据通道: ' + (i.dataTransport === api.TRANSPORT_DIRECT ? '扩展直连' : '未知') + '）')
+    : '，本次未能保存任何评论（评价也没有页面抓取通道，页面抓取只覆盖评论区）';
+  const advice = (n > 0 && !domOnly) ? '' : '归档前先在模型页展开评论区并等待加载完成，可多保存一些评论。';
+  return reason + tail + '；已停调的接口: ' + detail
+    + (i.pageError || (i.page && i.page.lastPageError) ? '；页面通道情况: ' + (i.pageError || i.page.lastPageError) : '')
+    + '。' + advice;
 }
 
 
@@ -280,16 +537,33 @@ function countCommentLines(commentsText) {
   return String(commentsText).split('\n').filter((l) => /^(\[页面抓取\]\s*)?【|^  ↳ 回复 【/.test(l)).length;
 }
 
+// 其中来自页面抓取（DOM 兜底）的条数——用来区分「存到了接口评论」和「只有页面渲染出来的评论」
+function countDomCommentLines(commentsText) {
+  if (!commentsText) return 0;
+  return String(commentsText).split('\n').filter((l) => /^\[页面抓取\]\s*【/.test(l)).length;
+}
+
 // ---- 归档主流程 ----
 // opts.batch=true：批量归档媒体阶段调用（契约 8.2）——
 //   短路点：复用 payload.modelData 免重复 fetchModel；跳过 askArchiveConfirm / askFileSelection；
 //   移除逐页 notifyArchiveDone（由批量结束统一重扫）；opts.skipComments 跳过 评论.txt（由批量阶段三统一写）。
 //   返回 {ok, msg, dirName, errors}（单页流程原不取返回值，行为不变）。
+// payload.dataTabId：只用于「数据请求借哪个标签页发」（页面通道），与 payload.tabId（弹窗/进度/DOM
+// 兜底等 UI 通道）分开——批量里每个 item 都有自己的 tabId 可以借道拿登录态数据，但绝不该因此
+// 给用户的页面弹进度或"归档完成"（契约 8.2：批量阶段无 content 交互）。
 async function runArchive(payload, opts) {
+  const p = payload || {};
+  const raw = (p.dataTabId != null && p.dataTabId !== '') ? p.dataTabId
+    : ((p.tabId != null && p.tabId !== '') ? p.tabId : null);
+  const entries = [];
+  if (raw != null && Number.isFinite(Number(raw))) entries.push({ tabId: Number(raw), pageUrl: String(p.pageUrl || '') });
+  return withPageTransport(entries, 'archive:' + String(p.modelId || ''), () => runArchiveCore(p, opts));
+}
+
+async function runArchiveCore(p, opts) {
   const o = opts || {};
   const isBatch = o.batch === true;
   const skipComments = o.skipComments === true;
-  const p = payload || {};
   const modelId = String(p.modelId || '');
   let modelVersionId = String(p.modelVersionId || '');
   const aboutText = String(p.aboutText || '');
@@ -332,11 +606,13 @@ async function runArchive(payload, opts) {
       modelData = p.modelData; // 批量短路：prepare 阶段已 fetch，避免重复请求
     } else {
       try {
-        const resp = await CFT.api.fetchJson(
+        // 数据类请求统一走 CFT.api.requestData（有页面通道先借页面登录态，回落扩展直连）
+        const res = await CFT.api.requestData(
           CFT.api.civitaiBaseUrl(pageUrl) + '/api/v1/models/' + encodeURIComponent(modelId),
-          { headers: { Accept: 'application/json' }, timeoutMs: FETCH_TIMEOUT_MS });
-        if (!resp.ok) { done(false, '[错误：访问模型信息接口失败] ' + resp.status); return lastResult; }
-        modelData = await resp.json();
+          { headers: { Accept: 'application/json' }, timeoutMs: FETCH_TIMEOUT_MS, pageUrlOrHost: pageUrl });
+        if (!res.ok) { done(false, '[错误：访问模型信息接口失败] ' + (res.status || 0)); return lastResult; }
+        modelData = CFT.api.parseJsonSafe(res.text);
+        if (!modelData) { done(false, '模型信息不是合法 JSON（通道: ' + (res.transport || '?') + '）'); return lastResult; }
       } catch (e) { done(false, '模型信息请求失败: ' + ((e && e.message) || e)); return lastResult; }
       if (!modelData) { done(false, '模型信息为空'); return lastResult; }
     }
@@ -600,21 +876,29 @@ async function writeCommentsFile(bag) {
   if (bag.batchSkipComments) { bag.st.completed += 1; return; }
   let commentsText = '';
   let reviewsText = '';
-  let gatedProcedures = [];
+  let gates = [];
   try {
     const got = await fetchCommentsText(bag.modelId, bag.modelVersionId, bag.tabId, bag.pageUrl);
     commentsText = got.commentsText;
     reviewsText = got.reviewsText;
-    gatedProcedures = got.gatedProcedures || [];
+    gates = got.gates || [];
     (got.failures || []).forEach((m) => bag.errors.push('[comments] 拉取异常: ' + m));
+    bag.dataChannel = got.dataTransport || '';
+    clog('info', '评论数据通道: ' + (bag.dataChannel || '无（未从接口取到数据）')
+      + (got.page && got.page.installed ? '，页面通道已装(' + got.page.tabs + ' 个标签页, 成功 ' + got.page.pageOk + ' 次)' : '，本次无页面通道'));
   } catch (e) {
     clog('warn', '评论拉取失败(已跳过)', e);
     bag.errors.push('[comments] 拉取失败: ' + ((e && e.message) || e));
   }
   bag.st.commentCount = countCommentLines(commentsText);
-  // 接口被 401 关掉 → 除 评论.txt 里的说明外，再进一次 errors/日志，避免"文件没了/文件是空的"
-  // 被读成"这个模型没人评论"
-  const degradeNote = commentsDegradeNote(gatedProcedures, bag.st.commentCount);
+  // 接口被 401 判死 → 除 评论.txt 里的说明外，再进一次 errors/日志，避免"文件没了/文件是空的"
+  // 被读成"这个模型没人评论"（页面通道拿到数据时 commentsDegradeNote 自己会闭嘴）
+  const degradeNote = commentsDegradeNote(gates, bag.st.commentCount, {
+    dataTransport: CFT.api.textDataChannel ? CFT.api.textDataChannel(commentsText) : '',
+    domCount: countDomCommentLines(commentsText),
+    page: pageTransportSummary(),
+    pageError: pageTransportSummary().lastPageError,
+  });
   if (degradeNote) { bag.errors.push('[comments] ' + degradeNote); clog('warn', '评论/评价降级: ' + degradeNote); }
   if (commentsText || reviewsText) {
     try {
@@ -675,8 +959,16 @@ async function finishArchiveSuccess(bag) {
 }
 
 // ---- 单图流程（P3，适配脚本 downloadSingleImage 2694-2800） ----
+// 单图同样需要登录态上下文：bg 的 saveSingleImage 会带上发起动作的 tabId（payload.tabId 或
+// sender.tab.id），这里把它登记给页面通道；拿不到 tab 时静默回落扩展直连（行为与改造前一致）。
 async function runSingleImage(payload) {
   const p = payload || {};
+  const raw = (p.tabId != null && p.tabId !== '') ? Number(p.tabId) : NaN;
+  const entries = Number.isFinite(raw) && raw >= 0 ? [{ tabId: raw, pageUrl: String(p.pageUrl || '') }] : [];
+  return withPageTransport(entries, 'single-image:' + String(p.imageId || ''), () => runSingleImageCore(p));
+}
+
+async function runSingleImageCore(p) {
   const U = CFT.util;
   const imageId = String(p.imageId || '');
   const originalUrl = String(p.originalUrl || '');
@@ -696,10 +988,14 @@ async function runSingleImage(payload) {
     const core = await CFT.api.getImageGenerationData(imageId, String(p.pageUrl || ''));
     if (!core) throw new Error('API 返回结构异常');
     if (core.found !== true) {
-      // 站点公开 API 在不带 API key 时对 NSFW/受限图返回空 items（实测 imageId=145224191）：
-      // 这是"拿不到"不是"没有"，原图照样保存，但绝不编造 meta，也不写成"该图没有提示词"
-      metaNote = '站点公开 API 未返回该图生成数据（reason=' + (core.reason || 'unknown')
-        + '；无 API key 时 NSFW/受限图就是空 items），已仅保存原图';
+      // 站点公开 API 在不带 API key / 不带登录态时对 NSFW 或受限图返回空 items（实测 imageId=145224191）：
+      // 这是"拿不到"不是"没有"，原图照样保存，但绝不编造 meta，也不写成"该图没有提示词"。
+      // 通道写进说明：匿名直连拿不到 ≠ 接口没有，用户自己的登录态可能就是差一个同源请求。
+      metaNote = '站点接口未返回该图生成数据（reason=' + (core.reason || 'unknown')
+        + '；数据通道: ' + (core.transport === CFT.api.TRANSPORT_PAGE ? '页面登录态通道'
+          : (core.transport === CFT.api.TRANSPORT_DIRECT ? '扩展直连（多半按匿名处理）' : '无'))
+        + (core.pageError ? '；页面通道未完成: ' + core.pageError : '')
+        + ')，已仅保存原图';
       clog('warn', '单图无生成数据: ' + metaNote, null, { imageId });
     } else {
       const refs = CFT.api.imageGenerationRefs(core);
@@ -812,14 +1108,23 @@ async function runPool(items, limit, fn) {
 }
 
 // 阶段 prepare 单页：fetchModel → 定位版本 → dirName → 多文件选主文件 → 已归档预检 → 模型文件入队
+// 每个 item 用自己的 res.tabId 装页面通道（并发 5 个 item 共用同一个引用计数 scope，
+// ptPickTab 按页面 URL / 站点 host 精确路由，绝不会 A 的请求借到 B 的 tab）
 async function prepareBatchItem(res, cfg) {
   const modelId = String(res.modelId || '');
   const payloadVersionId = String(res.modelVersionId || '');
-  const resp = await CFT.api.fetchJson(
-    CFT.api.civitaiBaseUrl(res.pageUrl || '') + '/api/v1/models/' + encodeURIComponent(modelId),
-    { headers: { Accept: 'application/json' }, timeoutMs: FETCH_TIMEOUT_MS });
-  if (!resp.ok) throw new Error('[错误：访问模型信息接口失败] ' + resp.status);
-  const modelData = await resp.json();
+  const ptEntries = (res.tabId != null && Number.isFinite(Number(res.tabId)))
+    ? [{ tabId: Number(res.tabId), pageUrl: String(res.pageUrl || '') }] : [];
+  const modelData = await withPageTransport(ptEntries, 'batch-prepare:' + modelId, async () => {
+    const resp = await CFT.api.requestData(
+      CFT.api.civitaiBaseUrl(res.pageUrl || '') + '/api/v1/models/' + encodeURIComponent(modelId),
+      { headers: { Accept: 'application/json' }, timeoutMs: FETCH_TIMEOUT_MS, pageUrlOrHost: res.pageUrl || '' });
+    if (!resp.ok) throw new Error('[错误：访问模型信息接口失败] ' + (resp.status || 0)
+      + '（通道: ' + (resp.transport || '无') + (resp.pageError ? '；页面通道: ' + resp.pageError : '') + '）');
+    const parsed = CFT.api.parseJsonSafe(resp.text);
+    if (!parsed) throw new Error('模型信息不是合法 JSON（通道: ' + (resp.transport || '?') + '）');
+    return parsed;
+  });
   if (!modelData) throw new Error('模型信息为空');
   if (modelData.message || modelData.error) throw new Error('模型接口返回错误：' + (modelData.message || modelData.error));
   const modelName = String(modelData.name || ('model_' + modelId)).replace(/[/\\?%*:|"<>~]/g, '-');
@@ -898,7 +1203,10 @@ async function runMediaStage(b) {
       modelData: res.modelData,
       verItem: res.verItem,
       modelFile: res.modelFile || '',
-      // 注意：不带 tabId —— batch 无 content 交互，askContent/reportProgress 自动 no-op
+      // dataTabId：本行自己的标签页，只用来借页面登录态发数据请求（评论/样图元数据）。
+      // 依然不带 tabId —— 批量不碰 content 的 UI 通道（askContent/reportProgress/notifyDone 保持 no-op，
+      // 契约 8.2），否则 110 页批量会逐页弹进度和"归档完成"。
+      dataTabId: (res.tabId != null) ? res.tabId : null,
     };
     try {
       const result = await runArchive(payload, { batch: true, skipComments: true });
@@ -913,27 +1221,38 @@ async function runMediaStage(b) {
   }
 }
 
-// 阶段 comments（串行）：对 done 页拉评论→写 评论.txt；DOM 兜底禁用（页面可能已关，tabId 传 null）
+// 阶段 comments（串行）：对 done 页拉评论→写 评论.txt；DOM 兜底仍禁用（页面评论区多半没展开，
+// 契约 8.2「纯 tRPC」），但**数据请求用本行的 tabId 借道页面**（runBatch 装的 scope 里
+// ptPickTab 按 res.pageUrl 命中该 tab），这样登录用户的历史评论才拿得到。
 async function runCommentsStage(b) {
   for (const res of b.results) {
     if (b.cancel) return;
     if (!res || res.status !== 'done') continue;
+    const ptEntries = (res.tabId != null && Number.isFinite(Number(res.tabId)))
+      ? [{ tabId: Number(res.tabId), pageUrl: String(res.pageUrl || '') }] : [];
     try {
-      const got = await fetchCommentsText(res.modelId, res.modelVersionId, null, res.pageUrl || '');
+      const got = await withPageTransport(ptEntries, 'batch-comments:' + String(res.modelId || ''),
+        () => fetchCommentsText(res.modelId, res.modelVersionId, null, res.pageUrl || ''));
       const text = [got.commentsText, got.reviewsText]
         .filter((s) => s && String(s).length > 0)
         .join('\n\n');
       if (text) await writeFileToBg(res.dirName, '评论.txt', utf8ToB64(text));
+      res.dataChannel = got.dataTransport || '';
       // 熔断是全批生效的：批级 errors 只报一次（逐文件的说明已经写在各自 评论.txt 里），
       // 免得 110 页刷出 110 行同义错误把 popup 状态区淹没
-      const note = commentsDegradeNote(got.gatedProcedures, countCommentLines(got.commentsText));
+      const note = commentsDegradeNote(got.gates, countCommentLines(got.commentsText), {
+        dataTransport: got.dataTransport,
+        domCount: got.domCount,
+        page: got.page,
+        pageError: (got.page && got.page.lastPageError) || '',
+      });
       if (note && !b.commentsGateNoted) {
         b.commentsGateNoted = true;
         clog('warn', '批量评论降级: ' + note);
         if (Array.isArray(b.errors)) {
           b.errors.push({
             modelId: res.modelId, modelVersionId: res.modelVersionId, dirName: res.dirName,
-            msg: '评论/评价降级: ' + note + '（批量阶段无页面抓取通道，各模型的 评论.txt 已写入该说明）',
+            msg: '评论/评价降级: ' + note + '（批量阶段不做页面抓取兜底，各模型的 评论.txt 已写明实际通道与真因）',
           });
         }
       }
@@ -957,16 +1276,23 @@ async function finishBatch(b) {
 }
 
 // 批量主循环：三阶段，随时检查 cancel
+// 整个 job 装一次页面通道（把所有 item 各自的 tabId 登记进去），三阶段共用、finally 必还原。
+// 阶段内/单页再各自 withPageTransport 只是往同一个 scope 追加绑定（引用计数），不会互相覆盖。
 async function runBatch(b) {
+  const entries = (b.results || [])
+    .filter((r) => r && r.tabId != null && Number.isFinite(Number(r.tabId)))
+    .map((r) => ({ tabId: Number(r.tabId), pageUrl: String(r.pageUrl || '') }));
   try {
-    b.phase = 'prepare';
-    await runPrepareStage(b);
-    if (b.cancel) { await finishBatch(b); return; }
-    b.phase = 'media';
-    await runMediaStage(b);
-    if (b.cancel) { await finishBatch(b); return; }
-    b.phase = 'comments';
-    await runCommentsStage(b);
+    await withPageTransport(entries, 'batch:' + String(b.jobId || ''), async () => {
+      b.phase = 'prepare';
+      await runPrepareStage(b);
+      if (b.cancel) return;
+      b.phase = 'media';
+      await runMediaStage(b);
+      if (b.cancel) return;
+      b.phase = 'comments';
+      await runCommentsStage(b);
+    });
     await finishBatch(b);
   } catch (e) {
     clog('error', '批量归档流程异常', e, { jobId: b.jobId });
@@ -976,14 +1302,22 @@ async function runBatch(b) {
 }
 
 // 阶段分发（测试钩子用：runBatchStage('prepare'|'media'|'comments', b)）
+// 单独跑某个阶段时也要有页面通道（正常流程由 runBatch 统一安装），所以这里同样装一个 scope
 async function runBatchStage(stage, b) {
   const tar = b || batch;
   if (!tar) return null;
-  if (stage === 'prepare') return runPrepareStage(tar);
-  if (stage === 'media') return runMediaStage(tar);
-  if (stage === 'comments') return runCommentsStage(tar);
-  if (stage === 'finish') return finishBatch(tar);
-  return null;
+  const run = () => {
+    if (stage === 'prepare') return runPrepareStage(tar);
+    if (stage === 'media') return runMediaStage(tar);
+    if (stage === 'comments') return runCommentsStage(tar);
+    if (stage === 'finish') return finishBatch(tar);
+    return null;
+  };
+  if (stage === 'finish') return run();
+  const entries = (tar.results || [])
+    .filter((r) => r && r.tabId != null && Number.isFinite(Number(r.tabId)))
+    .map((r) => ({ tabId: Number(r.tabId), pageUrl: String(r.pageUrl || '') }));
+  return withPageTransport(entries, 'batch-stage:' + stage, run);
 }
 
 // 状态快照（契约 8.1/8.2；剔除内部 modelData/verItem 等大字段）
@@ -1005,6 +1339,7 @@ function getBatchState() {
       tabId: r.tabId, url: r.url, modelId: r.modelId, modelVersionId: r.modelVersionId,
       status: r.status, dirName: r.dirName,
       autoChosenFile: r.autoChosenFile || '', msg: r.msg || '',
+      dataChannel: r.dataChannel || '', // 评论实际走的通道（page/direct/''），供状态区如实显示
     })),
   };
   return st;
@@ -1013,7 +1348,9 @@ function handleMessage(msg, sender, sendResponse) {
   if (!msg || msg.__cft !== true || msg.to !== 'offscreen') return false;
   const type = msg.type;
   const payload = (msg.payload && typeof msg.payload === 'object') ? msg.payload : {};
-  if (type === 'userSelection' || type === 'archiveConfirm' || type === 'domComments') {
+  if (type === 'userSelection' || type === 'archiveConfirm' || type === 'domComments' || type === 'pageFetchResult') {
+    // pageFetchResult 与 domComments 同一套 cid 请求-答复：content 侧既走 sendResponse（本函数收不到，
+    // 由 askContent 的 sendMessage 链丢弃）也走 runtime 广播（这里消费），resolveCid 先到先得、天然去重
     if (payload.cid != null) resolveCid(payload.cid, payload);
     return false;
   }
@@ -1090,5 +1427,8 @@ try {
     newCid, waitCid, resolveCid,
     getBatchState, runBatchStage, runPool,
     prepareBatchItem, runPrepareStage, runMediaStage, runCommentsStage, finishBatch,
+    // 页面数据通道（pageFetch）与通道文案
+    askContent, withPageTransport, pageTransportSummary, ptPickTab, ptHostOf, makePageFetcher,
+    fetchCommentsText, commentsDegradeNote, countDomCommentLines, promptGapNote, collectPromptList,
   };
 } catch (_) { /* 忽略 */ }

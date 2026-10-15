@@ -1,5 +1,5 @@
 'use strict';
-/* CFT content/image-badge.js —— images/posts 页 SAVE 徽章（P3）
+/* CFT content/image-badge.js —— images/posts 页 SAVE 徽章（P3）+ 页内同源 GET（pageFetch）
  * 搬运自油猴脚本 v1.7.8：loadSavedImages(2616-2628，localStorage→CFT.idb 只读)、
  * addImageBadges(2638-2691，originalUrl 构造/SAVED-SAVE 状态/rAF 防重入)、
  * 徽章点击后的 saveSingleImage 请求封装（downloadSingleImage 2694-2800 的意图，
@@ -83,6 +83,45 @@
       }
     } catch (_) { /* 忽略 */ }
     return ids;
+  }
+
+  /* ============ pageFetch 纯校验（无 DOM，可在 node 下单测） ============ */
+  // 与 model-page.js 中的同名实现保持逐字一致：两个 content script 各自服务不同路径，
+  // 都必须能独立应答 pageFetch，而 lib/ 归他人所有，不能把公共实现搬出去。
+
+  var PAGE_FETCH_HOSTS = ['civitai.com', 'civitai.red'];
+  var PAGE_FETCH_PATHS = ['/api/v1/', '/api/trpc/'];
+  var PAGE_FETCH_REJECT = 'url 不在白名单';
+  var PAGE_FETCH_DEFAULT_TIMEOUT_MS = 20000;
+  var PAGE_FETCH_MAX_BODY_CHARS = 3 * 1024 * 1024; // 模型详情约 16KB，上限只为防跑飞响应打爆消息通道
+  var PAGE_FETCH_CLAIM_CAP = 128;                  // 已应答 cid 记忆表容量（防无界增长）
+
+  // 白名单：https + 无端口/账号 + 域名剥掉前导 www. 后精确等于 civitai.com/.red + 路径前缀受限。
+  // 该校验必须落在本文件里做——请求会带上用户登录 Cookie，绝不能拿它去取调用方随手给的任意 URL。
+  // 返回 '' 表示放行；否则返回统一拒绝原因。
+  function pageFetchRejectReason(rawUrl) {
+    try {
+      var u = new URL(String(rawUrl == null ? '' : rawUrl));
+      if (u.protocol !== 'https:') return PAGE_FETCH_REJECT;
+      var host = String(u.hostname || '').toLowerCase();
+      if (host.indexOf('www.') === 0) host = host.slice(4);
+      if (PAGE_FETCH_HOSTS.indexOf(host) < 0) return PAGE_FETCH_REJECT;
+      if (u.port) return PAGE_FETCH_REJECT;
+      if (u.username || u.password) return PAGE_FETCH_REJECT;
+      var path = String(u.pathname || '');
+      for (var i = 0; i < PAGE_FETCH_PATHS.length; i++) {
+        if (path.indexOf(PAGE_FETCH_PATHS[i]) === 0) return '';
+      }
+      return PAGE_FETCH_REJECT;
+    } catch (_) { return PAGE_FETCH_REJECT; }
+  }
+
+  // 失败原因压成短字符串（不外抛、不把整个 Error 对象塞进消息通道）
+  function shortErrText(e) {
+    try {
+      var s = String((e && (e.message || e.name)) || e || 'unknown').slice(0, 80);
+      return 'fetch 失败: ' + s;
+    } catch (_) { return 'fetch 异常'; }
   }
 
   /* ================= 环境小助手（防御性） ================= */
@@ -475,11 +514,125 @@
     } catch (e) { warn('route event failed', e); }
   }
 
+  /* ================= pageFetch：借页面同源 + 会话 Cookie 发一次 GET =================
+   * 油猴脚本时代所有 Civitai API 调用都在页面里 fetch()，同源、带 Cookie。移植后请求换到
+   * offscreen（chrome-extension:// 源、跨站、匿名），tRPC 回 401「Please use the public API
+   * instead」，公开 API 的 NSFW 结果被清成 {"items":[]}。images/posts 页同样能给其它上下文
+   * 提供"回到页面里发这个请求"的通道，实现与 model-page.js 一致。
+   */
+
+  function runtimeSend(env) {
+    try {
+      if (typeof chrome !== 'undefined' && chrome.runtime) {
+        chrome.runtime.sendMessage(env, function () {
+          try { void chrome.runtime.lastError; } catch (_) {}
+        });
+      }
+    } catch (e) { warn('runtimeSend failed', e); }
+  }
+
+  // 答复：sendResponse（主通道）+ 同信封广播（备用，offscreen 任选其一消费，以 cid 去重）
+  function answer(to, type, payload, sendResponse) {
+    var env = { __cft: true, to: to, type: type, payload: payload || {} };
+    try { if (typeof sendResponse === 'function') sendResponse(env); }
+    catch (e) { warn('sendResponse failed', e); }
+    runtimeSend(env);
+  }
+
+  // 同一文档里若两个 content script 都收到同一条请求：先认领 cid 者应答，另一个完全不碰通道。
+  // 共享表挂在 globalThis（与 manifest 按序注入的 CFT 同一隔离世界，跨文件可见）。
+  function claimPageFetchCid(cid) {
+    try {
+      if (!cid) return true; // 无 cid 无从去重，照常应答（契约要求调用方必带 cid）
+      if (typeof globalThis === 'undefined') return true;
+      if (!globalThis.__cftPageFetchCids || typeof globalThis.__cftPageFetchCids.set !== 'function') {
+        globalThis.__cftPageFetchCids = new Map();
+      }
+      var m = globalThis.__cftPageFetchCids;
+      if (m.has(cid)) return false;
+      m.set(cid, Date.now());
+      if (m.size > PAGE_FETCH_CLAIM_CAP) {
+        var drop = m.size - Math.floor(PAGE_FETCH_CLAIM_CAP / 2);
+        var n = 0;
+        m.forEach(function (_v, k) { if (n++ < drop) m.delete(k); }); // 丢最早的半数，够用即可
+      }
+      return true;
+    } catch (_) { return true; }
+  }
+
+  // 无论白名单拒绝、超时、还是 fetch 抛异常，都必须且只应答一次 pageFetchResult。
+  function runPageFetch(payload, sendResponse) {
+    var p = (payload && typeof payload === 'object') ? payload : {};
+    var cid = String(p.cid == null ? '' : p.cid);
+    var replied = false;
+    var timer = 0;
+    var settle = function (r) {
+      if (replied) return;
+      replied = true;
+      try { if (timer) clearTimeout(timer); } catch (_) { /* 忽略 */ }
+      var out = r || {};
+      answer('offscreen', 'pageFetchResult', {
+        cid: cid,
+        ok: !!out.ok,
+        status: (typeof out.status === 'number' && isFinite(out.status)) ? out.status : 0,
+        body: typeof out.body === 'string' ? out.body : '',
+        err: out.err ? String(out.err) : null,
+        truncated: !!out.truncated
+      }, sendResponse);
+    };
+    try {
+      if (!cid) { settle({ err: '缺少 cid' }); return; }
+      var reject = pageFetchRejectReason(p.url);
+      if (reject) { settle({ err: reject }); return; } // 白名单不通过：一个字节都不请求
+      var timeoutMs = Number(p.timeoutMs);
+      if (!isFinite(timeoutMs) || timeoutMs <= 0) timeoutMs = PAGE_FETCH_DEFAULT_TIMEOUT_MS;
+      var controller = null;
+      try { controller = (typeof AbortController === 'function') ? new AbortController() : null; } catch (_) { controller = null; }
+      if (controller) {
+        try {
+          timer = setTimeout(function () { try { controller.abort(); } catch (_) { /* 忽略 */ } }, timeoutMs);
+        } catch (_) { timer = 0; }
+      }
+      fetch(String(p.url), {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+        signal: controller ? controller.signal : undefined
+      }).then(function (res) {
+        var status = (res && typeof res.status === 'number') ? res.status : 0;
+        var ok = !!(res && res.ok);
+        return res.text().then(function (raw) {
+          var text = String(raw == null ? '' : raw);
+          var truncated = text.length > PAGE_FETCH_MAX_BODY_CHARS;
+          settle({
+            ok: ok, status: status,
+            body: truncated ? text.slice(0, PAGE_FETCH_MAX_BODY_CHARS) : text,
+            err: null, truncated: truncated
+          });
+        });
+      }).catch(function (e) {
+        var aborted = !!(controller && controller.signal && controller.signal.aborted) ||
+          !!(e && String(e.name) === 'AbortError');
+        settle({ err: aborted ? '请求超时 ' + timeoutMs + 'ms' : shortErrText(e) });
+      });
+    } catch (e) {
+      settle({ err: shortErrText(e) }); // 处理器绝不把异常抛给 onMessage
+    }
+  }
+
   /* ================= 消息处理 ================= */
 
-  function onRuntimeMessage(msg) {
+  function onRuntimeMessage(msg, sender, sendResponse) {
     try {
       if (!msg || msg.__cft !== true || msg.to !== 'content') return; // 非本模块消息
+      if (msg.type === 'pageFetch') {
+        var payload = (msg && msg.payload) || {};
+        if (!claimPageFetchCid(String(payload.cid == null ? '' : payload.cid))) {
+          return; // 同文档已有应答方（model-page.js 抢先认领）：不重复 answer，也不占用通道
+        }
+        runPageFetch(payload, sendResponse);
+        return true; // 异步响应（与 model-page.js 的 askFileSelection 同款：fetch 完成前保持通道打开）
+      }
       if (msg.type === 'savedImageDone') {
         try {
           var p = (msg && msg.payload) || {};
@@ -527,6 +680,7 @@
       getImageIdFromHref: getImageIdFromHref,
       buildOriginalUrl: buildOriginalUrl,
       normalizeSavedIds: normalizeSavedIds,
+      pageFetchRejectReason: pageFetchRejectReason,
       handleMessage: onRuntimeMessage
     };
   } else {
