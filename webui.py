@@ -3234,7 +3234,9 @@ class Api:
                     version = self.api.get_model_version(vid)
                 if not version:
                     continue
-                f = self.api.pick_file(version)
+                # pick_file 返回 (file, index)：以前直接拿元组去 f["name"] 必抛 TypeError，
+                # 又被下面的 except 吞掉，导致本功能永远入队 0 个还报「成功」。
+                f = self.api.pick_file(version)[0]
                 if not f:
                     continue
                 fname = f["name"]
@@ -3255,7 +3257,10 @@ class Api:
                 existing.add(fname.lower())
                 detail.append({"name": r.get("name") or fname, "type": r.get("type") or "",
                                "status": "add"})
-            except Exception:
+            except Exception as e:
+                # 单个资源失败不能整批静默：详情里留下原因，用户才看得见为什么没下
+                detail.append({"name": r.get("name") or str(mid or vid), "type": r.get("type") or "",
+                               "status": "fail", "msg": str(e)[:160]})
                 continue
         return json.dumps({"ok": True, "added": added, "skipped": skipped,
                            "total": len(res.get("resources") or []), "detail": detail},

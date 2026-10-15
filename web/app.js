@@ -537,11 +537,15 @@ function showImgDlResult(r) {
     '<div class="wf-model"><span class="wf-model-ref">' + esc(d.name) + '（' + esc(d.type || "-") + "）</span>" +
     (d.status === "add"
       ? '<span class="wf-model-path">已加入下载队列</span>'
-      : '<span class="wf-model-miss">本地已存在，跳过</span>') +
+      : d.status === "fail"
+        ? '<span class="wf-model-miss">失败：' + esc(d.msg || "未知原因") + "</span>"
+        : '<span class="wf-model-miss">本地已存在，跳过</span>') +
     "</div>").join("");
+  const failed = (r.detail || []).filter((d) => d.status === "fail").length;
   dlg.innerHTML =
     '<div class="rd-title">图片页模型批量下载</div>' +
-    '<div class="wf-info">图片共使用 ' + r.total + ' 个模型 · 新增 ' + r.added + ' · 已存在跳过 ' + r.skipped + "</div>" +
+    '<div class="wf-info">图片共使用 ' + r.total + ' 个模型 · 新增 ' + r.added + ' · 已存在跳过 ' + r.skipped +
+    (failed ? ' · 失败 ' + failed : "") + "</div>" +
     '<div class="wf-nodes" style="margin-top:8px">' + (detail || '<div class="wf-empty">无可用模型</div>') + "</div>" +
     '<div class="rd-actions"><button class="btn btn-primary" id="imgDlOk">知道了</button></div>';
   document.body.appendChild(mask);
