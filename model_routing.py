@@ -24,12 +24,25 @@ folder_paths 扫不到，用户下完还得手工搬。目标落点形状（用�
    「写入必须用第一路径」的说法对不上，所以这里按 key 名落点（两个路径 ComfyUI 都会扫到，
    而 models/unet 在多数整合包里压根不存在）。resolve_dest_dir 要求 key 名目录已存在，否则返回
    None 让调用方退回旧行为 —— 宁可不分流，也不要造出扫不到的目录。
+4. 「Civitai 类型 → ComfyUI 目录」的**唯一事实源就是本模块**：model_manager 的 KNOWN_TYPES /
+   ENV_DIRS["comfyui"] 由 COMFYUI_TYPE_DIRS / KNOWN_MODEL_TYPES 派生，两边逐键一致。
+   （旧模型管理器自带过一份只覆盖 6 个目录的 comfyui 表，而 webui.mm_restore_organize 会用
+   `set(ENV_DIRS["comfyui"].values())` 反推「标准目录」，把不在集合里的顶层目录当成非标准把模型
+   搬回去 —— 分流写进 diffusion_models 的权重会被「误整理恢复」搬回 checkpoints，自己打自己。）
+   files[].type 的语义（17 值枚举 / 权重白名单 / 归一化）唯一事实源在 civitai_api，本模块只 import
+   不复制；本模块独有的只有「分流专属」的 FILE_TYPE_TO_FOLDER / NON_WEIGHT_FILE_TYPES 与展示拼写表。
 """
 import json
 import os
 import re
 import unicodedata
 from collections import namedtuple
+
+from civitai_api import (ATTACHMENT_FILE_TYPES, CIVITAI_FILE_TYPES, DOWNLOADABLE_FILE_TYPES,
+                         WEIGHT_FILE_TYPES as WEIGHT_FILE_KINDS, normalize_file_type)
+"""files[].type 的判定语义一律复用 civitai_api（纯标准库、import 时不发网络请求）：
+WEIGHT_FILE_KINDS / ATTACHMENT_FILE_TYPES / DOWNLOADABLE_FILE_TYPES 都是**归一化后**的集合，
+比对前统一走 normalize_file_type，避免「同名不同义」在跨模块 import 时静默错配。"""
 
 RouteDecision = namedtuple("RouteDecision", "folder reason source")
 """folder = 核心 key（None = 不分流）；reason = 给人看的一句话；source ∈ {"type","header","base_model","none"}。"""
@@ -72,8 +85,13 @@ MODEL_TYPE_TO_FOLDER = {
     "Model": "checkpoints",                # 早期 Civitai 把模型本体叫 Model
     "Textual Inversion": "embeddings",      # 带空格的旧写法
     "Diffusion Model": "diffusion_models",
+    # 旧 model_manager 表里一直在用的社区叫法（权威值是 TextualInversion）：
+    # 历史 .civitai.info / .info.json 里真写过 "Embedding"，漏了它就等于老数据不再被认成已知类型。
+    "Embedding": "embeddings",
 }
-"""键是 Civitai 显示拼写（只为可读性）；查表走 _TYPE_INDEX，比较用 normalize_type。"""
+"""键是 Civitai 显示拼写（只为可读性）；查表走 _TYPE_INDEX，比较用 normalize_type。
+这份 dict 同时是 model_manager.ENV_DIRS["comfyui"] 的唯一来源（见 COMFYUI_TYPE_DIRS），
+所以「分流落到哪」和「旧整理/误整理恢复认为哪个目录标准」不可能再对不上。"""
 
 NON_MODEL_TYPES = {
     "AestheticGradient", "MotionModule", "Poses", "Wildcards", "Workflows",
@@ -85,8 +103,50 @@ MotionModule 有 animatediff_models 目录但那不是核心 key（约束 2）�
 Detection 虽有核心 detection key，但 Civitai 那类资源是数据集/检测器包，按方案一律不分流；
 AestheticGradient 落到哪由 aesthetic gradient 专用节点决定，同样不是核心 key。"""
 
-WEIGHT_FILE_TYPES = {"Model", "Pruned Model", "Diffusion Model", "UNet"}
-"""Civitai files[].type 里「算模型本体权重」的四种。给 pick_file / model_files 白名单用（下游任务）。"""
+CIVITAI_MODEL_TYPES = (
+    "Checkpoint", "TextualInversion", "Hypernetwork", "AestheticGradient", "LORA", "LoCon", "DoRA",
+    "Controlnet", "Upscaler", "MotionModule", "VAE", "TextEncoder", "UNet", "CLIPVision", "Poses",
+    "Wildcards", "Workflows", "ComfyWorkflows", "Detection", "VisionLanguage", "CLIP", "LLM", "Other",
+)
+"""Civitai ModelType 的权威 23 值（精确大小写）。表驱动测试拿它逐个核对：
+每个值要么在 MODEL_TYPE_TO_FOLDER 有落点，要么在 NON_MODEL_TYPES 显式不分流，不许有第三种。"""
+
+# ---- 对外派生表：旧 model_manager 的 KNOWN_TYPES / ENV_DIRS["comfyui"] 直接拿这两个 ----
+
+COMFYUI_TYPE_DIRS = dict(MODEL_TYPE_TO_FOLDER)
+"""「Civitai 类型显示拼写 → ComfyUI 核心 key」的对外视图（model_manager.ENV_DIRS["comfyui"] == 这份）。
+保持**精确键匹配**（不做 normalize）是有意的：webui.mm_restore_organize 用 `env_map.get(mtype)`
+反推标准目录，键形状必须一致，否则它查不到 → 把分流产物当非标准目录搬走。
+值集合就是「ComfyUI 侧的标准顶层目录」全集：分流写进去的目录，整理侧一定认。"""
+
+KNOWN_MODEL_TYPES = frozenset(MODEL_TYPE_TO_FOLDER) | frozenset(NON_MODEL_TYPES)
+"""「认识的 C 站类型」全集（model_manager.KNOWN_TYPES == 这份）：有落点的 + 显式不分流的 + 旧拼写。
+不分流的类型留在集合里是旧整理流程的需要（Workflows/Poses/Wildcards… 由用户显式发起、走 TYPE_DIRS），
+分流对它们一律返回 folder=None，两条链路不会互相触发。"""
+
+# ---- files[].type：判定语义只有一份，就在 civitai_api --------------------------------
+# 权威 17 值 + 已废弃旧值（CIVITAI_FILE_TYPES）与权重白名单（WEIGHT_FILE_KINDS）都是归一化形式；
+# 本模块以前自带一份 {"Model", "Pruned Model", "Diffusion Model", "UNet"} 原始大小写集合，
+# 同名不同义，跨模块 import 会静默错配 —— 删掉了，只留下面这张「纯展示拼写」映射。
+
+FILE_TYPE_KINDS = CIVITAI_FILE_TYPES
+"""files[].type 的合法取值全集（归一化形式），转发 civitai_api 的枚举，本模块不另立权威。"""
+
+FILE_TYPE_LABELS = {
+    "model": "Model", "textencoder": "Text Encoder", "visionencoder": "Vision Encoder",
+    "prunedmodel": "Pruned Model", "negative": "Negative", "trainingdata": "Training Data",
+    "traindata": "Training Data", "vae": "VAE", "config": "Config", "archive": "Archive",
+    "unet": "UNet", "diffusionmodel": "Diffusion Model", "clipvision": "CLIPVision",
+    "controlnet": "ControlNet", "workflow": "Workflow", "upscaler": "Upscaler",
+    "enhancementlora": "Enhancement LoRA", "other": "Other",
+    "inpaintmask": "InpaintMask", "template": "Template", "image": "Image",
+}
+"""归一化 → Civitai 页面显示拼写。**纯展示**，不含任何判定语义；判定永远走 file_type_kind + 归一化集合。"""
+
+WEIGHT_FILE_TYPES = frozenset(FILE_TYPE_LABELS.get(kind, kind) for kind in WEIGHT_FILE_KINDS)
+"""显示拼写形式的权重白名单，**由 civitai_api.WEIGHT_FILE_TYPES 派生**（本模块不再复制字面量）。
+留这个名字只是因为 webui._needs_header_probe 拿原始 files[].type 字符串直接 `in` 它；
+新代码请一律用 is_weight_file_type()，别再自己比对大小写敏感的显示名。"""
 
 FILE_TYPE_TO_FOLDER = {
     "Text Encoder": "text_encoders",
@@ -103,7 +163,10 @@ FILE_TYPE_TO_FOLDER = {
 故意不在这里给提示，交给 model_type 或头部判。优先级低于 model_type。"""
 
 NON_WEIGHT_FILE_TYPES = {"Negative", "Training Data", "Config", "Archive", "Workflow", "Other"}
-"""明确不是模型本体的附件类型：拿到这些一律不分流，别把 Negative.txt 或 training data 归档塞进模型目录。"""
+"""明确不是模型本体的附件类型：拿到这些一律不分流，别把 Negative.txt 或 training data 归档塞进模型目录。
+分流专属表，故意不直接复用 civitai_api.ATTACHMENT_FILE_TYPES：那份集合为了「能不能下载」还收了
+image/traindata/inpaintmask/template，而 Negative 在 civitai_api 侧被单独排除（它可下载）；
+这里的口径只看「能不能当模型本体落点」，比那份更严，所以另立一张表（值仍按归一化比对）。"""
 
 # normalize 后的索引：新旧拼写、大小写、空格/连字符/下划线差异全部折叠掉，在 normalize_type 之后构建
 _TYPE_INDEX = {}
@@ -125,14 +188,37 @@ def normalize_type(s):
     return re.sub(r"[\s\-_]+", "", str(s if s is not None else "")).casefold()
 
 
+def file_type_kind(value):
+    """files[].type → 归一化形式，**口径与 civitai_api.normalize_file_type 完全一致**。
+
+    接受 dict（Civitai files[] 的一项：缺 type 键按 "Model"，和 civitai_api 一样）或裸类型字符串。
+    裸字符串为空/None 时返回 ""（= 没有文件类型信息），不许被默认成 Model 而混进权重白名单。
+    """
+    if isinstance(value, dict):
+        return normalize_file_type(value)
+    if value is None or not str(value).strip():
+        return ""
+    return normalize_file_type({"type": str(value)})
+
+
+def is_weight_file_type(value):
+    """这个 files[].type（dict 或裸字符串）是不是「模型本体权重」。
+
+    判定语义唯一来自 civitai_api.WEIGHT_FILE_TYPES（Model / Pruned Model / Diffusion Model / UNet）；
+    Civitai 对 Config / Archive / Workflow / Training Data 也打 primary，所以任何「挑模型本体」的场合
+    都必须先过这里（civitai_api.pick_file、model_manager.choose_body_file 同一个事实源）。
+    """
+    return file_type_kind(value) in WEIGHT_FILE_KINDS
+
+
 for _k, _v in MODEL_TYPE_TO_FOLDER.items():
     _TYPE_INDEX.setdefault(normalize_type(_k), _v)
 for _k, _v in FILE_TYPE_TO_FOLDER.items():
-    _FILE_INDEX.setdefault(normalize_type(_k), _v)
+    _FILE_INDEX.setdefault(file_type_kind(_k), _v)
 for _k in NON_MODEL_TYPES:
     _NON_TYPE_INDEX.add(normalize_type(_k))
 for _k in NON_WEIGHT_FILE_TYPES:
-    _NON_FILE_INDEX.add(normalize_type(_k))
+    _NON_FILE_INDEX.add(file_type_kind(_k))
 
 
 # ---- safetensors 头 ---------------------------------------------------------------
@@ -290,7 +376,7 @@ def classify(model_type, file_type=None, base_model=None, header=None):
             return RouteDecision(folder, reason, "header")
         if kind == "motion":
             return RouteDecision(None, "头部是 MotionModule，animatediff 目录不是核心 key，不分流", "none")
-    ft = normalize_type(file_type)
+    ft = file_type_kind(file_type)
     if ft in _NON_FILE_INDEX:
         return RouteDecision(None, "文件类型 %s 不是模型权重，不分流" % (file_type or "空"), "none")
     folder = _TYPE_INDEX.get(t)

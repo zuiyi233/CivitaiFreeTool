@@ -9,6 +9,8 @@ import shutil
 import threading
 import time
 
+import model_routing as _routing
+
 MODEL_EXTS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 INFO_EXTS = {".json", ".txt", ".yaml", ".yml", ".md", ".html"}
@@ -21,17 +23,17 @@ _SIDE_EXTS = (
     ".example.png", ".example.jpg", ".example.jpeg", ".example.webp", ".example.gif",
 ) + tuple(sorted(IMAGE_EXTS))
 
-# 已知 C 站类型白名单（其他类型如 AnimateDiff/ONNX/Clip 等目录一律不动）
-# ⚠️ 类型→目录映射的**权威表在 model_routing.py**（新分流功能的唯一事实来源），
-#    此处仅供旧的「整理模型」流程使用，不要在这里补全新类型。
-KNOWN_TYPES = {
-    "LORA", "LoRA", "Checkpoint", "VAE", "TextualInversion", "Embedding",
-    "ControlNet", "Controlnet", "LoCon", "DoRA", "Hypernetwork",
-    "AestheticGradient", "Poses", "Wildcards", "Workflows", "MotionModule",
-}
+# 已知 C 站类型白名单：⚠️ 唯一事实源是 model_routing（分流决策层），这里只是它的派生视图。
+# 曾经这份表自带 16 项、comfyui 目录只覆盖 6 个 key，缺 UNet/TextEncoder/CLIPVision/Upscaler/
+# ComfyWorkflows/Detection/VisionLanguage/CLIP/LLM —— 而 webui.mm_restore_organize 会用
+# set(ENV_DIRS["comfyui"].values()) 反推「标准目录」，把不在集合里的顶层目录当非标准，
+# 于是分流刚写进 diffusion_models 的 FLUX 权重会被「误整理恢复」搬回 checkpoints。派生之后
+# 「分流落点」与「整理侧认的标准目录」逐键一致，两条链路不可能再对打。
+KNOWN_TYPES = set(_routing.KNOWN_MODEL_TYPES)
 
 # 环境 → 类型目录映射（WebUI/Forge 与 ComfyUI 目录名不同）
 ENV_DIRS = {
+    # WebUI/Forge 的目录名与 ComfyUI 不同（Lora / Stable-diffusion / …），不是分流落点，独立维护。
     "webui": {
         "LORA": "Lora", "LoRA": "Lora", "LoCon": "Lora", "DoRA": "Lora",
         "Checkpoint": "Stable-diffusion",
@@ -40,16 +42,9 @@ ENV_DIRS = {
         "ControlNet": "ControlNet", "Controlnet": "ControlNet",
         "Hypernetwork": "hypernetworks",
     },
-    # ⚠️ 类型→目录映射的权威表在 model_routing.py（新分流功能的唯一事实来源），
-    #    这里这份旧表故意不补全（缺 UNet/TextEncoder/Upscaler/CLIPVision 等），仅供旧整理流程使用。
-    "comfyui": {
-        "LORA": "loras", "LoRA": "loras", "LoCon": "loras", "DoRA": "loras",
-        "Checkpoint": "checkpoints",
-        "VAE": "vae",
-        "TextualInversion": "embeddings", "Embedding": "embeddings",
-        "ControlNet": "controlnet", "Controlnet": "controlnet",
-        "Hypernetwork": "hypernetworks",
-    },
+    # ⚠️ 派生自 model_routing.MODEL_TYPE_TO_FOLDER，不要在这里手加/删条目：
+    #    分流把模型写到哪，这张表就得把同一个目录认成「标准目录」，否则整理流程会把它搬走。
+    "comfyui": dict(_routing.COMFYUI_TYPE_DIRS),
 }
 
 # C 站 tags → 分类文件夹（第二级，在 <类型>/<baseModel>/ 之下）；无匹配 tags 的模型保持原位
@@ -71,6 +66,16 @@ TAGS_DIRS = [
     (["illustration", "artwork", "插画"], "Illustration"),
 ]
 
+# 旧「整理模型」的兜底目录表：只在 ENV_DIRS 查不到该类型时才生效（mode=civitai，用户显式发起的搬运）。
+# 与分流的关系（互不触发，方向相反但都不越界）：
+# · 只有分流不分流的类型才会落到这张表（AestheticGradient/Poses/Wildcards/Workflows/Other/MotionModule
+#   → Aesthetic/Poses/Wildcards/Workflows/Other/Motion），它们在 model_routing 里全是 NON_MODEL_TYPES，
+#   分流一律返回 folder=None，不会往这些目录写任何东西；
+# · 反过来，分流会落的核心 key（diffusion_models/text_encoders/clip_vision/…）都能在
+#   ENV_DIRS["comfyui"] 查到，轮不到这张兜底表；
+# · Checkpoint 在这里是 "Stable-diffusion"（WebUI 时代的默认根目录名），只有 env 未设置时才用得到；
+#   env=comfyui 时 ENV_DIRS 先命中 checkpoints，不会再落到这里。
+# 调用方：只被 organize_model 的 tdir 兜底分支引用（BASE_DIRS 已确认无任何调用方，作为死代码删除）。
 TYPE_DIRS = {
 
     "Checkpoint": "Stable-diffusion",
@@ -87,19 +92,45 @@ TYPE_DIRS = {
     "Other": "Other",
     "MotionModule": "Motion",
 }
-BASE_DIRS = {
-    "SD 1.5": "SD1.5", "SD 2.0": "SD2.x", "SD 2.1": "SD2.x",
-    "SDXL": "SDXL", "SDXL 1.0": "SDXL", "SD 3": "SD3",
-    "FLUX.1 D": "FLUX", "FLUX.1 S": "FLUX", "FLUX.1 K": "FLUX",
-    "Pony": "Pony", "Illustrious": "Illustrious", "NoobAI": "NoobAI",
-    "Other": "Other",
-}
 
 
 def sanitize_filename(name):
     name = re.sub(r'[\\/:*?"<>|]', "_", name or "")
     name = name.strip().strip(".")
     return name[:180] or "model"
+
+
+def choose_body_file(files):
+    """info.files[]（本地 .civitai.info / .info.json 里的列表）→ 代表「模型本体」的那一项，没有则 None。
+
+    Civitai 对**附件**也打 primary（Config / Archive / Workflow / Training Data 都可能带 primary），
+    所以旧写法「primary 且 type != Negative 就是本体」是错的：改名/整理会拿 readme.json 或 flow.json
+    的名字去命名一个 .safetensors 权重（civitai_api.pick_file 修过的同一类缺陷，但这里读的是本地
+    info 文件、不经 pick_file，那次修复覆盖不到）。
+    分层挑选，判定语义与 civitai_api 同源（model_routing.is_weight_file_type）：
+      ① primary 的权重类型文件 → ② 任意权重类型文件（Model / Pruned Model / Diffusion Model / UNet）；
+    一个权重类型都没有时**退回原逻辑**：③ primary 且 type != "Negative" → ④ files[0]
+    （历史 info 常缺 type 或不写类型，退回旧行为才不会突然选不出名字）。
+    """
+    items = [f for f in (files or []) if isinstance(f, dict)]
+    if not items:
+        return None
+    for f in items:
+        if f.get("primary") and _routing.is_weight_file_type(f):
+            return f
+    for f in items:
+        if _routing.is_weight_file_type(f):
+            return f
+    for f in items:
+        if f.get("primary") and f.get("type") != "Negative":
+            return f
+    return items[0]
+
+
+def body_file_name(files):
+    """choose_body_file 的 name 字段（拿不到返回 ""），供改名/整理算目标文件名用。"""
+    chosen = choose_body_file(files)
+    return (chosen.get("name") or "").strip() if chosen else ""
 
 
 # 模型名清理规则：修掉会破坏 ComfyUI / WebUI 提示词解析的符号
@@ -173,21 +204,18 @@ def rename_model_bundle(model_path, destination):
 
 
 def rename_to_civitai(model_path, meta, dry_run=False, log_cb=None, clean_rules=None, include_version=False):
-    """同目录下把模型重命名为 C 站文件名（files 主文件 name，回退模型名），
+    """同目录下把模型重命名为 C 站文件名（本体文件名，见 choose_body_file；回退模型名），
     并同步改名附属文件（info/json/预览图/示例图/txt 等），返回 (新路径, 消息列表)。
     不移动目录，避免破坏 SD 的模型文件夹结构。"""
     msgs = []
     if not isinstance(meta, dict) or not meta:
         return model_path, ["无元数据，跳过: %s" % os.path.basename(model_path)]
     files = meta.get("files") or []
-    # 优先 C 站模型名（meta.name，如 "Koikatsu Style"），files 名兜底
+    # 优先 C 站模型名（meta.name，如 "Koikatsu Style"），本体文件名兜底
     # （files 名常是 @xxx 原始下载名，与本地名相同导致"重命名"无意义）
     new_base = (meta.get("name") or "").strip()
     if not new_base and files and isinstance(files[0], dict):
-        for f in files:
-            if f.get("primary") and f.get("type") != "Negative":
-                new_base = (f.get("name") or "").strip()
-                break
+        new_base = body_file_name(files)
         if not new_base:
             new_base = (files[0].get("name") or "").strip()
     if not new_base:
@@ -351,14 +379,9 @@ def organize_model(model_path, models_root, dry_run=True, log_cb=None, rules=Non
     version_name = ""
     files = meta.get("files") or []
     if files and isinstance(files[0], dict):
-        chosen = None
-        for f in files:
-            if f.get("primary") and f.get("type") != "Negative":
-                chosen = f
-                break
-        if chosen is None and files:
-            chosen = files[0]
-        version_name = (chosen or {}).get("name") or ""
+        # 目标文件名只认「模型本体」文件：Civitai 的 primary 会给 Config/Archive/Workflow 也打上，
+        # 旧写法会把附件名（readme.json / pack.zip）当成本体名，整理时连权重一起改成那个名字。
+        version_name = body_file_name(files)
 
     new_name = sanitize_filename(version_name) if version_name else os.path.basename(model_path)
     if not new_name.lower().endswith(os.path.splitext(model_path)[1].lower()):

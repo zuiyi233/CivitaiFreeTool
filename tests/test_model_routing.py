@@ -3,12 +3,14 @@
 import json
 import os
 import struct
+import subprocess
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import civitai_api
 import model_routing as routing
 
 # Civitai ModelType 权威 23 值（精确大小写：Controlnet 小写 n、Workflows 复数）
@@ -59,6 +61,8 @@ class TypeTableTests(unittest.TestCase):
     def test_all_23_authoritative_types_have_a_decision(self):
         self.assertEqual(len(CIVITAI_TYPES), 23)
         self.assertEqual(len(set(CIVITAI_TYPES)), 23)
+        # 模块里的权威枚举必须和测试这份逐值同序（漏一个/多一个都会被这里拦下）
+        self.assertEqual(list(routing.CIVITAI_MODEL_TYPES), CIVITAI_TYPES)
         for raw in CIVITAI_TYPES:
             with self.subTest(model_type=raw):
                 mapped = routing.MODEL_TYPE_TO_FOLDER.get(raw)
@@ -106,6 +110,73 @@ class TypeTableTests(unittest.TestCase):
         # 非权重附件类型必须与权重类型互斥
         self.assertFalse({k for k in routing.NON_WEIGHT_FILE_TYPES if k != "Other"}
                          & (routing.WEIGHT_FILE_TYPES | set(routing.FILE_TYPE_TO_FOLDER)))
+
+    def test_file_type_semantics_have_exactly_one_source(self):
+        """常量去重：files[].type 的判定语义只允许存在一份，就在 civitai_api。
+
+        model_routing 里过去的 {"Model","Pruned Model","Diffusion Model","UNet"} 原始大小写集合
+        与 civitai_api.WEIGHT_FILE_TYPES（归一化 tuple）同名不同义，跨模块 import 会静默错配。
+        现在 WEIGHT_FILE_TYPES 是**派生出来的显示名视图**（webui._needs_header_probe 仍按原始串比对，
+        本任务不许改 webui.py），判定一律走 is_weight_file_type → civitai_api.WEIGHT_FILE_TYPES。
+        """
+        self.assertIs(routing.WEIGHT_FILE_KINDS, civitai_api.WEIGHT_FILE_TYPES)
+        self.assertIs(routing.FILE_TYPE_KINDS, civitai_api.CIVITAI_FILE_TYPES)
+        self.assertIs(routing.normalize_file_type, civitai_api.normalize_file_type)
+        # 转发出来的另外两份集合也必须指向同一个对象，不许在 model_routing 里再抄一遍字面量
+        self.assertIs(routing.ATTACHMENT_FILE_TYPES, civitai_api.ATTACHMENT_FILE_TYPES)
+        self.assertIs(routing.DOWNLOADABLE_FILE_TYPES, civitai_api.DOWNLOADABLE_FILE_TYPES)
+        # 派生集合必须与权威枚举一一对应，且归一化回去就是权威的那四个
+        self.assertEqual({routing.file_type_kind(label) for label in routing.WEIGHT_FILE_TYPES},
+                         set(civitai_api.WEIGHT_FILE_TYPES))
+        self.assertTrue(routing.WEIGHT_FILE_TYPES <= set(routing.FILE_TYPE_LABELS.values()))
+        # 不许再出现第二份字面量：本模块的表里只有 FILE_TYPE_LABELS 存显示拼写
+        self.assertNotIn("Pruned Model", routing.FILE_TYPE_TO_FOLDER)
+        self.assertNotIn("Model", routing.NON_WEIGHT_FILE_TYPES)
+
+    def test_is_weight_file_type_accepts_dict_and_bare_string(self):
+        for label in ("Model", "Pruned Model", "Diffusion Model", "UNet", "pruned_model", " diffusion-model "):
+            with self.subTest(weight=label):
+                self.assertTrue(routing.is_weight_file_type(label))
+                self.assertTrue(routing.is_weight_file_type({"name": "x", "type": label}))
+        for label in ("Negative", "Training Data", "Config", "Archive", "Workflow", "VAE",
+                      "Text Encoder", "CLIPVision", "ControlNet", "Upscaler", "Enhancement LoRA", "Other"):
+            with self.subTest(not_weight=label):
+                self.assertFalse(routing.is_weight_file_type(label))
+                self.assertFalse(routing.is_weight_file_type({"name": "x", "type": label}))
+        # 缺 type 的 dict 按 Model（与 civitai_api.normalize_file_type 同口径）；裸空串不算类型信息
+        self.assertTrue(routing.is_weight_file_type({"name": "x.safetensors"}))
+        self.assertEqual(routing.file_type_kind(None), "")
+        self.assertEqual(routing.file_type_kind("   "), "")
+        self.assertFalse(routing.is_weight_file_type(None))
+        self.assertFalse(routing.is_weight_file_type(""))
+
+    def test_derived_tables_are_the_single_source_for_model_manager(self):
+        """model_manager 的 KNOWN_TYPES / ENV_DIRS["comfyui"] 必须由本模块派生，且与分流结论逐键一致。
+
+        旧模型管理器自带一份只覆盖 6 个目录的 comfyui 表，而 webui.mm_restore_organize 用
+        set(ENV_DIRS["comfyui"].values()) 反推「标准目录」，会把分流写进 diffusion_models 的权重
+        当成非标准文件搬回 checkpoints —— 这两条断言就是防止那张表再次漂移的钉子。
+        """
+        import model_manager as mm
+        self.assertEqual(mm.ENV_DIRS["comfyui"], routing.COMFYUI_TYPE_DIRS)
+        self.assertEqual(mm.KNOWN_TYPES, set(routing.KNOWN_MODEL_TYPES))
+        std_dirs = set(mm.ENV_DIRS["comfyui"].values())
+        for raw, folder in routing.COMFYUI_TYPE_DIRS.items():
+            with self.subTest(model_type=raw):
+                self.assertIn(raw, mm.KNOWN_TYPES)
+                self.assertIn(folder, std_dirs, "整理侧必须把分流落点认成标准目录")
+                self.assertEqual(routing.classify(raw).folder, folder)
+        self.assertTrue({"diffusion_models", "text_encoders", "clip_vision", "upscale_models"} <= std_dirs)
+        # 派生表必须覆盖权威 23 值 + 历史旧拼写，一个都不缺
+        self.assertEqual(set(routing.CIVITAI_MODEL_TYPES) - set(routing.KNOWN_MODEL_TYPES), set())
+        self.assertEqual(len(routing.CIVITAI_MODEL_TYPES), 23)
+        for raw, folder in LEGACY_TYPES + [("Embedding", "embeddings")]:
+            self.assertEqual(routing.COMFYUI_TYPE_DIRS[raw], folder)
+            self.assertEqual(mm.ENV_DIRS["comfyui"][raw], folder)
+            self.assertEqual(routing.classify(raw).folder, folder)
+        # 不分流的类型不能因为派生而悄悄获得目录（否则整理会把工作流当模型搬）
+        for raw in sorted(routing.NON_MODEL_TYPES):
+            self.assertNotIn(raw, mm.ENV_DIRS["comfyui"])
 
 
 class HeaderClassifyTests(unittest.TestCase):
@@ -444,6 +515,30 @@ class BundleNameTests(unittest.TestCase):
         for raw in ["  ", "..", "\x00\x01", "?" * 30, "。", "……", "CON", "\\", "\\\\", "a" * 300]:
             with self.subTest(name=raw):
                 self.assertTrue(routing.is_safe_segment(routing.bundle_name_for(raw)))
+
+
+class OfflineImportTests(unittest.TestCase):
+    def test_module_import_chain_still_needs_no_network(self):
+        """去重后 model_routing 会 import civitai_api（model_manager 又 import model_routing）：
+        这条链必须仍然零网络可导入 —— 子进程里把 socket 出口全打死，能 import 成功才算合格。"""
+        code = (
+            "import socket, urllib.request\n"
+            "def _boom(*a, **k):\n"
+            "    raise RuntimeError('network access during import')\n"
+            "socket.create_connection = _boom\n"
+            "socket.getaddrinfo = _boom\n"
+            "urllib.request.urlopen = _boom\n"
+            "urllib.request.build_opener = _boom\n"
+            "urllib.request.OpenerDirector.open = _boom\n"
+            "import model_routing, model_manager\n"
+            "print(model_routing.classify('UNet').folder)\n"
+            "print(model_manager.ENV_DIRS['comfyui']['UNet'])\n"
+        )
+        root = Path(__file__).resolve().parents[1]
+        proc = subprocess.run([sys.executable, "-c", code], cwd=str(root),
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, "import 期就碰了网络: %s" % proc.stderr[-800:])
+        self.assertEqual(proc.stdout.split(), ["diffusion_models", "diffusion_models"])
 
 
 if __name__ == "__main__":
