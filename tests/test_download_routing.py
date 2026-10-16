@@ -173,16 +173,13 @@ def _no_persistence(monkeypatch):
 def test_config_defaults_are_conservative():
     assert config.DEFAULTS["route_by_type"] is False
     assert config.DEFAULTS["comfyui_models_root"] == ""
-    assert config.DEFAULTS["route_unclassified"] == "keep"
 
 
 def test_normalize_rejects_dirty_route_values():
-    cfg = {"route_by_type": "true", "comfyui_models_root": "  D:\\ComfyUI\\models  ",
-           "route_unclassified": "KEEP"}
+    cfg = {"route_by_type": "true", "comfyui_models_root": "  D:\\ComfyUI\\models  "}
     config.normalize_ui_preferences(cfg)
     assert cfg["route_by_type"] is False            # 只有显式 true 才开：脏值一律当关
     assert cfg["comfyui_models_root"] == "D:\\ComfyUI\\models"
-    assert cfg["route_unclassified"] == "keep"
 
 
 # ---------------------------------------------------------------- 关闭态＝回归护栏
@@ -224,7 +221,7 @@ def test_absent_type_folder_is_not_created_and_explains_why(tmp_path):
 
 def test_same_name_file_blocking_type_dir_is_left_alone(tmp_path):
     root = comfy_root(tmp_path, "loras")
-    blocker = Path(root) / "loras" / "Demo Model_v1"
+    blocker = Path(root) / "loras" / "demo"
     blocker.write_text("有人把模型名当文件名用了", encoding="utf-8")
     a = make_app(tmp_path, route_by_type=True, comfyui_models_root=root)
     dest, reason, _ = a._route_dest_dir({"type": "LORA", "name": "Demo Model"},
@@ -242,8 +239,10 @@ def test_lora_routes_into_nested_bundle_dir(tmp_path):
     a.api.get_model = Mock(return_value={"id": 456, "name": "Demo Model", "type": "LORA"})
     a.api.get_model_version = Mock(return_value=version_for([LORA_FILE]))
     item, task = enqueue(a)
-    expect = os.path.join(root, "loras", model_routing.bundle_name_for("Demo Model", "v1"))
     assert item["ok"] and task is not None
+    # 目录名 = 模型文件名主干（kurachi_mizuki\kurachi_mizuki.safetensors），不是「模型名_版本名」：
+    # 后者会得到 "Kurachi Mizuki - style [Anima Base] (Commission)_Anima Base v1.0" 这种带括号长名。
+    expect = os.path.join(root, "loras", os.path.splitext(task.filename)[0])
     assert task.info["routed_dir"] == expect
     assert task.info["route_source"] == "type"
     assert os.path.isdir(expect)                     # 只有分流成功才建模型名目录
@@ -260,11 +259,11 @@ def test_checkpoint_header_splits_checkpoints_and_diffusion_models(tmp_path):
     for blob, folder in ((FULL_FT, "checkpoints"), (DIT, "diffusion_models")):
         with patch.object(civitai_api, "build_opener", return_value=range_opener(blob)):
             dest, reason, source = a._route_dest_dir(model_obj, version, CKPT_FILE, "demo")
-        assert dest == os.path.join(root, folder, "Demo Model_v1"), "%s -> %s" % (folder, reason)
+        assert dest == os.path.join(root, folder, "demo"), "%s -> %s" % (folder, reason)
         assert source == "header" and "头" in reason      # 原因要说清是「按文件头」判的
         assert os.path.isdir(dest)
-    assert os.path.isdir(os.path.join(root, "checkpoints", "Demo Model_v1"))
-    assert os.path.isdir(os.path.join(root, "diffusion_models", "Demo Model_v1"))
+    assert os.path.isdir(os.path.join(root, "checkpoints", "demo"))
+    assert os.path.isdir(os.path.join(root, "diffusion_models", "demo"))
 
 
 def test_probe_only_for_ambiguous_safetensors(tmp_path):
@@ -283,7 +282,7 @@ def test_probe_only_for_ambiguous_safetensors(tmp_path):
                    downloadUrl="https://civitai.com/api/download/models/123?fileId=9")
         dest, _, source = a._route_dest_dir({"type": "Checkpoint", "name": "Demo Model"},
                                             version_for([gguf]), gguf, "demo")
-        assert dest == os.path.join(root, "checkpoints", "Demo Model_v1") and source == "type"
+        assert dest == os.path.join(root, "checkpoints", "demo") and source == "type"
     assert seen == []                                   # 一条请求都没发
 
 
@@ -327,7 +326,7 @@ def test_sniff_failures_never_break_and_still_route_by_type(tmp_path, label):
     with patch.object(civitai_api, "build_opener", return_value=SNIFF_FAILURES[label]):
         dest, reason, source = a._route_dest_dir({"type": "Checkpoint", "name": "Demo Model"},
                                                  version, CKPT_FILE, "demo")
-    assert dest == os.path.join(root, "checkpoints", "Demo Model_v1"), "%s -> %s" % (label, reason)
+    assert dest == os.path.join(root, "checkpoints", "demo"), "%s -> %s" % (label, reason)
     assert source == "type", label               # 降级为「只按类型映射」，不是报错
     assert "按 C 站模型类型 Checkpoint 落 checkpoints" in reason, label
 
@@ -340,7 +339,7 @@ def test_download_url_unavailable_degrades_to_type_only(tmp_path):
                       side_effect=civitai_api.CivitaiError("无下载链接")):
         dest, reason, source = a._route_dest_dir({"type": "Checkpoint", "name": "Demo Model"},
                                                  version_for([CKPT_FILE]), CKPT_FILE, "demo")
-    assert dest == os.path.join(root, "checkpoints", "Demo Model_v1") and source == "type"
+    assert dest == os.path.join(root, "checkpoints", "demo") and source == "type"
     assert "checkpoints" in reason
 
 
@@ -353,7 +352,7 @@ def test_probe_budget_exhausted_degrades_without_network(tmp_path):
     with patch.object(civitai_api, "build_opener", return_value=range_opener(FULL_FT, seen=seen)):
         dest, reason, source = a._route_dest_dir({"type": "Checkpoint", "name": "Demo Model"},
                                                  version_for([CKPT_FILE]), CKPT_FILE, "demo")
-    assert dest == os.path.join(root, "checkpoints", "Demo Model_v1") and source == "type"
+    assert dest == os.path.join(root, "checkpoints", "demo") and source == "type"
     assert seen == []
 
 
@@ -380,7 +379,7 @@ def test_unclassified_type_keeps_current_behaviour(tmp_path):
     dest, reason, source = a._route_dest_dir({"type": "Workflows", "name": "Demo Model"},
                                              version_for([flow]), flow, "flow")
     assert dest is None and source == "none"
-    assert "不分流" in reason and "route_unclassified=keep" in reason
+    assert "不分流" in reason and "保持现有落盘" in reason   # 文案给人看，不暴露内部配置键名
     assert os.listdir(os.path.join(root, "checkpoints")) == []   # 一个目录都没多
 
 
@@ -443,7 +442,7 @@ def test_enqueue_with_explicit_dest_skips_routing(tmp_path):
     assert "routed_dir" not in task.info               # 更新下载不被分流搬走
     assert "指定落点优先" in task.info["route_reason"]
     assert make_downloader(a.cfg)._resolve_dest(task) == str(explicit)
-    assert not os.path.isdir(os.path.join(root, "checkpoints", "Demo Model_v1"))
+    assert not os.path.isdir(os.path.join(root, "checkpoints", "demo"))
 
 
 def test_hf_relative_subdir_semantics_unchanged(tmp_path):
@@ -470,7 +469,7 @@ def test_routing_priority_survives_task_round_trip(tmp_path):
 # ---------------------------------------------------------------- 防重入
 
 def test_two_tasks_routed_to_same_bundle_do_not_write_concurrently(tmp_path):
-    routed = tmp_path / "models" / "loras" / "Demo Model_v1"
+    routed = tmp_path / "models" / "loras" / "demo"
     routed.mkdir(parents=True)
     global_dir = tmp_path / "global"
     global_dir.mkdir()
@@ -582,7 +581,7 @@ def test_sidecars_and_preview_follow_the_routed_dir(tmp_path):
                  gen_metadata=True, metadata_format="both", download_cover=True,
                  archive_comments=True, models_dir=root, models_dirs=[root],
                  download_target_dir=root)
-    bundle = os.path.join(root, "checkpoints", "Demo Model_v1")
+    bundle = os.path.join(root, "checkpoints", "demo")
     os.makedirs(bundle)
     model = os.path.join(bundle, "demo.safetensors")
     Path(model).write_bytes(b"fake-weights")
@@ -624,7 +623,7 @@ def test_sidecars_and_preview_follow_the_routed_dir(tmp_path):
 def test_images_dir_is_created_inside_the_bundle(tmp_path):
     """补帧的 <名>.images/ 必须落在嵌套目录里与模型同层（真实 _start_images_autofill 链路）。"""
     root = comfy_root(tmp_path, "checkpoints")
-    bundle = os.path.join(root, "checkpoints", "Demo Model_v1")
+    bundle = os.path.join(root, "checkpoints", "demo")
     os.makedirs(bundle)
     model = os.path.join(bundle, "demo.safetensors")
     Path(model).write_bytes(b"fake-weights")
@@ -680,3 +679,63 @@ def test_history_row_carries_route_fields(tmp_path):
     assert row["routed_dir"] == str(routed)
     assert row["dest_dir"] == str(routed)              # 列表/历史落点字段齐全
     assert row["file_path"] == os.path.join(str(routed), "demo.safetensors")
+
+
+# ---------------------------------------------------------------- 入口一致性（图片页批量 / parse_urls）
+
+def _image_result(app, resources, url="https://civitai.red/images/1"):
+    app.parse_image_models = Mock(return_value=json.dumps({"ok": True, "resources": resources}))
+    return json.loads(app.download_image_models(url))
+
+
+def test_batch_dedup_index_follows_routing(tmp_path):
+    """防重复索引必须跟着分流走：分流后本体落在 <models_root>\\<类型>\\<名>\\ 里，
+    只 walk download_dir 永远看不见它们 → 每点一次「批量下载全部模型」就重复下一遍。"""
+    root = comfy_root(tmp_path, "loras")
+    bundle = Path(root) / "loras" / "demo_lora"
+    (bundle / "demo_lora.images").mkdir(parents=True)   # 图片缓存目录不算模型
+    (bundle / "demo_lora.safetensors").write_bytes(b"x")
+    (bundle / "demo_lora.images" / "shot.png").write_bytes(b"x")
+    off = make_app(tmp_path, comfyui_models_root=root)   # route_by_type 默认 False
+    assert "demo_lora.safetensors" not in off._batch_existing_model_names()
+    on = make_app(tmp_path, route_by_type=True, comfyui_models_root=root)
+    assert "demo_lora.safetensors" in on._batch_existing_model_names()
+    assert "shot.png" not in on._batch_existing_model_names()   # .images 里的图不当成模型
+
+
+def test_batch_download_routes_then_skips_when_already_routed(tmp_path):
+    """一次改两件事：① 这条链路要按类型分流 ② 分流后的文件要能被下一次认出来并跳过。
+    只做①不做②就会「分流越正常、重复下载越多」。"""
+    root = comfy_root(tmp_path, "loras")
+    a = make_app(tmp_path, route_by_type=True, comfyui_models_root=root)
+    a.api.get_model = Mock(return_value={"id": 456, "name": "Demo LoRA", "type": "LORA",
+                                         "modelVersions": [{"id": 123}]})
+    a.api.get_model_version = Mock(return_value=version_for([LORA_FILE]))
+    res = [{"modelId": 456, "versionId": 123, "name": "Demo LoRA", "type": "LORA"}]
+    first = _image_result(a, res)
+    assert first["added"] == 1 and first["skipped"] == 0
+    task = a.dl.add_task.call_args_list[-1].args[0]
+    expect = os.path.join(root, "loras", os.path.splitext(task.filename)[0])
+    assert task.info["routed_dir"] == expect
+    assert first["detail"][0]["dest_dir"] == expect          # 弹窗能显示落点
+    assert "loras" in first["detail"][0]["route_reason"]
+    Path(expect).mkdir(parents=True, exist_ok=True)
+    (Path(expect) / task.filename).write_bytes(b"x")
+    second = _image_result(a, res)
+    assert second["added"] == 0 and second["skipped"] == 1   # 已经分流到位的文件不再重复下载
+
+
+def test_parse_urls_records_routed_dir(tmp_path):
+    """前端「解析链接」走的是 parse_urls 而不是 _enqueue_one，两条入口都要接上分流。"""
+    root = comfy_root(tmp_path, "loras")
+    a = make_app(tmp_path, route_by_type=True, comfyui_models_root=root)
+    a.api.get_model = Mock(return_value={"id": 456, "name": "Demo LoRA", "type": "LORA",
+                                         "modelVersions": [{"id": 123}]})
+    a.api.get_model_version = Mock(return_value=version_for([LORA_FILE]))
+    a.parse_urls(["https://civitai.red/models/456?modelVersionId=123"])
+    for _ in range(300):
+        if getattr(a, "_parse_state", {}).get("finished"):
+            break
+        time.sleep(0.01)
+    task = a.dl.add_task.call_args_list[-1].args[0]
+    assert task.info["routed_dir"] == os.path.join(root, "loras", os.path.splitext(task.filename)[0])

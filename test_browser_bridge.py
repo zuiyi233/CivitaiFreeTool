@@ -1161,19 +1161,19 @@ class BundleCapsTest(unittest.TestCase):
         self.assertNotIn("bundle", d, d)
         task = self._wait_task()
         self.assertEqual(os.path.normpath(task.info.get("routed_dir") or ""),
-                         os.path.normpath(os.path.join(self.comfy, "loras", "Test Model_v1")))
+                         os.path.normpath(os.path.join(self.comfy, "loras", "test")))
         self.assertEqual(browser_bridge.bundle_count(), 1,
                          "分流出落点就登记令牌（扩展用不上，交给 TTL/容量回收）")
 
     def test_caps_present_routes_and_returns_bundle_token(self):
-        """声明 caps:["bundle"] → 分流到 <comfy>\\loras\\<模型名_版本>，令牌随响应回给扩展"""
+        """声明 caps:["bundle"] → 分流到 <comfy>\\loras\\<文件名主干>，令牌随响应回给扩展"""
         st, d = req("/api/download", "POST", self._body(True), origin="chrome-extension://abc")
         self.assertEqual(st, 200, d)
         self.assertTrue(d["ok"], d)
         self.assertTrue(d.get("routed"), d)
         token = d.get("bundle") or ""
         self.assertTrue(token, "分流成功必须回 bundle 令牌：%s" % d)
-        expect = os.path.normpath(os.path.join(self.comfy, "loras", "Test Model_v1"))
+        expect = os.path.normpath(os.path.join(self.comfy, "loras", "test"))
         self.assertEqual(os.path.normpath(d["dest_dir"]), expect)
         self.assertEqual(browser_bridge.resolve_bundle(token), expect)
         task = self._wait_task()
@@ -1224,7 +1224,7 @@ class BundleCapsTest(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         task = self._wait_task()
         self.assertEqual(os.path.normpath(task.info.get("routed_dir") or ""),
-                         os.path.normpath(os.path.join(self.comfy, "loras", "Test Model_v1")))
+                         os.path.normpath(os.path.join(self.comfy, "loras", "test")))
         self.app.dl.reset_mock()
         item = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
         self.assertTrue(item["ok"], item)

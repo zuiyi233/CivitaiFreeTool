@@ -242,8 +242,9 @@ _civitai_archive_history.json           # 历史镜像（导入导出格式）  
 4. 响应统一 `{ok, saved: 'software'|'downloads'|'', channel, msg}`（`saved:''` 仅出现在失败响应；无 'skipped' 状态）。
 5. 模型文件本体不经 writeFile：offscreen 发 `sendModelToSoftware {downloadUrl, pageUrl, destSubdir}`，
    bg POST `/api/download` body `{url, dest_subdir, caps:['bundle']}`。桌面端**按类型分流**时本体落
-   `<comfyui_models_root>\<类型key>\<模型名>\`，并回 `{bundle, dest_dir, routed:true}`；本次归档的
-   封面/配图/视频/模型信息 txt/example.json/评论全部改走该令牌的 `bundle` 通道，与本体同目录。
+   `<comfyui_models_root>\<类型key>\<文件名主干>\`（目录名跟模型文件名一致，如
+   `loras\kurachi_mizuki\kurachi_mizuki.safetensors`），并回 `{bundle, dest_dir, routed:true}`；
+   本次归档的封面/配图/视频/模型信息 txt/example.json/评论全部改走该令牌的 `bundle` 通道，与本体同目录。
    分流判不成才回落 `<archive_root>/<dest_subdir>/`。
 6. **顺序硬约束**：`sendModelToSoftware` 必须先于任何附属文件写入完成——令牌是随下载提交回的，
    并发跑就会在令牌到手前按 rel_path 写盘，本体与附属文件分家（这正是本次修的缺陷）。

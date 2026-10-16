@@ -1115,17 +1115,6 @@ class Api:
         msg = "后续下载目标已设为：%s（已有模型不会移动）" % (p or "默认下载目录")
         return json.dumps({"ok": True, "target": p, "msg": msg, "moved": moved}, ensure_ascii=False)
 
-    def _task_intended_dir(self, task):
-        """任务「应该」落在哪：单独指定过的以指定为准；否则按当前全局目标（HF 任务带相对子目录）"""
-        if (task.info or {}).get("dest_explicit"):
-            return task.dest_dir or ""
-        t = (self.cfg.get("download_target_dir") or "").strip()
-        base = t if (t and os.path.isdir(t)) else (self.cfg.get("download_dir") or "").strip()
-        rel = ((task.info or {}).get("hf_rel") or "").strip().strip("/\\")
-        if rel and base:
-            return os.path.join(base, rel.replace("/", os.sep))
-        return base
-
     def _target_allowed(self, p):
         """目标文件夹是否允许（必须在模型管理目录或默认下载目录内，防误设到别处）"""
         if not p:
@@ -2926,11 +2915,16 @@ class Api:
                 if header:
                     decision = model_routing.classify(model_type, file_type, base_model, header)
             if not decision.folder:
-                mode = str(self.cfg.get("route_unclassified") or "keep").strip().lower() or "keep"
-                # 目前只有 keep 一档（保持现有落盘并如实说明原因）；未来加档位在这里分支，不猜目录
-                return None, "未分流：%s（route_unclassified=%s）" % (decision.reason, mode), decision.source
-            bundle = model_routing.bundle_name_for(model_obj.get("name") or base_name,
-                                                   version.get("name") or "")
+                # 原因文案直接给人看：说清处理方式，不暴露内部配置键名
+                return None, "未分流：%s（保持现有落盘，不猜目录）" % decision.reason, decision.source
+            # 目录名跟模型文件名主干走（kurachi_mizuki\kurachi_mizuki.safetensors）：
+            # 文件名已经过 download_name_mode / rename_clean_rules 清洗，比「模型名_版本名」干净得多
+            # ——后者会得到 "Kurachi Mizuki - style [Anima Base] (Commission)_Anima Base v1.0" 这种
+            # 带括号的长名，在 ComfyUI 下拉框里几乎读不了。没有文件名时才退回模型名+版本。
+            stem = str(base_name or "").strip()
+            bundle = (model_routing.bundle_name_for(stem, "") if stem
+                      else model_routing.bundle_name_for(model_obj.get("name") or "",
+                                                         version.get("name") or ""))
             dest = model_routing.resolve_dest_dir(models_root, decision.folder, bundle)
             if not dest:
                 # 落点原因要先落成变量：写成 `return None, (原因, 来源)` 会变成 2 元组，调用方解包直接炸
@@ -3580,6 +3574,39 @@ class Api:
                     return r
         return None
 
+    _MODEL_FILE_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin")
+    """「批量下载全部模型」防重复索引认的扩展名（与历史行为同一张表）。"""
+
+    def _batch_existing_model_names(self):
+        """图片页批量下载的「本地已有同名文件」索引（小写文件名集合）。
+
+        扫描范围必须跟着分流一起改：开启分流后模型本体落在
+        `<comfyui_models_root>\\<类型key>\\<模型名>\\` 里，只 walk `download_dir`
+        就永远看不见它们 → 每次点按钮都会把同一个模型重复下一遍（分流越正常，重复下载越多）。
+        未开启分流时逐字保持旧行为：只扫 download_dir，不碰模型库（否则会因同名文件多跳过）。
+        """
+        roots = []
+        base = str(self.cfg.get("download_dir") or "").strip()
+        if base and os.path.isdir(base):
+            roots.append(base)
+        if self.cfg.get("route_by_type"):
+            # _models_roots() 自带「route_by_type 开启且 comfyui_models_root 有效才并入」的门限，
+            # 这里复用它，绝不在这条链路上再抄一遍判定（两处门限早晚会分叉）。
+            roots.extend(r for r in (self._models_roots() or []) if r)
+        out = set()
+        seen = set()
+        for root in roots:
+            key = os.path.normcase(os.path.abspath(root))
+            if key in seen:
+                continue
+            seen.add(key)
+            for dp, dn, fns in os.walk(root, onerror=lambda e: None):
+                dn[:] = [d for d in dn if not d.lower().endswith(".images")]
+                for fn in fns:
+                    if fn.lower().endswith(self._MODEL_FILE_EXTS):
+                        out.add(fn.lower())
+        return out
+
     @requires_civitai_key("json")
     def download_image_models(self, url):
         """图片页全部模型批量入队：本地已存在同名文件则跳过"""
@@ -3588,19 +3615,14 @@ class Api:
         if not res.get("ok"):
             return json.dumps(res)
         base = self.cfg.get("download_dir") or ""
-        existing = set()
-        if base and os.path.isdir(base):
-            for dp, dn, fns in os.walk(base):
-                dn[:] = [d for d in dn if not d.lower().endswith(".images")]
-                for fn in fns:
-                    if fn.lower().endswith((".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin")):
-                        existing.add(fn.lower())
+        existing = self._batch_existing_model_names()
         added, skipped = 0, 0
         detail = []
         for r in res.get("resources") or []:
             mid, vid = r.get("modelId"), r.get("versionId")
             if not mid and not vid:
                 continue
+            model = None
             try:
                 if mid:
                     model = self.api.get_model(mid)
@@ -3615,6 +3637,17 @@ class Api:
                 f = self.api.pick_file(version)[0]
                 if not f:
                     continue
+                # 只有图片页资源 id（没有 modelId）时也把模型对象取回来：分流要用 model.type 判类型、
+                # 用 model.name 算目录名，缺了它就只能退回「按文件类型/base_model 猜」。拿不到就当 None，
+                # 由 _route_dest_dir 内部降级，绝不让这条链路因为一次 get_model 失败而整条资源报错。
+                if model is None:
+                    vmid = (version.get("modelId")
+                            or (version.get("model") or {}).get("id") or "")
+                    if vmid:
+                        try:
+                            model = self.api.get_model(vmid)
+                        except Exception:
+                            model = None
                 fname = f["name"]
                 if fname.lower() in existing:
                     skipped += 1
@@ -3622,17 +3655,26 @@ class Api:
                                    "status": "skip"})
                     continue
                 dl_url = self.api.build_download_url(version["id"], f.get("id"))
+                # 落点解析与 parse_urls / _enqueue_one 同源：这条是桌面自身 UI 发起的下载，
+                # 不受扩展 caps 门限约束，直接按类型分流（拿不到落点就保持现有落盘）。
+                routed, route_reason, route_source = self._route_dest_dir(
+                    model, version, f, os.path.splitext(fname)[0])
                 task = downloader.DownloadTask(
                     url=dl_url,
                     dest_dir=base or "",
                     filename=fname,
-                    info={"modelName": r.get("name") or fname, "versionName": r.get("versionName") or ""},
+                    info={"modelName": r.get("name") or fname,
+                          "versionName": r.get("versionName") or "",
+                          "route_reason": route_reason, "route_source": route_source},
                 )
+                if routed:
+                    task.info["routed_dir"] = routed    # downloader._resolve_dest 认它，压过全局目标
                 self.dl.add_task(task)
                 added += 1
                 existing.add(fname.lower())
                 detail.append({"name": r.get("name") or fname, "type": r.get("type") or "",
-                               "status": "add"})
+                               "status": "add", "dest_dir": routed or "",
+                               "route_reason": route_reason})
             except Exception as e:
                 # 单个资源失败不能整批静默：详情里留下原因，用户才看得见为什么没下
                 detail.append({"name": r.get("name") or str(mid or vid), "type": r.get("type") or "",
