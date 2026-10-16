@@ -139,10 +139,11 @@ code {
     <p class="note">浏览 C 站模型页 → 点扩展图标 → 确认小窗 → 一键下载到软件下载管理。</p>
     <p style="margin-top:10px;font-weight:600">安装步骤：</p>
     <ul class="steps" style="margin-top:8px">
-      <li>解压下载的 zip，得到 <code>chrome-extension</code> 文件夹</li>
+      <li>把 zip 解压到一个长期保留的固定位置，得到 <code>CivitaiFreeTool-ChromeExtension</code> 文件夹</li>
       <li>打开 Chrome，地址栏进入 <code>chrome://extensions/</code></li>
       <li>右上角开启「开发者模式」→「加载已解压的扩展程序」→ 选择该文件夹</li>
       <li>工具栏固定图标；需配套 CivitaiFreeTool v2.1.0+</li>
+      <li>以后更新：新版 zip 覆盖解压到同一文件夹，回到本页点扩展卡片的「重新加载」即可，不用移除重加</li>
     </ul>
     <div class="flow" style="margin-top:14px">
       <span class="step-chip">1️⃣ 打开软件</span><span class="arrow">→</span>
@@ -192,6 +193,7 @@ code {
   const zipBtn = document.getElementById("dlZip");
   const verTag = document.getElementById("verTag");
   const fbExe = "https://github.com/ADVICEsama/CivitaiFreeTool/releases/download/v2.1.12/CivitaiFreeToolWeb.exe";
+  // 回退链接指的是 v2.1.12 已发布的历史资产，名字带版本号；现行扩展包名不带版本号，别在这里顺手改齐，否则回退链接 404。
   const fbZip = "https://github.com/ADVICEsama/CivitaiFreeTool/releases/download/v2.1.12/CivitaiFreeTool-ChromeExtension-v2.1.12.zip";
   fetch("https://api.github.com/repos/ADVICEsama/CivitaiFreeTool/releases/latest")
     .then((r) => (r.ok ? r.json() : Promise.reject()))

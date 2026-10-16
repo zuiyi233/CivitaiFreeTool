@@ -10,7 +10,7 @@ release=importlib.util.module_from_spec(spec);spec.loader.exec_module(release)
 
 class ReleaseTests(unittest.TestCase):
     def fixture(self,d):
-        folder=Path(d);names=['CivitaiFreeToolWeb-2.6.0.exe','CivitaiFreeTool-Windows-v2.6.0.zip','CivitaiFreeTool-ChromeExtension-v2.6.0.zip','CivitaiFreeTool-FirefoxExtension-v2.6.0.zip','CivitaiFreeTool-Source-v2.6.0.zip','SHA256SUMS.txt']
+        folder=Path(d);names=['CivitaiFreeToolWeb-2.6.0.exe','CivitaiFreeTool-Windows-v2.6.0.zip','CivitaiFreeTool-ChromeExtension.zip','CivitaiFreeTool-FirefoxExtension.zip','CivitaiFreeTool-Source-v2.6.0.zip','SHA256SUMS.txt']
         assets=[]
         for name in names:
             data=('fixture '+name).encode();(folder/name).write_bytes(data);assets.append({'name':name,'size':len(data),'sha256':hashlib.sha256(data).hexdigest()})

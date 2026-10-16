@@ -183,9 +183,9 @@ Mica / Mica Alt 是 Windows 原生**壁纸色调材质**，并不透视其他窗
 
 ## Chrome / Firefox 扩展
 
-Release 同时附带两款扩展 ZIP，`manifest.json` 在压缩包根目录。
+Release 同时附带两款扩展 ZIP，`manifest.json` 在压缩包根目录；扩展包的文件名不带版本号，版本看 Release tag 和包内 `manifest.json`。
 
-- **Chrome / Edge**：解压 Chrome 包，在扩展管理页启用开发者模式，加载已解压目录。
+- **Chrome / Edge**：首次把 Chrome 包解压到一个长期保留的固定位置，在 `chrome://extensions` 启用开发者模式后「加载已解压的扩展程序」。之后每次更新只需覆盖解压到同一目录，再点扩展卡片的「重新加载」，不必移除重加；扩展 ID 由 manifest 的 `key` 固定，换目录或换机器都不会变，提交记录也不会丢（从 2.2.0 及更早版本迁移需要一次移除重加，详见 [chrome-extension/README.md](chrome-extension/README.md)）。
 - **Firefox**：当前包未签名，通过 `about:debugging` 临时加载；长期安装需要 Mozilla 签名。不能把它当作已签名永久扩展。
 - 软件运行后，点击扩展图标，发送当前页，或切换“批量标签页”后全选 / 勾选并发送；当前页不是模型也能提交其它已打开的模型页。
 

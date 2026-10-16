@@ -55,7 +55,9 @@ def main():
     if pushed.lower()!=repo.lower():raise RuntimeError('目标仓库 %s 与 %s 指向的 %s 不一致；发布与源码推送必须同一个仓库'%(repo,args.remote,pushed or '(取不到)'))
     manifest=json.loads((args.assets_dir/'release_assets.json').read_text(encoding='utf-8'))
     if manifest['version']!=version or manifest['commit']!=head:raise RuntimeError('附件清单与版本或源码提交不一致')
-    required={'CivitaiFreeToolWeb-'+version+'.exe','CivitaiFreeTool-Windows-'+tag+'.zip','CivitaiFreeTool-ChromeExtension-'+tag+'.zip','CivitaiFreeTool-FirefoxExtension-'+tag+'.zip','CivitaiFreeTool-Source-'+tag+'.zip','SHA256SUMS.txt'}
+    # 扩展 ZIP 的名字不带版本号：Chrome 的"解压全部"会用 ZIP 文件名建目录，名字里带版本
+    # 就等于每次发版都换目录，已加载的扩展因此只能删掉重加（ID 与 storage 一起丢）。
+    required={'CivitaiFreeToolWeb-'+version+'.exe','CivitaiFreeTool-Windows-'+tag+'.zip','CivitaiFreeTool-ChromeExtension.zip','CivitaiFreeTool-FirefoxExtension.zip','CivitaiFreeTool-Source-'+tag+'.zip','SHA256SUMS.txt'}
     if {a['name'] for a in manifest['assets']}!=required:raise RuntimeError('缺少必要附件')
     for a in manifest['assets']:
         data=(args.assets_dir/a['name']).read_bytes()
