@@ -1,13 +1,48 @@
 # -*- coding: utf-8 -*-
-"""browser_bridge 单测：扩展 POST /api/download → handler 入队下载 全链路（临时 handler，不碰真实下载）"""
+"""browser_bridge 单测：扩展 POST /api/download → handler 入队下载 全链路（临时 handler，不碰真实下载）
+
+bundle 令牌层（分流落点凭据 + /api/archive/file 新形态 + 能力协商）同样全部离线：
+假 api 只回本地字典，dl/scan 用 Mock 顶掉，所有落点都在临时目录，绝不发一个真实请求。"""
 import json
 import os
+import tempfile
+import time
 import unittest
 import urllib.request
 
 import browser_bridge
 
-PORT = 47539  # 测试端口，避开默认 47531
+PORT = 47539  # 兜底端口；实际端口由 boot_bridge() 向 OS 要（见下）
+
+
+def _free_port():
+    """让 OS 挑一个空闲端口（bind 到 0 再读回来），只为避开「固定端口被人占住」"""
+    import socket
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def boot_bridge():
+    """启动桥服务并把真实端口写回模块级 PORT（全文件共用一个服务实例）
+
+    为什么不再直接用固定 47539：本机并排跑测试的另一个进程（或上一轮没退干净的服务器）
+    占住该端口时，本文件的 start() 会静默返回 0，而请求却打到「别人的服务器」上——
+    handler 不是本文件注册的那个，用例会莫名其妙地红（实测过：/api/download 全 200）。
+    """
+    global PORT
+    if browser_bridge._server is not None:
+        PORT = browser_bridge.port() or PORT
+        return PORT
+    for _ in range(3):
+        p = browser_bridge.start(version="test", port=_free_port())
+        if p:
+            PORT = p
+            return p
+    raise RuntimeError("桥服务起不来（端口不可用）")
 
 
 class FakeAPI(__import__("civitai_api").CivitaiAPI):
@@ -30,6 +65,18 @@ class FakeAPI(__import__("civitai_api").CivitaiAPI):
         return "https://civitai.com/api/download/models/%s" % version_id
 
 
+class LoraFakeAPI(FakeAPI):
+    """LoRA 类型：model_routing.classify 只看 model.type 就能定落点，不读文件头（零网络）"""
+    def get_model(self, mid):
+        return {"name": "Test Model", "type": "LORA", "modelVersions": [{"id": 456}]}
+
+    def get_model_version(self, vid):
+        return {"id": vid, "name": "v1", "baseModel": "PonyXL",
+                "files": [{"name": "test.safetensors", "type": "Model", "primary": True,
+                           "downloadUrl": "https://civitai.com/api/download/models/456",
+                           "hashes": {"SHA256": "abc123"}}]}
+
+
 def req(path, method="GET", body=None, origin=None):
     url = "http://127.0.0.1:%d%s" % (PORT, path)
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -48,7 +95,7 @@ class BridgeTest(unittest.TestCase):
     def setUpClass(cls):
         cls.received = []
         browser_bridge.set_download_handler(cls._fake_dl)
-        browser_bridge.start(version="test", port=PORT)
+        boot_bridge()
 
     @classmethod
     def _fake_dl(cls, url, dest_subdir=""):
@@ -306,8 +353,8 @@ class ArchiveBridgeTest(unittest.TestCase):
         app.mm_scan_state = {"running": False, "rows": [], "msg": ""}
         cls.app = app
         cls._register()
-        # 幂等启动：unittest 按字母序先跑本类时服务可能尚未启动，start 已幂等
-        browser_bridge.start(version="test", port=PORT)
+        # 幂等启动：unittest 按字母序先跑本类时服务可能尚未启动，boot_bridge 已幂等
+        boot_bridge()
 
     @classmethod
     def _register(cls):
@@ -320,6 +367,7 @@ class ArchiveBridgeTest(unittest.TestCase):
     def tearDownClass(cls):
         import shutil
         browser_bridge.set_archive_handlers(None, None, None, None)
+        browser_bridge.clear_bundles()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_archive_config(self):
@@ -367,12 +415,54 @@ class ArchiveBridgeTest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertTrue(d["ok"])
 
-    def test_archive_done_empty_dir_name(self):
-        for bad in ({}, {"dir_name": ""}):
-            st, d = req("/api/archive/done", "POST", bad,
-                        origin="chrome-extension://abc")
-            self.assertEqual(st, 400, str(bad))
-            self.assertFalse(d["ok"], str(bad))
+    def test_archive_done_allows_empty_dir_name(self):
+        """分流后 dir_name 不再代表路径，空参也必须接受并触发重扫。
+
+        回归修复：老实现对空 dir_name 返回 400，而扩展的 finishBatch 恒传 {dirName:''}，
+        于是批量归档结束后的模型库重扫从未真正触发（模型管理里看不见刚归档完的模型）。
+        """
+        import threading
+        done = threading.Event()
+        seen = []
+        orig = type(self.app).scan_models
+
+        def fake_scan(self_app):
+            seen.append(self_app)
+            done.set()
+
+        type(self.app).scan_models = fake_scan
+        try:
+            for body in ({}, {"dir_name": ""}, {"dir_name": "real/老客户端仍传真实目录名"}):
+                done.clear()
+                st, d = req("/api/archive/done", "POST", body, origin="chrome-extension://abc")
+                self.assertEqual(st, 200, str(body))
+                self.assertTrue(d["ok"], str(body))
+                self.assertTrue(done.wait(5), "空 dir_name 没触发重扫: %s" % body)
+                self.assertIs(seen[-1], self.app)
+        finally:
+            type(self.app).scan_models = orig
+
+    def test_archive_done_releases_bundle(self):
+        """带 bundle 的结束信号释放该令牌（不带就交给 TTL/容量回收）"""
+        import base64
+        d = os.path.join(self.tmp, "bundle_done")
+        os.makedirs(d, exist_ok=True)
+        token = browser_bridge.register_bundle(d)
+        b64 = base64.b64encode(b"x").decode("ascii")
+        st, _ = req("/api/archive/file", "POST",
+                    {"bundle": token, "filename": "keep.txt", "data_b64": b64},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200)
+        st, r = req("/api/archive/done", "POST", {"dir_name": "", "bundle": token},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, r)
+        self.assertTrue(r["ok"])
+        self.assertIsNone(browser_bridge.resolve_bundle(token), "done 之后令牌应已释放")
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": token, "filename": "late.txt", "data_b64": b64},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400, r)
+        self.assertFalse(os.path.exists(os.path.join(d, "late.txt")))
 
     def test_archive_done_async(self):
         """archive_done 必须 daemon 线程执行 scan_models、立即返回（防 hang）"""
@@ -397,6 +487,156 @@ class ArchiveBridgeTest(unittest.TestCase):
                  if t is not threading.current_thread() and t.daemon and t.is_alive()]
         self.assertTrue(any(getattr(t, "_target", None) is not None for t in alive)
                         or started.is_set())
+
+    # ---------------- bundle 形态（新协议：{bundle, filename, data_b64}） ----------------
+    def _mk_bundle_dir(self, name):
+        """造一个「桌面分流出来的落点」并登记令牌（真实链路里这一步由 _enqueue_one 完成）"""
+        d = os.path.join(self.tmp, name)
+        os.makedirs(d, exist_ok=True)
+        return d, browser_bridge.register_bundle(d)
+
+    def test_archive_file_bundle_ok(self):
+        import base64
+        d, token = self._mk_bundle_dir("bundle_ok")
+        blob = "封面二进制".encode("utf-8")
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": token, "filename": "封面.png", "data_b64": base64.b64encode(blob).decode("ascii")},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, r)
+        self.assertTrue(r["ok"])
+        self.assertEqual(os.path.normpath(os.path.dirname(r["path"])), os.path.normpath(d))
+        with open(os.path.join(d, "封面.png"), "rb") as f:
+            self.assertEqual(f.read(), blob)
+
+    def test_archive_file_bundle_writes_into_models_root_outside_archive(self):
+        """允许根扩展：分流落点在 models_dirs/comfyui_models_root 里、归档根之外，不能一律被拒"""
+        import base64
+        import shutil
+        import tempfile
+        extra = tempfile.mkdtemp(prefix="cft_bundle_root_")
+        old_dirs = self.app.cfg["models_dirs"]
+        old_root = self.app.cfg["archive_root"]
+        try:
+            # 归档根挪走，让 extra 只在 models_dirs 里 → 不扩根就会被拒
+            self.app.cfg["models_dirs"] = [extra]
+            self.app.cfg["archive_root"] = os.path.join(self.tmp, "another_archive")
+            os.makedirs(self.app.cfg["archive_root"], exist_ok=True)
+            st, r = req("/api/archive/file", "POST",
+                        {"bundle": browser_bridge.register_bundle(extra),
+                         "filename": "example.json",
+                         "data_b64": base64.b64encode(b"{}").decode("ascii")},
+                        origin="chrome-extension://abc")
+            self.assertEqual(st, 200, r)
+            self.assertTrue(os.path.isfile(os.path.join(extra, "example.json")))
+        finally:
+            self.app.cfg["models_dirs"] = old_dirs
+            self.app.cfg["archive_root"] = old_root
+            shutil.rmtree(extra, ignore_errors=True)
+
+    def test_archive_file_bundle_token_missing_expired_released(self):
+        import base64
+        b64 = base64.b64encode(b"x").decode("ascii")
+        d, token = self._mk_bundle_dir("bundle_lifecycle")
+        # 1) 令牌压根没登记过
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": "not-a-real-token", "filename": "a.txt", "data_b64": b64},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400, r)
+        self.assertFalse(r["ok"])
+        # 2) 已过期（把 TTL 压成负数模拟「30 分钟早过了」）
+        old_ttl = browser_bridge._BUNDLE_TTL
+        browser_bridge._BUNDLE_TTL = -1.0
+        try:
+            expired = browser_bridge.register_bundle(d)
+        finally:
+            browser_bridge._BUNDLE_TTL = old_ttl
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": expired, "filename": "b.txt", "data_b64": b64},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400, r)
+        self.assertIn("令牌", r["msg"])
+        self.assertIsNone(browser_bridge.resolve_bundle(expired), "过期令牌不该还能解析")
+        # 3) 已释放
+        browser_bridge.release_bundle(token)
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": token, "filename": "c.txt", "data_b64": b64},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400, r)
+        self.assertEqual(sorted(os.listdir(d)), [], "被拒的请求绝不能落盘: %s" % os.listdir(d))
+
+    def test_archive_file_bundle_rejects_dirty_filename(self):
+        """filename 必须是纯基名：桌面侧自己判，绝不只信扩展已经过滤过"""
+        import base64
+        b64 = base64.b64encode(b"x").decode("ascii")
+        d, token = self._mk_bundle_dir("bundle_names")
+        bad = ["../up.txt", "sub/inside.txt", "a\\b.txt", "C:\\evil.txt", "C:evil.txt",
+               "\\\\srv\\share\\x.txt", "/abs/x.txt", "..", ".", "bad\x00name.txt",
+               "ctrl\x07bell.txt", "  spaced  ", ""]
+        for name in bad:
+            st, r = req("/api/archive/file", "POST",
+                        {"bundle": token, "filename": name, "data_b64": b64},
+                        origin="chrome-extension://abc")
+            self.assertEqual(st, 400, repr(name))
+            self.assertFalse(r["ok"], repr(name))
+        self.assertEqual(sorted(os.listdir(d)), [], "非法 filename 一律不许落盘: %s" % os.listdir(d))
+        # 令牌仍然可用（非法名字不该把令牌吃掉）
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": token, "filename": "ok.txt", "data_b64": b64},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, r)
+
+    def test_archive_file_bundle_rejects_dir_outside_allowed_roots(self):
+        """令牌目录被换成允许根之外的路径（用户中途改设置/盘上被动过）→ 拒写"""
+        import base64
+        import shutil
+        import tempfile
+        b64 = base64.b64encode(b"x").decode("ascii")
+        outside = tempfile.mkdtemp(prefix="cft_bundle_outside_")
+        try:
+            st, r = req("/api/archive/file", "POST",
+                        {"bundle": browser_bridge.register_bundle(outside),
+                         "filename": "evil.txt", "data_b64": b64},
+                        origin="chrome-extension://abc")
+            self.assertEqual(st, 400, r)
+            self.assertEqual(os.listdir(outside), [])
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_archive_file_rel_path_form_never_touches_models_root(self):
+        """老形态逐字不变：rel_path 只认归档根，不得借 models_dirs 里的兄弟目录逃逸"""
+        import base64
+        import shutil
+        import tempfile
+        b64 = base64.b64encode(b"x").decode("ascii")
+        sibling = tempfile.mkdtemp(prefix="cft_sibling_")
+        old_dirs = self.app.cfg["models_dirs"]
+        try:
+            self.app.cfg["models_dirs"] = [sibling]
+            rel = os.path.join(os.path.basename(sibling), "escaped.txt")
+            st, r = req("/api/archive/file", "POST",
+                        {"rel_path": "../" + rel, "data_b64": b64},
+                        origin="chrome-extension://abc")
+            self.assertEqual(st, 400, r)
+            self.assertFalse(os.path.exists(os.path.join(sibling, "escaped.txt")),
+                             "老形态被扩根了：rel_path 不该能写进 models_dirs")
+        finally:
+            self.app.cfg["models_dirs"] = old_dirs
+            shutil.rmtree(sibling, ignore_errors=True)
+
+    def test_archive_file_bundle_requires_filename(self):
+        """两种形态各自缺字段 → 400 + 明确 msg（bundle 形态缺 filename 不会退化成写归档根）"""
+        import base64
+        b64 = base64.b64encode(b"x").decode("ascii")
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": "whatever", "data_b64": b64}, origin="chrome-extension://abc")
+        self.assertEqual(st, 400, r)
+        self.assertIn("filename", r["msg"])
+        st, r = req("/api/archive/file", "POST",
+                    {"data_b64": b64}, origin="chrome-extension://abc")
+        self.assertEqual(st, 400, r)
+        st, r = req("/api/archive/file", "POST", {"bundle": "whatever"},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400, r)
 
     def test_archive_file_bad_base64(self):
         st, d = req("/api/archive/file", "POST",
@@ -694,8 +934,329 @@ class CoverCacheTest(unittest.TestCase):
             shutil.rmtree(cache, ignore_errors=True)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class BundleRegistryTest(unittest.TestCase):
+    """bundle 令牌注册表：滑动 TTL / 写入续期 / 释放 / 容量上限（纯内存，不碰磁盘与网络）"""
+
+    def setUp(self):
+        browser_bridge.clear_bundles()
+        self.addCleanup(browser_bridge.clear_bundles)
+
+    def test_register_and_resolve(self):
+        token = browser_bridge.register_bundle(r"D:\ComfyUI\models\loras\Demo_v1")
+        self.assertTrue(token)
+        self.assertEqual(len(token), 22, "secrets.token_urlsafe(16) 恒 22 字符")
+        self.assertEqual(browser_bridge.resolve_bundle(token), r"D:\ComfyUI\models\loras\Demo_v1")
+
+    def test_register_rejects_empty_and_tokens_are_unique(self):
+        self.assertEqual(browser_bridge.register_bundle(""), "")
+        self.assertEqual(browser_bridge.register_bundle(None), "")
+        self.assertEqual(browser_bridge.register_bundle("   "), "")
+        self.assertEqual(browser_bridge.bundle_count(), 0)
+        a = browser_bridge.register_bundle(r"D:\a")
+        b = browser_bridge.register_bundle(r"D:\a")
+        self.assertNotEqual(a, b, "同一目录反复归档要各拿一个令牌，不能互相覆盖")
+
+    def test_ttl_is_sliding_and_renews_on_every_write(self):
+        """每次解析（= 每次写盘）都把到期时刻往后推——批量归档从 prepare 到写评论能隔几分钟"""
+        old = browser_bridge._BUNDLE_TTL
+        browser_bridge._BUNDLE_TTL = 5.0
+        try:
+            token = browser_bridge.register_bundle(r"D:\slide")
+            deadline0 = browser_bridge._bundles[token][1]
+            time.sleep(0.05)
+            self.assertEqual(browser_bridge.resolve_bundle(token), r"D:\slide")
+            self.assertGreater(browser_bridge._bundles[token][1], deadline0, "解析（写入）没续期")
+        finally:
+            browser_bridge._BUNDLE_TTL = old
+        self.assertEqual(browser_bridge._BUNDLE_TTL, 1800.0, "TTL 默认必须是 30 分钟")
+        self.assertEqual(browser_bridge.resolve_bundle(token), r"D:\slide", "恢复 TTL 后仍有效")
+
+    def test_expired_token_resolves_to_none_and_is_dropped(self):
+        old = browser_bridge._BUNDLE_TTL
+        browser_bridge._BUNDLE_TTL = -1.0
+        try:
+            token = browser_bridge.register_bundle(r"D:\stale")
+        finally:
+            browser_bridge._BUNDLE_TTL = old
+        self.assertIsNone(browser_bridge.resolve_bundle(token))
+        self.assertIsNone(browser_bridge.resolve_bundle(token), "已过期令牌不得复活")
+        self.assertEqual(browser_bridge.bundle_count(), 0, "过期项应在解析时就从表里带走")
+
+    def test_release(self):
+        token = browser_bridge.register_bundle(r"D:\rel")
+        self.assertTrue(browser_bridge.release_bundle(token))
+        self.assertFalse(browser_bridge.release_bundle(token), "重复释放是正常路径，但返回 False")
+        self.assertFalse(browser_bridge.release_bundle(""))
+        self.assertFalse(browser_bridge.release_bundle("unknown"))
+        self.assertIsNone(browser_bridge.resolve_bundle(token))
+        self.assertIsNone(browser_bridge.resolve_bundle(""))
+        self.assertIsNone(browser_bridge.resolve_bundle(None))
+
+    def test_capacity_evicts_least_recently_written(self):
+        """表满按「最久没写入」淘汰：正在写附属文件的批次不能被同批后来的登记挤掉"""
+        old_max = browser_bridge._BUNDLE_MAX
+        browser_bridge._BUNDLE_MAX = 4
+        try:
+            a = browser_bridge.register_bundle(r"D:\a")
+            b = browser_bridge.register_bundle(r"D:\b")
+            c = browser_bridge.register_bundle(r"D:\c")
+            d = browser_bridge.register_bundle(r"D:\d")
+            self.assertEqual(browser_bridge.resolve_bundle(a), r"D:\a")   # a 变成「最近写过」
+            e = browser_bridge.register_bundle(r"D:\e")                   # 于是挤掉 b
+            self.assertEqual(browser_bridge.bundle_count(), 4)
+            self.assertIsNone(browser_bridge.resolve_bundle(b))
+            for t, p in ((a, r"D:\a"), (c, r"D:\c"), (d, r"D:\d"), (e, r"D:\e")):
+                self.assertEqual(browser_bridge.resolve_bundle(t), p)
+        finally:
+            browser_bridge._BUNDLE_MAX = old_max
+
+    def test_caps_helpers(self):
+        self.assertTrue(browser_bridge.caps_allow_bundle(["bundle"]))
+        self.assertTrue(browser_bridge.caps_allow_bundle(["bundle", "future"]))
+        self.assertTrue(browser_bridge.caps_has(("bundle",), "bundle"))
+        # 老扩展不发这个字段；脏值一律当「没声明」——判错方向的代价是归档分家，宁可少放行
+        for no in (None, [], {}, "", "bundle", 12, [None], ["other"], [" Bundle "], [{"bundle": 1}], ()):
+            self.assertFalse(browser_bridge.caps_allow_bundle(no), repr(no))
+
+    def test_download_handler_caps_detection_keeps_two_arg_handlers(self):
+        """老 handler 只声明 (url, dest_subdir)：桥绝不硬塞第三参（v2.6.30 整条链 500 的回归网）"""
+        seen = {}
+        unset = object()
+
+        def two_arg(url, dest_subdir=""):
+            seen["args"] = (url, dest_subdir)
+            return {"ok": True}
+
+        def three_arg(url, dest_subdir="", caps=unset):
+            # 用哨兵区分「没传 caps」与「传了 None」：桥只在 caps 非空时才带这个关键字
+            seen["args"] = (url, dest_subdir) if caps is unset else (url, dest_subdir, caps)
+            return {"ok": True}
+
+        browser_bridge._call_download_handler(two_arg, "u", "d", ["bundle"])
+        self.assertEqual(seen["args"], ("u", "d"))
+        browser_bridge._call_download_handler(three_arg, "u", "d", ["bundle"])
+        self.assertEqual(seen["args"], ("u", "d", ["bundle"]))
+        browser_bridge._call_download_handler(three_arg, "u", "d", None)   # 没 caps 就不带关键字
+        self.assertEqual(seen["args"], ("u", "d"))
+        # **kwargs 兜底的 handler 也算收得住 caps
+        def var_kw(url, dest_subdir="", **kw):
+            seen["args"] = (url, dest_subdir, kw.get("caps"))
+            return {"ok": True}
+        browser_bridge._call_download_handler(var_kw, "u", "d", ["bundle"])
+        self.assertEqual(seen["args"], ("u", "d", ["bundle"]))
+
+
+class BundleCapsTest(unittest.TestCase):
+    """能力协商全链路：/api/download 的 caps 决定要不要分流，分流就回令牌，令牌把附属文件写进同一目录。
+
+    零真实网络：假 api 只回本地字典（LoRA 走「按类型映射」，压根不读 safetensors 头），
+    dl 用 Mock 收任务，全部落点在临时目录。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import config
+        import webui
+        from unittest.mock import Mock
+        cls.tmp = tempfile.mkdtemp(prefix="cft_caps_")
+        cls.archive = os.path.join(cls.tmp, "archive")       # 归档根（附属文件的旧通道）
+        cls.comfy = os.path.join(cls.tmp, "models")          # comfyui_models_root（分流落点）
+        os.makedirs(cls.archive, exist_ok=True)
+        os.makedirs(os.path.join(cls.comfy, "loras"), exist_ok=True)
+        app = webui.Api.__new__(webui.Api)
+        app.cfg = dict(config.DEFAULTS,
+                       api_key="synthetic-test-key", site_domain="civitai.red",
+                       download_dir=cls.archive, archive_root=cls.archive,
+                       models_dir=cls.archive, models_dirs=[cls.archive],
+                       download_target_dir="", download_cover=False, gen_metadata=False,
+                       multi_file_download="first",
+                       route_by_type=True, comfyui_models_root=cls.comfy)
+        app.log_error = Mock()                # 绝不把测试噪声写进仓库 error.log
+        app.api = LoraFakeAPI()
+        app.dl = Mock()
+        app.dl.tasks = []
+        app.model_rows = []
+        app.mm_scan_state = {"running": False, "rows": [], "msg": ""}
+        app.scan_models = Mock()
+        cls.app = app
+        cls._prev = (browser_bridge._handler, browser_bridge._archive_config_fn,
+                     browser_bridge._archive_write_fn, browser_bridge._archive_done_fn,
+                     browser_bridge._archive_check_fn)
+        browser_bridge.set_download_handler(app.dl_submit_url_from_bridge)
+        browser_bridge.set_archive_handlers(config_fn=app.archive_config, write_fn=app.archive_write,
+                                            done_fn=app.archive_done, check_fn=app.library_check)
+        browser_bridge.clear_bundles()
+        boot_bridge()
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        h, cf, w, dn, ck = cls._prev
+        browser_bridge._handler = h
+        browser_bridge.set_archive_handlers(config_fn=cf, write_fn=w, done_fn=dn, check_fn=ck)
+        browser_bridge.clear_bundles()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        self.app.dl.reset_mock()
+        self.app.dl.tasks = []
+        browser_bridge.clear_bundles()
+
+    def _wait_task(self):
+        """等后台入队线程把任务交给 Mock dl（caps 缺失那条分支是异步应答 + 后台解析）"""
+        for _ in range(150):
+            if self.app.dl.add_task.call_args:
+                return self.app.dl.add_task.call_args.args[0]
+            time.sleep(0.02)
+        self.fail("后台线程没入队")
+
+    def _body(self, with_caps, dest_subdir="Demo Model_v1"):
+        body = {"url": "https://civitai.red/models/123/abc", "dest_subdir": dest_subdir}
+        if with_caps:
+            body["caps"] = ["bundle"]
+        return body
+
+    def test_caps_absent_keeps_old_flow_and_returns_no_bundle(self):
+        """老扩展归档流（只发 {url, dest_subdir}）：不分流、响应里没有 bundle，本体仍落 <归档根>/<目录名>
+
+        这条历史上就被 dest_subdir 的「指定落点优先」挡住了分流，等于双保险；
+        响应里没有 bundle 才是关键——扩展看见没有令牌就退回 rel_path 形态，两边同目录。
+        """
+        st, d = req("/api/download", "POST", self._body(False), origin="chrome-extension://abc")
+        self.assertEqual(st, 200, d)
+        self.assertTrue(d["ok"])
+        self.assertNotIn("bundle", d, d)
+        self.assertFalse(d.get("routed"), d)
+        task = self._wait_task()
+        self.assertEqual(os.path.normpath(task.dest_dir),
+                         os.path.normpath(os.path.join(self.archive, "Demo Model_v1")))
+        self.assertFalse((task.info or {}).get("routed_dir"), "老扩展被分流了 → 归档必然分家")
+        self.assertTrue(task.info.get("dest_explicit"), "回落归档子目录后要标记，才不被全局目标搬走")
+        self.assertEqual(browser_bridge.bundle_count(), 0)
+
+    def test_caps_absent_without_dest_subdir_is_blocked_by_the_gate(self):
+        """列表批量提交（老扩展，无 dest_subdir）：只剩门限这一道能挡住分流"""
+        body = {"url": "https://civitai.red/models/123/abc"}
+        st, d = req("/api/download", "POST", body, origin="chrome-extension://abc")
+        self.assertEqual(st, 200, d)
+        self.assertNotIn("bundle", d, d)
+        task = self._wait_task()
+        self.assertFalse((task.info or {}).get("routed_dir"),
+                         "LORA 类型 + route_by_type=True，没有门限就一定分流")
+        self.assertIn("bundle 能力", (task.info or {}).get("route_reason", ""),
+                      "不分流的原因要写进 route_reason，用户在下载列表看得见")
+
+    def test_caps_present_without_dest_subdir_routes_but_acks_fast(self):
+        """列表批量提交 + 新扩展（caps、无 dest_subdir）：分流照常，但这条链路没有令牌可消费
+
+        为什么不改成同步：这条路径的扩展只发链接，附属文件由桌面自己在下载完成后生成，
+        本体与附属文件必然同目录；同步解析会让每条链接都排队等一次解析（多文件版本还要等
+        文件选择弹窗），批量提交会被拖成 12s 超时。
+        """
+        st, d = req("/api/download", "POST",
+                    {"url": "https://civitai.red/models/123/abc", "caps": ["bundle"]},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, d)
+        self.assertTrue(d["started"], d)
+        self.assertNotIn("bundle", d, d)
+        task = self._wait_task()
+        self.assertEqual(os.path.normpath(task.info.get("routed_dir") or ""),
+                         os.path.normpath(os.path.join(self.comfy, "loras", "Test Model_v1")))
+        self.assertEqual(browser_bridge.bundle_count(), 1,
+                         "分流出落点就登记令牌（扩展用不上，交给 TTL/容量回收）")
+
+    def test_caps_present_routes_and_returns_bundle_token(self):
+        """声明 caps:["bundle"] → 分流到 <comfy>\\loras\\<模型名_版本>，令牌随响应回给扩展"""
+        st, d = req("/api/download", "POST", self._body(True), origin="chrome-extension://abc")
+        self.assertEqual(st, 200, d)
+        self.assertTrue(d["ok"], d)
+        self.assertTrue(d.get("routed"), d)
+        token = d.get("bundle") or ""
+        self.assertTrue(token, "分流成功必须回 bundle 令牌：%s" % d)
+        expect = os.path.normpath(os.path.join(self.comfy, "loras", "Test Model_v1"))
+        self.assertEqual(os.path.normpath(d["dest_dir"]), expect)
+        self.assertEqual(browser_bridge.resolve_bundle(token), expect)
+        task = self._wait_task()
+        self.assertEqual(os.path.normpath(task.info["routed_dir"]), expect)
+        # 附属文件用令牌写：必须进本体所在的那个目录，而不是 <归档根>/<目录名>
+        import base64
+        blob = "评论正文".encode("utf-8")
+        st, w = req("/api/archive/file", "POST",
+                    {"bundle": token, "filename": "评论.txt",
+                     "data_b64": base64.b64encode(blob).decode("ascii")},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, w)
+        self.assertTrue(os.path.isfile(os.path.join(expect, "评论.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.archive, "Demo Model_v1", "评论.txt")),
+                         "分流后附属文件不该再回归档根（用户投诉的「没归档」就是这么来的）")
+        # 令牌目录在 comfyui_models_root 里、归档根之外——允许根扩展就是为这一步
+        self.assertIn(os.path.normpath(self.comfy),
+                      [os.path.normpath(r) for r in self.app._archive_allowed_roots()])
+
+    def test_caps_present_but_unroutable_falls_back_to_dest_subdir(self):
+        """分流判不成（类型判不出落点）时 dest_subdir 仍是落点，且不发令牌"""
+        old_api = self.app.api
+        self.app.api = FakeAPI()          # 没有 model.type / baseModel → classify 判不出，绝不嗅探
+        try:
+            st, d = req("/api/download", "POST", self._body(True, dest_subdir="另一个归档目录"),
+                        origin="chrome-extension://abc")
+        finally:
+            self.app.api = old_api
+        self.assertEqual(st, 200, d)
+        task = self._wait_task()
+        self.assertEqual(os.path.normpath(task.dest_dir),
+                         os.path.normpath(os.path.join(self.archive, "另一个归档目录")))
+        self.assertTrue(task.info.get("dest_explicit"), "回落归档子目录后要标记，才不被全局目标搬走")
+        self.assertFalse(d.get("routed"), d)
+        self.assertNotIn("bundle", d, d)
+        self.assertEqual(browser_bridge.bundle_count(), 0)
+
+    def test_caps_garbage_is_treated_as_no_caps(self):
+        st, d = req("/api/download", "POST",
+                    {"url": "https://civitai.red/models/123/abc", "dest_subdir": "x",
+                     "caps": "bundle"}, origin="chrome-extension://abc")
+        self.assertEqual(st, 200, d)
+        self.assertNotIn("bundle", d, "裸字符串是脏值：按「没声明」处理，宁可少分流")
+
+    def test_desktop_own_ui_entries_still_route_without_caps(self):
+        """桌面自身的下载入口（dl_submit_url / dl_enqueue_url_sync）不受门限约束，照常分流"""
+        r = self.app.dl_submit_url("https://civitai.red/models/123/abc")
+        self.assertTrue(r["ok"], r)
+        task = self._wait_task()
+        self.assertEqual(os.path.normpath(task.info.get("routed_dir") or ""),
+                         os.path.normpath(os.path.join(self.comfy, "loras", "Test Model_v1")))
+        self.app.dl.reset_mock()
+        item = self.app.dl_enqueue_url_sync("https://civitai.red/models/123/abc")
+        self.assertTrue(item["ok"], item)
+        self.assertTrue(item.get("bundle"), item)
+
+    def test_archive_done_releases_token_and_rescans_with_empty_dir_name(self):
+        """批量结束（dirName 恒空）：不再 400，令牌释放，重扫真的被触发"""
+        import base64
+        st, d = req("/api/download", "POST", self._body(True), origin="chrome-extension://abc")
+        self.assertEqual(st, 200, d)
+        token = d["bundle"]
+        st, r = req("/api/archive/file", "POST",
+                    {"bundle": token, "filename": "example.json",
+                     "data_b64": base64.b64encode(b"{}").decode("ascii")},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, r)
+        self.app.scan_models.reset_mock()
+        for _ in range(150):
+            if self.app.scan_models.call_count:
+                break
+            time.sleep(0.02)     # 前面入队/写盘都可能已触发重扫：先把它耗掉再断言这一次
+        self.app.scan_models.reset_mock()
+        st, r = req("/api/archive/done", "POST", {"dir_name": "", "bundle": token},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, r)
+        self.assertTrue(r["ok"], r)
+        for _ in range(150):
+            if self.app.scan_models.call_count:
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.app.scan_models.call_count, 1, "空 dir_name 的结束信号必须触发模型库重扫")
+        self.assertIsNone(browser_bridge.resolve_bundle(token), "done 后令牌应释放")
 
 
 if __name__ == "__main__":

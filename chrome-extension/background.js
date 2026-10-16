@@ -60,7 +60,7 @@ async function save() { await ext.storage.local.set({ [STORE]: job }); }
 async function post(url) {
   const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), 12000);
   try {
-    const res = await fetch(BRIDGE + '/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }), signal: ctrl.signal });
+    const res = await fetch(BRIDGE + '/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, caps: ['bundle'] }), signal: ctrl.signal });
     const data = await res.json();
     if (!res.ok || !data.ok) return { status: 'failed', msg: data.msg || 'CFT 未接受请求' };
     return { status: 'sent', msg: submitResultMsg(data) };
@@ -358,8 +358,11 @@ async function handleSendModelToSoftware(payload) {
   const url = String((payload && (payload.downloadUrl || payload.url)) || '');
   if (!url || !CIVITAI_RE.test(url)) return { ok: false, msg: '仅支持 Civitai 模型页链接', ...softwareRouteInfo(null) };
   try {
+    // caps:["bundle"] 是能力协商：告诉桌面端「本扩展收得住落点令牌」。
+    // 桌面端只有看到这个才允许按类型分流 —— 分流后本体进 ComfyUI 目录，附属文件必须靠令牌才
+    // 能跟着走；不带 caps 的老桌面/老扩展组合下，桌面端会保持 <归档根>/<目录名> 的旧落点。
     const r = await bridgeFetch('/api/download', {
-      method: 'POST', body: { url, dest_subdir: String((payload && payload.destSubdir) || '') }, timeoutMs: 10000,
+      method: 'POST', body: { url, dest_subdir: String((payload && payload.destSubdir) || ''), caps: ['bundle'] }, timeoutMs: 10000,
     });
     const route = softwareRouteInfo(r.data);
     if (r.httpOk && r.data && r.data.ok) {

@@ -757,7 +757,8 @@ class Api:
         self.api = self._new_api()
         self.dl = downloader.Downloader(self.cfg, on_update=self._on_dl_update)
         # 浏览器桥：Chrome 扩展一键下载当前页面（127.0.0.1 本地 HTTP，静默失败）
-        browser_bridge.set_download_handler(self.dl_submit_url)
+        # from_bridge 版要多收一个 caps（能力协商：对面能不能吃 bundle 令牌决定要不要分流）
+        browser_bridge.set_download_handler(self.dl_submit_url_from_bridge)
         browser_bridge.set_api(self)     # 浏览器模式：/api/rpc 的方法调用目标
         browser_bridge.set_archive_handlers(config_fn=self.archive_config,
                                             write_fn=self.archive_write,
@@ -3033,12 +3034,14 @@ class Api:
         return fetch
 
     @requires_civitai_key("dict")
-    def _enqueue_one(self, url, dest_dir=None, skip_if_exists=False, _version=None, _file=None, _model_id=None, dest_subdir=""):
+    def _enqueue_one(self, url, dest_dir=None, skip_if_exists=False, _version=None, _file=None, _model_id=None, dest_subdir="", allow_route=True):
         """同步解析单条 URL 并入队（忽略付费状态）。返回 item dict：{url, ok, msg, task_id?}
 
         dest_subdir 非空时落盘到归档根下该子目录（逃逸校验复用 _safe_archive_path），为空保持下载目录。
         dest_dir 非空时表示「指定落点」（更新下载：新版直接下到旧版所在文件夹，且不被全局目标搬走）。
         skip_if_exists=True 时做防重复：目标文件已存在、或该版本已在队列里 → 直接跳过不重复下载。
+        allow_route=False 时**禁止按类型分流**：只给「收不住 bundle 令牌」的老扩展用（桥入口按
+        caps 决定）。桌面自身的下载入口一律保持默认 True。
         """
         api = self.api
         u = (url or "").strip()
@@ -3069,11 +3072,21 @@ class Api:
                     files = self._choose_model_files(version)
                 if not files:
                     return {**item, "cancelled": True, "msg": "已取消文件下载"}
-                results = [self._enqueue_one(u, dest_dir, skip_if_exists, version, file, model_id, dest_subdir=dest_subdir) for file in files]
+                results = [self._enqueue_one(u, dest_dir, skip_if_exists, version, file, model_id, dest_subdir=dest_subdir, allow_route=allow_route) for file in files]
                 if len(results) == 1: return results[0]
-                return {**item, "ok": any(r.get("ok") for r in results), "items": results,
+                out = {**item, "ok": any(r.get("ok") for r in results), "items": results,
                         "task_ids": [r["task_id"] for r in results if r.get("task_id")],
                         "msg": "；".join(r.get("msg", "") for r in results)}
+                # 归档桥的响应只有一条通道：多文件版本（multi_file_download=all）各文件可能被判进
+                # 不同类型目录，但一次响应只能带一个令牌 → 取「真的分流出落点」的那个子任务，
+                # 附属文件跟着它走。其余文件的目录各自落各自的（一处对不齐就在扩展侧留痕，见汇报）。
+                lead = next((r for r in results if r.get("bundle")), None) \
+                    or next((r for r in results if r.get("dest_dir")), None) \
+                    or next((r for r in results if r.get("ok")), None) or {}
+                for key in ("bundle", "dest_dir", "routed", "route_reason", "route_source"):
+                    if lead.get(key) not in (None, "", False):
+                        out[key] = lead[key]
+                return out
             f = _file if _file is not None else api.pick_file(version)[0]
             hashes = f.get("hashes") or {}
             model_obj = None
@@ -3111,26 +3124,61 @@ class Api:
                 pass
             info["meta"] = meta
             dest_dir = (dest_dir or "").strip()   # 空 = 下载开始时才解析落地目录（入队后再换文件夹也生效）
+            subdir = (dest_subdir or "").strip()
             if dest_dir:
                 info["dest_explicit"] = True      # 指定落点的（更新下载）不被全局目标/自动归位搬走
                 try:
                     os.makedirs(dest_dir, exist_ok=True)
                 except Exception:
                     pass
-            elif (dest_subdir or "").strip():
-                # 归档桥指定子目录：落盘到归档根下该子目录（逃逸校验复用 _safe_archive_path）
-                dest_dir = self._safe_archive_path(self._archive_root(), dest_subdir)
+            elif subdir and not allow_route:
+                # 归档桥指定子目录（老扩展/未声明 bundle 能力）：落盘到归档根下该子目录
+                # （逃逸校验复用 _safe_archive_path）—— 这条就是历史行为，逐字不变
+                dest_dir = self._safe_archive_path(self._archive_root(), subdir)
                 info["dest_explicit"] = True      # 同样标记，不被全局目标/自动归位搬走
-            # —— 按类型分流：显式落点（更新下载 / 归档子目录）优先级最高，此时不判定也不嗅探 ——
+            # —— 落点优先级：显式指定（更新下载）> 按类型分流 > 归档子目录 dest_subdir > 全局目标 ——
+            # 归档子目录排到分流之后，是给「声明了 bundle 能力」的新扩展让路：它带 dest_subdir 只是
+            # 归档目录名，真正的落点由分流决定、靠令牌回传；判不出分流时才用 dest_subdir（老行为）。
+            bundle_token = ""
             if info.get("dest_explicit"):
                 info["route_reason"] = "指定落点优先（更新下载/归档子目录），未分流"
+                info["route_source"] = "none"
+            elif not allow_route:
+                # 能力协商门限：对面的扩展写不了 bundle 形态，分流就等于把本体和归档拆成两处
+                info["route_reason"] = ("未分流：扩展未声明 bundle 能力"
+                                        "（老扩展的附属文件只会写回归档根，分流会让两者分家；"
+                                        "更新浏览器扩展后即可按类型分流）")
                 info["route_source"] = "none"
             else:
                 routed, route_reason, route_source = self._route_dest_dir(model_obj, version, f, base_name)
                 info["route_reason"] = route_reason
                 info["route_source"] = route_source
                 if routed:
-                    info["routed_dir"] = routed    # 绝对落点；downloader._resolve_dest 认它，压过全局目标
+                    # 令牌 = 「这个目录是桌面自己算出来的落点」的凭据，随本次响应回给扩展，
+                    # 后续封面/配图/提示词/example.json/评论都用它写进同一个目录。
+                    # 只放进 item、不进 task.info：info 会持久化到 download_tasks.json，
+                    # 一个 30 分钟就作废的一次性凭据没理由跟着任务历史一起落盘。
+                    # 分流与令牌必须成对出现：发不出令牌就当场收回分流决定，本体留在原落盘逻辑里，
+                    # 也绝不出现「本体进 ComfyUI、附属文件回归档根」的分家现场。
+                    token = ""
+                    try:
+                        token = browser_bridge.register_bundle(routed)
+                    except Exception as e:
+                        try:
+                            self.log_error("route", "落点令牌登记异常（本次不分流）: %s" % e)
+                        except Exception:
+                            pass
+                    if token:
+                        info["routed_dir"] = routed    # 绝对落点；downloader._resolve_dest 认它，压过全局目标
+                        bundle_token = token
+                    else:
+                        info["route_reason"] = ("未分流：落点令牌登记失败"
+                                                "（保持现有落盘，避免模型本体与附属文件分家）")
+                        info["route_source"] = "none"
+            # 分流没成立（或压根没判）时，归档桥的 dest_subdir 才当落点用（与改动前一致）
+            if subdir and not dest_dir and not info.get("routed_dir"):
+                dest_dir = self._safe_archive_path(self._archive_root(), subdir)
+                info["dest_explicit"] = True
             dl_url = api.file_download_url(version, f)
             if not dl_url:
                 item["msg"] = "无下载链接"
@@ -3157,6 +3205,12 @@ class Api:
             item["dest_dir"] = info.get("routed_dir") or dest_dir
             item["route_reason"] = info.get("route_reason", "")
             item["route_source"] = info.get("route_source", "")
+            # 归档桥要按这两个字段决定附属文件的写入形态：
+            #   routed=True + bundle → {bundle, filename} 令牌形态，附属文件跟着本体进分流目录
+            #   没有 bundle           → 老的 {rel_path, data_b64} 形态，dest_subdir 落点就是本体落点
+            item["routed"] = bool(info.get("routed_dir"))
+            if bundle_token:
+                item["bundle"] = bundle_token
         except civitai_api.CivitaiError as e:
             item["msg"] = _friendly_api_error(str(e))[:300]
         except Exception as e:
@@ -3164,13 +3218,17 @@ class Api:
         return item
 
     @requires_civitai_key("dict")
-    def dl_enqueue_url(self, url, dest_subdir=""):
-        """强制解析单条 URL 并入队（忽略付费状态，用于「仍要下载」，后台执行）"""
+    def dl_enqueue_url(self, url, dest_subdir="", allow_route=True):
+        """强制解析单条 URL 并入队（忽略付费状态，用于「仍要下载」，后台执行）
+
+        allow_route=False 只给「声明收不住 bundle 令牌」的桥请求用（见 dl_submit_url_from_bridge）；
+        桌面自身入口保持默认 True，照常分流。
+        """
         state = {"running": True, "total": 1, "done": 0, "items": [], "finished": False}
         self._parse_state = state
 
         def work():
-            item = self._enqueue_one(url, dest_subdir=dest_subdir)
+            item = self._enqueue_one(url, dest_subdir=dest_subdir, allow_route=allow_route)
             state["items"].append(item)
             state["done"] += 1
             state["finished"] = True
@@ -3180,9 +3238,9 @@ class Api:
         return {"started": True}
 
     @requires_civitai_key("dict")
-    def dl_enqueue_url_sync(self, url, dest_subdir=""):
+    def dl_enqueue_url_sync(self, url, dest_subdir="", allow_route=True):
         """Legacy synchronous caller (archive bridge passes dest_subdir); extension endpoint uses dl_submit_url to avoid timeout."""
-        item = self._enqueue_one(url, dest_subdir=dest_subdir)
+        item = self._enqueue_one(url, dest_subdir=dest_subdir, allow_route=allow_route)
         if item.get("ok"): self._notify_ext_download_started()
         return item
 
@@ -3192,6 +3250,8 @@ class Api:
 
         dest_subdir 必须留着：browser_bridge 的 /api/download 一律按 (url, dest_subdir) 两参调用
         本方法（归档桥的 sendModelToSoftware 靠它把模型文件落进 <归档根>/<目录名>/）。
+        桥现在注册的是 dl_submit_url_from_bridge（要收 caps 做能力协商）；本方法保持
+        「两参 + 立即应答 + 后台入队」的原样，UI 与老测试都按这个约定调用它。
         """
         try: self.api.resolve_url(url)
         except Exception: return {"ok": False, "msg": "不是有效的 Civitai 模型链接"}
@@ -3199,6 +3259,50 @@ class Api:
         if result.get("started"): self._notify_ext_download_started()
         return {"ok": bool(result.get("started")), "started": bool(result.get("started")),
                 "msg": "已提交解析，请在 CivitaiFreeTool 下载管理选择文件或查看结果"}
+
+    @requires_civitai_key("dict")
+    def dl_submit_url_from_bridge(self, url, dest_subdir="", caps=None):
+        """browser_bridge /api/download 的入口：能力协商 + 落点令牌回传只发生在这一层。
+
+        门限为什么落在这里（桥入口）而不是 _route_dest_dir 里面：只有桥的这一次请求知道对面
+        那个客户端到底收不收得住 bundle 令牌，而「分流」与「发令牌」必须成对出现——
+        分流了却发不出令牌 = 本体进 ComfyUI 类型目录、附属文件被老扩展按 destSubdir 写回
+        <归档根>/<目录名>，用户看到的正是「模型下完了但归档没了」的分裂现场。
+
+        三条分支：
+        · 没声明 caps → 「立即应答 + 后台入队」（老行为逐字不变），并且这次请求不分流。
+        · 声明 caps 且带 dest_subdir → 归档流（扩展会把封面/评论写回来）：改成**同步解析**，
+          令牌才能随本次响应出去（后台入队就拿不到了）。同步耗时由 _SNIFF_BUDGET_S 整段预算
+          夹住，且这条链路的 URL 带 fileId、不会卡在多文件选择弹窗上（扩展 sendModelToSoftware
+          的超时是 10s）。
+        · 声明 caps 但不带 dest_subdir → 列表批量提交（扩展只发链接，附属文件由桌面自己生成）：
+          这里没有令牌可消费，所以保持「立即应答」，别让每条链接都排队等同一次解析/文件选择；
+          分流照常允许，本体与桌面生成的附属文件仍然同目录。
+        """
+        if not browser_bridge.caps_allow_bundle(caps):
+            result = self.dl_enqueue_url(url, dest_subdir, allow_route=False)
+            if result.get("started"): self._notify_ext_download_started()
+            return {"ok": bool(result.get("started")), "started": bool(result.get("started")),
+                    "msg": "已提交解析，请在 CivitaiFreeTool 下载管理选择文件或查看结果"}
+        if not (dest_subdir or "").strip():
+            result = self.dl_enqueue_url(url, dest_subdir, allow_route=True)
+            if result.get("started"): self._notify_ext_download_started()
+            return {"ok": bool(result.get("started")), "started": bool(result.get("started")),
+                    "msg": "已提交解析，请在 CivitaiFreeTool 下载管理选择文件或查看结果"}
+        try: self.api.resolve_url(url)
+        except Exception: return {"ok": False, "msg": "不是有效的 Civitai 模型链接"}
+        item = self.dl_enqueue_url_sync(url, dest_subdir, allow_route=True)
+        out = {"ok": bool(item.get("ok")), "started": bool(item.get("ok")),
+               "msg": item.get("msg", ""),
+               "dest_dir": item.get("dest_dir", ""), "routed": bool(item.get("routed")),
+               "route_reason": item.get("route_reason", ""),
+               "route_source": item.get("route_source", "")}
+        if item.get("bundle"):
+            out["bundle"] = item["bundle"]
+        if item.get("cancelled") or item.get("skipped"):
+            out["cancelled"] = bool(item.get("cancelled"))
+            out["skipped"] = bool(item.get("skipped"))
+        return out
 
     @staticmethod
     def _notify_ext_download_started():
@@ -3228,25 +3332,77 @@ class Api:
 
     @staticmethod
     def _safe_archive_path(root, rel_path):
-        """rel_path 安全校验：拒绝 .. 逃逸/绝对路径/盘符，返回落盘完整路径"""
+        """rel_path 安全校验：拒绝 .. 逃逸/绝对路径/盘符，返回落盘完整路径
+
+        单根便捷入口（老调用方与测试都按这个签名用）；多根版本见 _safe_path_in_roots。
+        """
+        return Api._safe_path_in_roots([root], rel_path)
+
+    @staticmethod
+    def _safe_path_in_roots(roots, rel_path):
+        """rel_path 在「任一允许根」内的安全落点：全部不命中就抛 ValueError（同 _safe_archive_path 口径）
+
+        形状校验（空/盘符/绝对/UNC）在循环外做一次，保证每个根用同一套标准；
+        逐根做 containment：落点必须严格在该根内（等于根自身也拒——归档不能直接往根里写文件）。
+        为什么要多根版本：分流后的落点在 ComfyUI 目录下、归档根之外，只认归档根会一律被拒。
+        """
         rel = (rel_path or "").strip()
         if not rel:
             raise ValueError("rel_path 不能为空")
         # 盘符（C:）/绝对路径/UNC 拦截（Windows 逃逸面），无新依赖
         if (len(rel) >= 2 and rel[1] == ":") or rel.startswith(("\\\\", "/", "\\")):
             raise ValueError("非法路径")
-        full = os.path.normpath(os.path.join(root, rel))
-        root_n = path_util.norm_root(root)
-        full_n = path_util.norm_root(full)
-        if not root_n or not full_n:
+        normed = []
+        for root in (roots or ()):
+            rn = path_util.norm_root(root)
+            if rn:
+                normed.append(rn)
+        if not normed:
             raise ValueError("非法路径")
-        # 落盘目标必须在归档根内（相等即根自身，同样拒绝）
-        if not path_util.is_within(root_n, full_n) or full_n == root_n:
-            raise ValueError("非法路径：禁止逃逸归档根目录")
-        return full
+        for rn in normed:
+            full = os.path.normpath(os.path.join(rn, rel))
+            full_n = path_util.norm_root(full)
+            if not full_n:
+                continue
+            if path_util.is_within(rn, full_n) and full_n != rn:
+                return full
+        raise ValueError("非法路径：禁止逃逸归档根目录")
 
-    def archive_write(self, rel_path, data):
-        """归档写盘：二进制写入归档根下的 rel_path，返回完整路径"""
+    def _archive_allowed_roots(self):
+        """归档写入的允许根（规范化去重）：归档根 + _models_roots()。
+
+        _models_roots() 已经包含 models_dirs，并且只在 route_by_type 开启且目录有效时并入
+        comfyui_models_root —— 令牌目录本来就只有「分流开着」才会发出来，所以这里直接复用，
+        不再自己判一次开关（两处判定早晚会分叉）。
+        """
+        roots = []
+        try:
+            roots.append(self._archive_root())
+        except Exception:
+            pass          # 归档根没配置也不影响令牌目录这一侧的校验
+        try:
+            roots.extend(self._models_roots() or [])
+        except Exception:
+            pass
+        out, seen = [], set()
+        for r in roots:
+            n = path_util.norm_root(r)
+            if n and n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+
+    def archive_write(self, rel_path, data, target_dir=""):
+        """归档写盘：二进制写入并返回完整路径
+
+        两种形态（对应 /api/archive/file 的两个请求体）：
+        · target_dir 为空 → rel_path 相对归档根，历史行为逐字不变
+        · target_dir 非空 → 桥层由 bundle 令牌解析出的**绝对目录**，文件名就是 rel_path 位上的
+          纯基名；这里再复核一遍「目录仍在允许根内 + 名字是纯基名」才写。令牌只证明
+          「这个目录是桌面自己算出来的落点」，不证明它今天还合法（用户可能中途改了设置）。
+        """
+        if target_dir:
+            return self._archive_write_bundle(str(target_dir), rel_path, data)
         root = self._archive_root()
         full = self._safe_archive_path(root, rel_path)
         parent = os.path.dirname(full)
@@ -3256,8 +3412,47 @@ class Api:
             f.write(data or b"")
         return full
 
-    def archive_done(self, dir_name):
-        """归档完成：daemon 线程触发模型库重扫（全库磁盘遍历，不阻塞桥响应），尽力而为"""
+    def _archive_write_bundle(self, target_dir, filename, data):
+        """bundle 形态写盘：令牌目录（绝对）+ 纯基名 → 复核后落盘，非法一律 ValueError（桥回 400）"""
+        import model_routing
+        d = path_util.norm_root(target_dir)
+        if not d:
+            raise ValueError("落点目录为空")
+        roots = self._archive_allowed_roots()
+        if not any(path_util.is_within(r, d) for r in roots):
+            raise ValueError("非法路径：落点目录不在允许的归档根/模型根内")
+        if not os.path.isdir(d):
+            raise ValueError("落点目录已不存在")
+        try:
+            # 令牌目录本身是被人在盘上换成链接/junction 时绝不跟（分流目录是我们在入队时建的，
+            # 但 30 分钟 TTL 内用户什么都可能做）
+            if _is_reparse_path(d) or os.path.islink(d):
+                raise ValueError("非法路径：落点目录是链接指向别处")
+        except ValueError:
+            raise
+        except Exception:
+            pass          # 判定函数本身不可用（非 Windows/依赖缺失）不拦：containment 已经过一遍
+        # 桌面侧自己再判一次名字：绝不只信扩展过滤过
+        name = str(filename or "").strip()
+        if not name or name in (".", "..") or "/" in name or "\\" in name or name.startswith(".."):
+            raise ValueError("filename 必须是纯文件名")
+        if not model_routing.is_safe_segment(name):
+            raise ValueError("非法文件名")
+        full = self._safe_path_in_roots([d], name)
+        parent = os.path.dirname(full)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data or b"")
+        return full
+
+    def archive_done(self, dir_name=""):
+        """归档完成：daemon 线程触发模型库重扫（全库磁盘遍历，不阻塞桥响应），尽力而为
+
+        dir_name 分流后不再代表路径（本体已经进了 ComfyUI 类型目录，落点凭据是 bundle 令牌，
+        释放在桥层做），所以这里允许空串——扩展批量结束恒传 {dirName:''}，重扫只看磁盘，
+        本来就没用过 dir_name。老客户端传真实 dirName 行为不变。
+        """
         def work():
             try:
                 self.scan_models()

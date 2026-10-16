@@ -4,10 +4,20 @@
 设计要点
 - 仅绑定 127.0.0.1，外部网络不可达；
 - CORS 白名单：只允许 chrome-extension://* 与本机页面（file://、null、127.0.0.1/localhost）；
-- POST /api/download：校验 URL 后调用注册的下载 handler（webui.Api.dl_submit_url，
-  解析并入队下载均为后台线程，handler 同步快速返回）；
-  **handler 一律按 (url, dest_subdir) 两参调用**——归档桥的 sendModelToSoftware 靠第二个参数
-  把模型文件落进 <归档根>/<目录名>/，注册进来的方法必须收得住这两个参数。
+- POST /api/download：校验 URL 后调用注册的下载 handler（webui.Api.dl_submit_url_from_bridge，
+  老 handler 是 dl_submit_url：解析并入队下载均为后台线程，handler 同步快速返回）；
+  **handler 至少收得住 (url, dest_subdir) 两参**——归档桥的 sendModelToSoftware 靠第二个参数
+  把模型文件落进 <归档根>/<目录名>/。handler 自己额外声明了 `caps` 关键字时，桥把请求体里的
+  caps 数组原样带进去（按签名探测，绝不给两参老 handler 硬塞第三参——v2.6.30 就是这么整条链 500 的）。
+- 能力协商：请求体可选 `caps: ["bundle"]`。**只有扩展声明了 bundle 能力，桌面端才允许按类型分流**
+  （分流后模型本体进 ComfyUI 目录，附属文件必须靠 bundle 令牌才能跟着走；老扩展只会把附属文件
+  按 destSubdir 写回 <归档根>/<目录名>，届时本体与归档分家——正是用户投诉的「没归档」现场）。
+  桌面自身 UI 的下载由桌面自己写附属文件，不受这个门限约束。
+- POST /api/archive/file：两种形态（旧→新，逐条保留，缺字段一律 400）
+  · `{rel_path, data_b64}`     落点 = 归档根 / rel_path（历史行为）
+  · `{bundle, filename, data_b64}` 落点 = bundle 令牌登记的绝对目录，filename 必须是**纯文件名**
+- POST /api/archive/done：`{dir_name}`，尽力而为触发模型库重扫；分流后 dir_name 不再代表路径，
+  因此允许空参（扩展的批量结束恒传空串），请求体带 `bundle` 时顺手释放该令牌。
 - POST /api/rpc：浏览器模式下的通用方法调用（前端 shim 把 window.pywebview.api.xxx 映射到这里）；
 - GET /、/app.js 等：浏览器模式下直接由本服务提供 web/ 目录里的界面文件；
 - GET /api/heartbeat：页面心跳（用于「关页面即退出」）；
@@ -15,13 +25,16 @@
 - 端口冲突/启动失败静默（不影响主程序）。
 """
 import base64
+import inspect
 import json
 import mimetypes
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -55,6 +68,25 @@ _archive_done_fn = None    # def done(dir_name) -> 任意（尽力而为）
 _archive_check_fn = None   # def check(version_id) -> dict {found, paths}
 # 资源库媒体流（GET /api/media）：可读根目录由 webui.Api 注入，桥层不 import webui
 _media_roots_fn = None     # def media_roots() -> [绝对根目录]
+
+# ---------------- bundle 落点令牌注册表（模块级，与 _handler 同风格） ----------------
+# 为什么要有令牌：扩展算不出分流落点（看不到 safetensors 头、不知道 ComfyUI 目录现状），
+# 而封面/配图/提示词/example.json/评论必须写进「模型本体真正所在的那个目录」。
+# 桌面端分流成功时把绝对落点登记成一个不透明随机串，随 /api/download 回给扩展；
+# 扩展之后只带令牌写文件，绝不自己拼路径 —— 令牌同时充当「这个目录是桌面自己算出来的」凭据，
+# 所以只有桌面登记的目录能用，扩展拿任意路径来写不认。
+_BUNDLE_TTL = 30 * 60.0
+"""滑动 TTL（秒）。批量归档从 prepare 阶段（提交本体）到阶段三（写评论）可能隔好几分钟，
+每次写入都续期；令牌过早失效 → 附属文件降级到浏览器下载目录 → 归档分家（用户投诉的现场）。"""
+
+_BUNDLE_MAX = 256
+"""容量上限：一屏批量也就几十项，256 足够宽；超出按「最久没写入」淘汰，避免长跑进程无界增长。"""
+
+_bundles = OrderedDict()   # token -> (绝对落点, 到期时刻)；插入序 == 「最近写入序」（resolve 时 move_to_end）
+_bundle_lock = threading.Lock()
+
+# 能力名：扩展声明「收得住 bundle 令牌」
+CAP_BUNDLE = "bundle"
 
 # 媒体扩展名白名单——镜像 media_library.IMAGE_EXTS / VIDEO_EXTS（契约 §3.1）。
 # 为什么在本模块重复定义：这是「越界读文件」的第一道安全闸，必须在 media_library
@@ -214,7 +246,11 @@ def set_ui_state(**kw):
 
 
 def set_download_handler(fn):
-    """注册下载入口：webui.Api 启动时把 dl_submit_url 注册进来（必须接受 (url, dest_subdir) 两参）"""
+    """注册下载入口：webui.Api 启动时把 dl_submit_url 注册进来（必须接受 (url, dest_subdir) 两参）
+
+    想收能力协商（caps）的 handler 自己声明 `caps=` 关键字参数即可，桥按签名决定要不要传
+    —— 老的两参 handler 不会因为多一个参数而 TypeError（v2.6.30 就是这么整条链 500 的）。
+    """
     global _handler
     _handler = fn
 
@@ -243,12 +279,103 @@ def touch():
 
 
 def set_archive_handlers(config_fn=None, write_fn=None, done_fn=None, check_fn=None):
-    """注册归档入口：webui.Api 启动时把 config/write/done/check 注册进来"""
+    """注册归档入口：webui.Api 启动时把 config/write/done/check 注册进来
+
+    write_fn 的调用约定：老形态 `write_fn(rel_path, data)`（两参，落归档根）；
+    新形态 `write_fn(filename, data, target_dir)`（桥解析出 bundle 令牌后带绝对目录，
+    根校验与纯文件名复核由 webui 侧做——令牌只证明「这是桌面自己算出来的落点」）。
+    """
     global _archive_config_fn, _archive_write_fn, _archive_done_fn, _archive_check_fn
     _archive_config_fn = config_fn
     _archive_write_fn = write_fn
     _archive_done_fn = done_fn
     _archive_check_fn = check_fn
+
+
+# ---------------- bundle 令牌：注册 / 解析 / 释放 ----------------
+
+def register_bundle(abs_dir):
+    """登记一个分流落点 → 返回不透明令牌；入参为空返回 ""（调用方据此不发令牌）
+
+    只存字符串、不校验目录存在性：登记时刻目录刚被 _route_dest_dir 建好，
+    真正的「还在不在允许根内」由写盘那一刻的 webui 侧复核（用户中途改设置要能生效）。
+    """
+    d = str(abs_dir or "").strip()
+    if not d:
+        return ""
+    token = secrets.token_urlsafe(16)
+    now = time.time()
+    with _bundle_lock:
+        # 惰性清扫：过期项在登记时顺手带走，省一个后台线程（表最多 256 条，遍历代价可忽略）
+        for stale in [k for k, (_, dl) in _bundles.items() if dl <= now]:
+            _bundles.pop(stale, None)
+        _bundles[token] = (d, now + _BUNDLE_TTL)
+        while len(_bundles) > _BUNDLE_MAX:
+            _bundles.popitem(last=False)   # 淘汰最久没写入的那一条
+    return token
+
+
+def resolve_bundle(token):
+    """令牌 → 绝对落点（**命中即滑动续期**）；不存在/已过期返回 None
+
+    续期是这条链路的要害：附属文件是一路写过来的，只要还在写就不能失效。
+    同时 move_to_end，让容量淘汰按「最久没写入」而不是「最早登记」——
+    正在写附属文件的批次绝不会被同批后来的登记挤掉。
+    """
+    t = str(token or "")
+    if not t:
+        return None
+    now = time.time()
+    with _bundle_lock:
+        ent = _bundles.get(t)
+        if ent is None:
+            return None
+        d, deadline = ent
+        if deadline <= now:
+            _bundles.pop(t, None)          # 过期就地删，别再占容量
+            return None
+        _bundles[t] = (d, now + _BUNDLE_TTL)
+        _bundles.move_to_end(t)
+        return d
+
+
+def release_bundle(token):
+    """主动释放（归档结束）。未知/已过期令牌返回 False 且静默——重复释放是正常路径不是错误"""
+    t = str(token or "")
+    if not t:
+        return False
+    with _bundle_lock:
+        return _bundles.pop(t, None) is not None
+
+
+def clear_bundles():
+    """清空注册表（测试与进程收尾用）"""
+    with _bundle_lock:
+        _bundles.clear()
+
+
+def bundle_count():
+    """当前在册令牌数（测试与诊断用，不做断言依据）"""
+    with _bundle_lock:
+        return len(_bundles)
+
+
+# ---------------- 能力协商 ----------------
+
+def caps_has(caps, name):
+    """caps 是扩展声明的能力字符串数组（老扩展根本不发这个字段）。
+
+    只认 list/tuple/set 里的字符串元素；脏值（裸字符串、dict、None）一律当「没声明」——
+    这条门限只管一件事：放行分流。判错方向的代价是归档分家，所以宁可少放行。
+    """
+    if not isinstance(caps, (list, tuple, set)):
+        return False
+    return any(isinstance(c, str) and c.strip() == name for c in caps)
+
+
+def caps_allow_bundle(caps):
+    """扩展是否声明「能按 bundle 令牌写附属文件」——只有声明了，桌面端才允许分流（理由见模块头）"""
+    return caps_has(caps, CAP_BUNDLE)
 
 
 def is_model_url(url):
@@ -263,6 +390,58 @@ def is_model_url(url):
         return False
     path = m.group(2) or "/"
     return bool(_URL_PATH_RE.match(path))
+
+
+# bundle 形态的 filename 语法闸（纯文件名）。为什么桥层也要判一次：
+# webui 侧判的是「落在哪个根里」（策略），这里的「协议形状」即使注册方漏判也拦住；
+# 两边都不信扩展过滤过（扩展改了/被人改了不能变成写盘逃逸面）。
+_FILENAME_BAD_MSG = "filename 必须是纯文件名（不能含路径分隔符、盘符、UNC、.. 或控制字符）"
+
+
+def bundle_filename_error(name):
+    """纯文件名校验：合法返回 None，非法返回给扩展看的一句话（400 的 msg）"""
+    if not isinstance(name, str):
+        return _FILENAME_BAD_MSG
+    s = name.strip()
+    if not s:
+        return "filename 不能为空"
+    if s in (".", "..") or s.startswith(".."):
+        return _FILENAME_BAD_MSG
+    if "/" in s or "\\" in s:
+        return _FILENAME_BAD_MSG
+    # 盘符（"C:x" 在 POSIX 上是合法文件名，却是 Windows 逃逸面）与 UNC
+    if re.match(r"^[A-Za-z]:", s) or s.startswith("//"):
+        return _FILENAME_BAD_MSG
+    # 控制字符（含 NUL）：Windows 会静默截断/拒绝，宁可不写
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in s):
+        return _FILENAME_BAD_MSG
+    # 首尾空白：Windows 会静默去掉尾部空格，两边算出不同文件名就等于重复归档
+    if s != name:
+        return _FILENAME_BAD_MSG
+    return None
+
+
+def _handler_wants_caps(fn):
+    """handler 自己是否声明了 caps（关键字或位置参数皆可）。老 handler 只收两参，绝不硬塞第三参。"""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    p = params.get("caps")
+    if p is not None and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY):
+        return True
+    return any(x.kind == x.VAR_KEYWORD for x in params.values())
+
+
+def _call_download_handler(fn, url, dest_subdir, caps):
+    """按 handler 的声明调用：caps 非空且 handler 收得住才带关键字传进去。
+
+    门限的判定权交给 webui（它才知道分流与令牌怎么发），桥只负责「把扩展声明的能力原样送到」，
+    老 handler（含测试里的假实现）不会因为多一个参数而 TypeError。
+    """
+    if caps and _handler_wants_caps(fn):
+        return fn(url, dest_subdir, caps=caps) or {}
+    return fn(url, dest_subdir) or {}
 
 
 def origin_allowed(origin):
@@ -521,17 +700,32 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(200, {"result": result}, origin)
 
     def _handle_archive_file(self, origin):
-        """POST /api/archive/file：body {rel_path, data_b64}，上限 128MB"""
+        """POST /api/archive/file，body 上限 128MB，两种形态（详见模块头）：
+           旧 `{rel_path, data_b64}`            → 相对归档根，行为与历史逐字一致
+           新 `{bundle, filename, data_b64}`    → 落点 = bundle 令牌登记的绝对目录
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(min(length, _ARCHIVE_FILE_MAX)) if length else b""
             data = json.loads(raw.decode("utf-8", "replace") or "{}")
             rel_path = data.get("rel_path") or ""
             data_b64 = data.get("data_b64") or ""
+            bundle = data.get("bundle") or ""
+            filename = data.get("filename") or ""
         except Exception:
             return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
-        if not rel_path or not data_b64:
-            return self._json(400, {"ok": False, "msg": "rel_path 与 data_b64 不能为空"}, origin)
+        use_bundle = bool(bundle)
+        target_dir = ""
+        if use_bundle:
+            # bundle 形态自己的一套必填校验：缺 filename 就是协议错，绝不退化成写归档根
+            if not filename or not data_b64:
+                return self._json(400, {"ok": False, "msg": "bundle 形态需要 filename 与 data_b64"}, origin)
+            bad = bundle_filename_error(filename)
+            if bad:
+                return self._json(400, {"ok": False, "msg": bad}, origin)
+        else:
+            if not rel_path or not data_b64:
+                return self._json(400, {"ok": False, "msg": "rel_path 与 data_b64 不能为空"}, origin)
         try:
             blob = base64.b64decode(data_b64, validate=True)
         except Exception:
@@ -541,8 +735,16 @@ class _Handler(BaseHTTPRequestHandler):
         fn = _archive_write_fn
         if fn is None:
             return self._json(500, dict(_NOT_READY), origin)
+        if use_bundle:
+            # 解析放在解码/尺寸校验之后：坏请求不该把令牌寿命续满
+            # 令牌不存在/已过期/已释放 → 400 + 明说原因（扩展会带着这条 msg 降级到浏览器下载目录，
+            # 用户至少能在归档日志里看到「令牌没了」而不是莫名其妙）
+            target_dir = resolve_bundle(bundle)
+            if not target_dir:
+                return self._json(400, {"ok": False, "msg": "落点令牌无效或已过期，请重新发送模型"}, origin)
+            rel_path = filename
         try:
-            saved = fn(rel_path, blob)
+            saved = fn(rel_path, blob, target_dir) if target_dir else fn(rel_path, blob)
         except Exception as e:
             return self._json(400, {"ok": False, "msg": str(e)[:200]}, origin)
         if saved is False or saved is None:
@@ -550,19 +752,26 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "path": str(saved)}, origin)
 
     def _handle_archive_done(self, origin):
-        """POST /api/archive/done：body {dir_name}，尽力而为语义"""
+        """POST /api/archive/done：body {dir_name, bundle?}，尽力而为语义。
+
+        dir_name 允许为空：分流后它不再代表路径（本体已在 ComfyUI 类型目录里），
+        「结束」这件事本身就是触发模型库重扫的信号。扩展的批量结束恒传 {dir_name:''}，
+        旧实现在这里返回 400，导致批量归档后的重扫从未真正触发（本次一并修掉）。
+        老客户端传真实 dirName 行为不变。带 bundle 时顺手释放该令牌（不带就交给 TTL/容量回收）。
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(min(length, 65536)) if length else b""
             data = json.loads(raw.decode("utf-8", "replace") or "{}")
             dir_name = data.get("dir_name") or ""
+            bundle = data.get("bundle") or ""
         except Exception:
             return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
         fn = _archive_done_fn
         if fn is None:
             return self._json(500, dict(_NOT_READY), origin)
-        if not dir_name:
-            return self._json(400, {"ok": False, "msg": "dir_name 不能为空"}, origin)
+        if bundle:
+            release_bundle(bundle)
         try:
             fn(dir_name)
         except Exception as e:
@@ -590,6 +799,7 @@ class _Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8", "replace") or "{}")
             url = data.get("url") or ""
             dest_subdir = data.get("dest_subdir") or ""
+            caps = data.get("caps") or []
         except Exception:
             return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
         url = (url or "").strip()
@@ -601,11 +811,14 @@ class _Handler(BaseHTTPRequestHandler):
         if fn is None:
             return self._json(500, {"ok": False, "msg": "下载服务未就绪"}, origin)
         try:
-            result = fn(url, dest_subdir) or {}
+            result = _call_download_handler(fn, url, dest_subdir, caps)
         except Exception as e:
             return self._json(500, {"ok": False, "msg": "下载启动失败: %s" % str(e)[:120]}, origin)
         if isinstance(result, dict) and result.get("ok") is False:
             return self._json(400, result, origin)
+        # **result 在 "msg" 之后合并：桌面端的真实一句话（"已加入队列: xxx"）压过这里的兜底文案，
+        # 分流三件套 bundle/dest_dir/routed 也在 result 里，靠这个合并透出去（老扩展没有这些键，
+        # 合并结果与改动前逐字一致）
         return self._json(200, {"ok": True, "msg": "已开始下载", **result}, origin)
 
 
@@ -638,3 +851,4 @@ def stop():
         except Exception:
             pass
         _server = None
+    clear_bundles()   # 服务没了令牌就没意义（重启后 webui 会重新登记）；失败也不影响关服务
