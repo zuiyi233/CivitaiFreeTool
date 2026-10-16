@@ -28,6 +28,8 @@ const WORKBENCH_SETTING_HELP = {
   window_appearance: "Mica / Mica Alt 扩展到整个窗口背景，面板不再盖住材质；Mica 取桌面壁纸色调，不是实时透视毛玻璃，窗口失焦/系统关闭透明时回退纯色；需要 Windows 11 22H2 或更新版本，不支持时回退不透明背景。选择外部控制可配合 Mica For Everyone，按进程名 CivitaiFreeToolWeb.exe 添加规则；需要另行安装并配置工具，不等于内置 Mica。外部模式使用系统窗口框，改动需重启。",
   proxy_enabled: "只有需要通过代理连接外网时才开启。代理软件需要保持运行。",
   ssl_verify: "建议开启。仅排查代理证书问题时暂时关闭，不要长期关闭。",
+  route_by_type: "开启后模型本体按 C 站类型直接落进 ComfyUI 对应目录（loras / checkpoints / diffusion_models / vae / controlnet / embeddings / upscale_models / clip_vision / text_encoders / hypernetworks），本体与 json/info/封面/配图/视频/提示词/评论在同一个「模型名」目录里，下载完成后不再弹「询问移动分类」。判定优先读 safetensors 文件头（只取头部几 KB，不重下、不重新哈希），Checkpoint 与纯 UNet 大模型靠它区分；读不到退回 C 站类型，再判不出就不分流，按原目录落盘并在下载列表写明原因。代价要说清：只往你机器上**已经存在**的 ComfyUI 目录里放，一个都不新建，所以 MotionModule 这类要自定义节点才生效的类型不会自动分流；工作流、触发词等非模型文件一律不分流，继续留在归档根目录。另外浏览器扩展要与软件同时更新——扩展没声明落点令牌能力时，为避免本体进了 ComfyUI 而图片评论还留在归档目录，这类提交不分流。",
+  comfyui_models_root: "填 ComfyUI 的 models 根目录（形如 D:\\ComfyUI_Mie_2026_V8.0\\ComfyUI\\models），不是 ComfyUI 根目录、也不是 loras 这类子目录——填错会得到 models\\models\\...。开启分流后软件按类型自动拼子目录，并把该根目录并入模型管理扫描范围，否则落到 vae/controlnet 的文件软件自己看不见、也就没有预览图。留空或目录不存在 = 不分流。",
   target_env: "选择模型最终使用的环境，让自动整理采用对应目录结构。",
   organize_mode: "先用手动分类熟悉流程，再根据右侧介绍选择自动分类。",
   window_wait_seconds: "30–600 秒，默认 30 秒。正在初始化时会继续宽限，避免 5–8 秒就打断正常启动。改动重启后生效。",
@@ -90,7 +92,8 @@ function settingRow(key, label, type, opts, tip) {
     input = '<textarea class="input" rows="3"' + attrs + ' placeholder="D:\\ComfyUI\\models&#10;D:\\WebUI\\models&#10;\\\\192.168.1.10\\models（局域网共享）">' + esc(dirs.join("\n")) + '</textarea>' +
       '<button type="button" class="btn" data-dirtest="' + key + '">测试连接</button>';
   } else if (type === "dir") {
-    input = '<div class="dir-pick"><input class="input"' + attrs + ' value="' + esc(value || "") + '" readonly placeholder="使用默认下载目录"/>' +
+    const ph = key === "comfyui_models_root" ? "填 ComfyUI 的 models 根目录，如 D:\\ComfyUI\\models" : "使用默认下载目录";
+    input = '<div class="dir-pick"><input class="input"' + attrs + ' value="' + esc(value || "") + '" readonly placeholder="' + esc(ph) + '"/>' +
       '<button type="button" class="btn" data-dirpick="' + key + '">' + _icon("folder") + '选择</button><button type="button" class="btn" data-dirclear="' + key + '">清除</button></div>';
   } else if (type === "password") {
     input = '<div class="pwd-wrap"><input class="input" type="password"' + attrs + ' value="' + esc(value || "") + '"/><button type="button" class="pwd-eye btn" data-eye="' + key + '" aria-label="显示或隐藏' + esc(label) + '">显示</button></div>';

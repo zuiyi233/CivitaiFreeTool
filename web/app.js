@@ -1106,16 +1106,20 @@ async function dlRefresh() {
         ? "<td class='c-err err-copy' title='点击复制完整报错'>" + esc(t.error) + "</td>"
         : "<td class='c-err'></td>";
       // 「保存到」列：显示该任务会落在哪（未单独指定时显示全局目标）；点一下可单独换
-      const destFull = t.dest_dir || "";
+      // 分流任务必须优先看 routed_dir：dest_dir 要到下载真正开始那一刻才写入，
+      // 否则等待中的任务一直显示「默认」，用户看不出它会落进哪个 ComfyUI 类型目录。
+      const routed = t.routed_dir || "";
+      const destFull = routed || t.dest_dir || "";
       const effFull = destFull || (state.cfg ? (state.cfg.download_target_dir || state.cfg.download_dir || "") : "");
       const md = (state.cfg && state.cfg.models_dir) || "";
       let destShow = effFull;
       if (md && effFull && effFull.toLowerCase().indexOf(md.toLowerCase()) === 0) {
         destShow = effFull.slice(md.length).replace(/^[\\/]+/, "");
       }
-      const destTip = (destFull ? destFull : (effFull + "\n（全局目标）")) + "\n点击选择该文件的保存文件夹";
+      const destTip = (destFull ? destFull : (effFull + "\n（全局目标）"))
+        + (routed ? "\n按类型分流：" + (t.route_reason || "") : "") + "\n点击选择该文件的保存文件夹";
       const destLeaf = String(destShow || effFull || "未设置").replace(/[\\/]$/, "").split(/[\\/]/).pop();
-      const destCell = "<td class='c-dest cell-dest' data-task='" + esc(t.id) + "' title='" + esc(destTip) + "'><button type='button' class='dest-picker' aria-label='保存到 " + esc(destLeaf) + "'>" + _icon("folder") + "<span>" + esc(destLeaf) + "</span>" + _icon("chevron-down") + "</button>" + (destFull ? "" : " <span class='dest-def'>默认</span>") + "</td>";
+      const destCell = "<td class='c-dest cell-dest' data-task='" + esc(t.id) + "' title='" + esc(destTip) + "'><button type='button' class='dest-picker' aria-label='保存到 " + esc(destLeaf) + "'>" + _icon("folder") + "<span>" + esc(destLeaf) + "</span>" + _icon("chevron-down") + "</button>" + (destFull ? (routed ? " <span class='dest-def'>分流</span>" : "") : " <span class='dest-def'>默认</span>") + "</td>";
       return '<tr data-task-id="'+esc(t.id)+'" data-fn="' + esc(t.filename) + '" class="' + (selPaths.has(t.id) ? "sel-row" : "") + '">' +
         '<td class="dl-check-col"><span class="dl-check-controls"><button type="button" class="dl-drag-handle" draggable="true" aria-label="拖动调整下载顺序" data-tip="拖动排序：前面的等待任务优先，不中断当前下载">'+ '<svg class="ic dl-grip" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="8" cy="6" r="1.7"/><circle cx="16" cy="6" r="1.7"/><circle cx="8" cy="12" r="1.7"/><circle cx="16" cy="12" r="1.7"/><circle cx="8" cy="18" r="1.7"/><circle cx="16" cy="18" r="1.7"/></svg>' +'</button><input type="checkbox" class="dl-task-check" aria-label="选择下载任务 ' + esc(t.filename) + '"'+(selPaths.has(t.id)?' checked':'')+'/></span></td>' + "<td class='c-thumb'>" + thumb + "</td><td class='c-file'><div>" + esc(t.filename) + "</div>" +
         (effFull ? '<div class="file-subpath" title="' + esc(effFull + (/[/\\]$/.test(effFull) ? "" : (effFull.includes("\\") || /^[a-z]:/i.test(effFull) ? "\\" : "/")) + t.filename) + '">' +
@@ -1207,7 +1211,8 @@ function maybeAskMove(tasks) {
   if (_moveAsking || !(state.cfg && state.cfg.ask_move_after_download)) return;
   // 已在下载页/设置里选了「下载目标文件夹」→ 下载完成会自动归位，不再弹窗询问
   if (state.cfg && (state.cfg.download_target_dir || "").trim()) return;
-  const done = tasks.find((t) => t.status === "done" && t.dest_dir && !_moveAsked.has(t.id));
+  // 已按类型分流的任务也不再问：它已经在 ComfyUI 的正确目录里，弹窗反而会把本体搬出去
+  const done = tasks.find((t) => t.status === "done" && t.dest_dir && !t.routed_dir && !_moveAsked.has(t.id));
   if (!done) return;
   _moveAsked.add(done.id);
   _moveAsking = true;
@@ -4879,6 +4884,8 @@ const SETTING_FIELDS = [
   ["下载", "download_cover", "完成后自动下载封面", "bool"],
   ["下载", "ask_move_after_download", "完成后询问移动分类", "bool"],
   ["下载", "download_target_dir", "下载目标文件夹（预设）", "dir"],
+  ["下载", "route_by_type", "按类型自动分流到 ComfyUI", "bool"],
+  ["下载", "comfyui_models_root", "ComfyUI 模型根目录（models）", "dir"],
   ["下载", "rename_clean_rules", "文件名清理符号", "select", [["", "不清理"], ["comma", "去逗号（推荐）"], ["comma,paren", "去逗号 + 括号"], ["comma,paren,dash", "去逗号+括号，横线/下划线→空格"]]],
   ["下载", "metadata_format", "metadata 格式", "select", ["sd", "civitai", "both"]],
   ["翻译", "baidu_appid", "百度翻译 APP ID", "text"],
@@ -5231,19 +5238,22 @@ $("#settingsForm").addEventListener("click", async (e) => {
   }
   const pick = e.target.closest("[data-dirpick]");
   if (pick) {
+    const key = pick.dataset.dirpick;
     const p = await pickFolderModal();
-    if (p && await applyDownloadTarget(p)) {
-      const inp = $('#settingsForm [data-key="' + pick.dataset.dirpick + '"]');
-      if (inp) {inp.value = p;markSettingSaved(pick.dataset.dirpick);}
-    }
+    if (!p) return;
+    // 只有「下载目标文件夹」需要服务端校验并立即生效；其余目录项走普通保存。
+    // 写成无条件 applyDownloadTarget 的话，给分流用的「ComfyUI 模型根目录」点选择会改到下载目标上。
+    if (key === "download_target_dir" && !(await applyDownloadTarget(p))) return;
+    const inp = $('#settingsForm [data-key="' + key + '"]');
+    if (inp) {inp.value = p;markSettingSaved(key);}
     return;
   }
   const clr = e.target.closest("[data-dirclear]");
   if (clr) {
-    if (await applyDownloadTarget("")) {
-      const inp = $('#settingsForm [data-key="' + clr.dataset.dirclear + '"]');
-      if (inp) {inp.value = "";markSettingSaved(clr.dataset.dirclear);}
-    }
+    const key = clr.dataset.dirclear;
+    if (key === "download_target_dir" && !(await applyDownloadTarget(""))) return;
+    const inp = $('#settingsForm [data-key="' + key + '"]');
+    if (inp) {inp.value = "";markSettingSaved(key);}
   }
 });
 

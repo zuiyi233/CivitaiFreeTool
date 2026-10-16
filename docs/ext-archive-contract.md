@@ -45,9 +45,9 @@ chrome-extension/
 | popup/content → bg | `startArchive` | `{tabId}` → 无（bg 指挥 content 采集） | P1 |
 | bg → content | collectPage | bg 经 tabs.sendMessage 主动采集，envelope 应答 `{modelId, modelVersionId, aboutText, pageUrl}` | P1 |
 | bg → offscreen | `archive` | `{modelId, modelVersionId, aboutText, pageUrl, tabId}` → 流式进度 | P1 |
-| offscreen → bg | `writeFile` | `{relPath, dataB64, overwrite}` → `{ok, saved, channel, msg}` | P1 |
+| offscreen → bg | `writeFile` | `{relPath, dataB64, overwrite}` 或 `{relPath, dataB64, overwrite, bundle, filename}` → `{ok, saved, channel, msg}`（有 `bundle` 走令牌通道写进分流落点，`relPath` 只作降级命名；无令牌退回 rel_path 老形态） | P1 |
 | offscreen → bg | `getArchiveConfig` | → `{softwareOnline, archiveRoot, channel}` | P1 |
-| offscreen → bg | `sendModelToSoftware` | `{downloadUrl, pageUrl, destSubdir}` → `{ok, msg}`（POST 软件桥 /api/download，body `{url, dest_subdir}`；dest_subdir=归档子目录，模型文件落 <archive_root>/<destSubdir>/） | P1 |
+| offscreen → bg | `sendModelToSoftware` | `{downloadUrl, pageUrl, destSubdir}` → `{ok, msg, bundle, destDir, routed}`（POST 软件桥 /api/download，body `{url, dest_subdir, caps:['bundle']}`；桌面端分流时本体落 `<comfyui_models_root>\<类型key>\<模型名>\` 并回令牌，后续附属文件同目录；未声明 caps 或分流判不成则回落 `<archive_root>/<dest_subdir>/`） | P1 |
 | offscreen → content | `progress` | `{percent, text, level}` | P1 |
 | offscreen → content | `archiveDone` | `{ok, dirName, msg, errors:[]}` | P1 |
 | offscreen → content | `askFileSelection` | `{files:[{name,size,type}]}` → `{fileName}` | P2 |
@@ -231,41 +231,66 @@ _civitai_archive_history.json           # 历史镜像（导入导出格式）  
 ```
 
 通道选择（bg 的 writeFile 实现顺序）：
-1. 软件在线且 `archive_root` 非空 → `POST http://127.0.0.1:47531/api/archive/file`
-   `{rel_path, data_b64}`（原始大小 ≤ 32MB）。
-2. 否则降级 `chrome.downloads.download({url: dataUrl, filename: 'CivitaiArchive/'+relPath,
+1. 软件在线且拿到 **落点令牌** → `POST http://127.0.0.1:47531/api/archive/file`
+   `{bundle, filename, data_b64}`（原始大小 ≤ 32MB）。`filename` 必须是**纯基名**，不含任何路径
+   分隔符；目标目录完全由桌面端按令牌解析，扩展不再传路径。
+2. 无令牌（老桌面端，或桌面端判定不分流）→ 同一端点退回 `{rel_path, data_b64}`，
+   落 `<archive_root>/<rel_path>`，行为与令牌协议引入前逐字一致。
+3. 两者都不可用 → 降级 `chrome.downloads.download({url: dataUrl, filename: 'CivitaiArchive/'+relPath,
    saveAs:false, conflictAction:'overwrite'})`；原始大小 > 20MB 拒绝，返回
    `{ok:false, msg:'文件过大且软件未在线'}`。
-3. 响应统一 `{ok, saved: 'software'|'downloads'|'', channel, msg}`（`saved:''` 仅出现在失败响应；无 'skipped' 状态）。
-4. 模型文件本体不经 writeFile：offscreen 发 `sendModelToSoftware {downloadUrl, pageUrl, destSubdir}`，
-   bg POST `/api/download` body `{url, dest_subdir}`，由软件下载到 `<archive_root>/<dest_subdir>/`，
-   与小文件同一归档目录闭环。
+4. 响应统一 `{ok, saved: 'software'|'downloads'|'', channel, msg}`（`saved:''` 仅出现在失败响应；无 'skipped' 状态）。
+5. 模型文件本体不经 writeFile：offscreen 发 `sendModelToSoftware {downloadUrl, pageUrl, destSubdir}`，
+   bg POST `/api/download` body `{url, dest_subdir, caps:['bundle']}`。桌面端**按类型分流**时本体落
+   `<comfyui_models_root>\<类型key>\<模型名>\`，并回 `{bundle, dest_dir, routed:true}`；本次归档的
+   封面/配图/视频/模型信息 txt/example.json/评论全部改走该令牌的 `bundle` 通道，与本体同目录。
+   分流判不成才回落 `<archive_root>/<dest_subdir>/`。
+6. **顺序硬约束**：`sendModelToSoftware` 必须先于任何附属文件写入完成——令牌是随下载提交回的，
+   并发跑就会在令牌到手前按 rel_path 写盘，本体与附属文件分家（这正是本次修的缺陷）。
+7. `bag.dirName` 语义保持不变（仍是 `<归档根>` 下的相对目录名，用于历史与降级命名）；分流后的
+   真实绝对落点另存 `bag.destDir`，写进历史记录的 `destDir`/`routed` 字段，不覆写 `dirName`。
 
 ## 4. Python 侧（browser_bridge.py + webui.py + web/app.js）
 
 - `GET /api/archive/config` → `{ok, archive_root, download_dir}`（archive_root = cfg 的
   `archive_root`，未设置则回落 `download_dir`；两者都空则 `archive_root=""`）。
-- `POST /api/archive/file` body `{rel_path, data_b64}` → `{ok, path}`。安全：rel_path 用
-  os.path.normpath 校验不得逃逸根目录（拒绝 `..`、绝对路径、盘符）；根目录未配置返回
-  `{ok:false, msg:'归档根目录未设置'}`。
-- `POST /api/archive/done` body `{dir_name}` → `{ok}`：起 daemon 线程触发模型库后台重扫（立即返回，
-  不阻塞请求线程；尽力而为）。
+- `POST /api/archive/file`：
+  - `{bundle, filename, data_b64}` → `{ok, path}`。`bundle` 是桌面端 `secrets.token_urlsafe(16)`
+    生成的不透明令牌，注册表在 `browser_bridge.py` 模块级（30 分钟**滑动** TTL、每次写入续期、
+    容量 256 按最久未写入淘汰、`stop()` 时清空）。`filename` 桌面端自己也要拒 `/`、`\`、`..`、
+    盘符、UNC、控制字符、空串——不能只信扩展过滤过。令牌无效/过期返回 400 与「请重新发送模型」。
+  - `{rel_path, data_b64}` → `{ok, path}`。安全：rel_path 用 os.path.normpath 校验不得逃逸
+    （拒绝 `..`、绝对路径、盘符）；根目录未配置返回 `{ok:false, msg:'归档根目录未设置'}`。
+    **该形态的合法根只有归档根**，不随下面的扩根放开：多根匹配会让 `../<兄弟 models 目录>/x`
+    被第二个根接受，等于给旧通道新开一面写盘。
+  - `bundle` 形态的允许根 = 归档根 + `comfyui_models_root` + `models_dirs`（分流落点在 ComfyUI
+    目录下、归档根之外），并拒绝 reparse/junction 目录。
+- `POST /api/download` body `{url, dest_subdir, caps}`：`caps` 含 `"bundle"` 才允许分流。
+  老扩展只发 `{url, dest_subdir}`，若照样分流，本体会进 ComfyUI 而附属文件被它写回
+  `<archive_root>/<dirName>`，造成分裂归档。桌面自身 UI 的下载由桌面自己写附属文件，不受该门限约束。
+  响应 `{ok, msg, bundle?, dest_dir?, routed?}`。
+- `POST /api/archive/done` body `{dir_name, bundle?}` → `{ok}`：起 daemon 线程触发模型库后台重扫
+  （立即返回，不阻塞请求线程；尽力而为）。**空 `dir_name` 不再返回 400**——扩展批量结束恒传空值，
+  此前重扫从未真正触发；分流后 `dir_name` 已不代表路径，结束即重扫。带 `bundle` 时顺带释放令牌。
 - `GET /api/library/check?version_id=` → `{ok, found, paths:[...]}`：在模型库扫描缓存/目录中
   匹配 `.civitai.info`/`.json` 的 `version_id` 字段。
 - browser_bridge.py 保持既有风格：handler 注册制（新增
   `set_archive_handlers(config_fn, write_fn, done_fn, check_fn)`），bridge 自身不 import webui；
   静默失败、CORS 白名单、origin 校验不变；Content-Length 上限放宽到 128MB（仅
-  /api/archive/file）。
-- 设置页（web/app.js 数据驱动设置项，见 2079-2160 区段）新增「归档根目录」行，key=
-  `archive_root`，用现有 pick_dir 对话框模式。
-- 不改动：downloader.py / civitai_api.py / gui.py / 模型管理其余功能。
+  /api/archive/file）。桥 handler 入参用签名探测兼容（`_handler_wants_caps`），老的两参
+  handler 绝不硬塞第三参。
+- 设置页新增 `route_by_type`（按类型分流，默认关）与 `comfyui_models_root`（ComfyUI 的 models
+  根目录）两行；`data-dirpick`/`data-dirclear` 改为按 key 分派，只有 `download_target_dir`
+  走服务端校验的 `set_download_target`。
+- 不改动：downloader.py 的断点续传语义 / civitai_api.py 的下载端点白名单 / gui.py / 模型管理其余功能。
 
 ## 5. 归档历史（Phase 3，lib/history.js）
 
 - IndexedDB：库名 `civitai_archive_assistant`，store `history`，keyPath 无（key =
   `"${modelId}@${modelVersionId}"` 手动指定）。记录字段：
   `{modelId, modelVersionId, modelName, modelVer, dirName, archiveTime(ISO),
-  modelFile, commentCount, imgCount}`。
+  modelFile, commentCount, imgCount, destDir, routed}`（`dirName` 仍是归档根下的相对目录名，
+  分流后的真实绝对落点另存 `destDir`，完成消息与批量状态优先报 `destDir`）。
 - API：`CFT.history.all()` / `.get(modelId, versionId)` / `.put(record)` /
   `.delete(key)` / `.search(keyword)` / `.exportJson()` / `.importJson(json, merge)` /
   `.mirrorFile(writeFileFn)`（把全量历史写 `_civitai_archive_history.json`）。
@@ -316,9 +341,9 @@ batch = { jobId, cancel:false, phase:'prepare'|'media'|'comments'|'done',
                            dirName,autoChosenFile?,msg?}], errors:[] }
 ```
 
-- **阶段 prepare（并发 5）**：逐页 fetchModel → dirName=safeFsName(模型名_版本)；多文件自动选主文件（primary 优先，否则 files[0]，记 `autoChosenFile`）；已归档预检（`CFT.history.get(mid,ver)` 命中 → status='skip'）；命中后逐页 `sendModelToSoftware {downloadUrl, destSubdir:dirName}` 立即入队（POST /api/download）。每页结果存 results 并带 `modelData`（阶段 1 复用，避免重复 fetch）。
+- **阶段 prepare（并发 5）**：逐页 fetchModel → dirName=safeFsName(模型名_版本)；多文件自动选主文件（primary 优先，否则 files[0]，记 `autoChosenFile`）；已归档预检（`CFT.history.get(mid,ver)` 命中 → status='skip'）；命中后逐页 `sendModelToSoftware {downloadUrl, destSubdir:dirName}` 立即入队（POST /api/download，带 `caps:['bundle']`），并把回包的 `bundle`/`destDir`/`routed` 存进该页结果。每页结果存 results 并带 `modelData`（阶段 1 复用，避免重复 fetch）。
 - **阶段 media（串行）**：逐页 `runArchive(payload,{batch:true,skipComments:true})`（batch 模式：跳过 askArchiveConfirm/askFileSelection、跳过逐页 notifyArchiveDone、支持 presetModelData 短路 fetchModel）；每页 try/catch 隔离。
-- **阶段 comments（串行）**：对 status='done' 页逐页 fetchCommentsText（**纯 tRPC，跳过 DOM 兜底**——页面可能已关）→ writeFileToBg(dirName/'评论.txt')；失败记 errors 不阻断。
+- **阶段 comments（串行）**：对 status='done' 页逐页 fetchCommentsText（**纯 tRPC，跳过 DOM 兜底**——页面可能已关）→ writeFileToBg(dirName/'评论.txt')，该页 prepare 阶段拿到过 `bundle` 就走令牌通道写进分流落点（令牌 30 分钟滑动 TTL，跨阶段仍有效）；失败记 errors 不阻断。
 - **结束**：phase='done'；发一次 `notifyArchiveDone`（统一重扫）；badge 清空。
 - 单页归档（`archive` 消息）行为不变；batch 与单页互斥（一方在跑另一方拒绝）。
 - **单图（`saveSingleImage`）同样占这把锁**：`archive` / `archiveBatch` / `saveSingleImage` 三个入口
