@@ -1799,8 +1799,13 @@ class Api:
                 if row is not None:
                     row.update(model_url=url, cached_info=os.path.isfile(self._history_asset(task.id, ".json")), cached_thumb=os.path.isfile(self._history_asset(task.id, ".jpg")))
             self.dl.save_tasks()
-        except Exception:
-            pass
+        except Exception as e:
+            # 历史缓存失败不会让下载失败，但会让「下载历史」缺缩略图/模型链接且无人知晓
+            try:
+                self.log_error("history_cache", "历史缓存失败 [%s] %s" % (
+                    getattr(task, "filename", ""), str(e)[:600]))
+            except Exception:
+                pass
 
     def _run_history_migration(self):
         self._history_migration_running=True

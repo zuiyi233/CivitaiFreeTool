@@ -1430,7 +1430,7 @@ function pollMmScan() {
         const cfg=await api.call("get_config");if(cfg?.model_favorites)state.cfg.model_favorites=cfg.model_favorites;
       } catch (e) {
         state.models = [];
-        setStatus("行数据解析失败: " + e);
+        setStatus("模型列表加载失败：" + ((e && e.message) || e) + "（可重试；持续失败请到设置页打开日志文件夹）");
       }
       // 保留用户的排序与筛选（删除/刷新后不再重置）；勾选只清掉已不存在的模型
       try {
