@@ -58,6 +58,8 @@ class FakeApi:
         self.tasks = []
         self.submitted = []
         self.mm_calls = []
+        self.moves = []
+        self.renames = []
 
     def get_tasks(self):
         return list(self.tasks)
@@ -149,6 +151,38 @@ class FakeApi:
                            "nodes": [{"id": 1, "type": "KSampler", "title": ""},
                                      {"id": 2, "type": "CheckpointLoader", "title": "ck"}],
                            "edges": [{"source": 2, "target": 1, "input": "model", "slot": 0}]})
+
+    def move_file_to(self, path, dest_dir):
+        self.moves.append(("file", path, dest_dir))
+        return {"ok": True, "path": path}
+
+    def set_task_target(self, task_id, dest_dir):
+        self.moves.append(("task", task_id, dest_dir))
+        return {"ok": True}
+
+    def history_move_to(self, task_id, dest_dir):
+        self.moves.append(("history", task_id, dest_dir))
+        return {"ok": True}
+
+    def rename_file(self, path, new_name):
+        self.renames.append(("file", path, new_name))
+        return {"ok": True, "path": path}
+
+    def mm_rename_preview(self, act="rename_c", paths=None):
+        self.renames.append(("preview", paths))
+        return {"ok": True, "items": [{"old": "a", "new": "b", "same": False}]}
+
+    def mm_rename(self, paths=None):
+        self.renames.append(("batch", paths))
+        return {"started": True}
+
+    def mm_organize(self, paths=None):
+        self.mm_calls.append(("mm_organize", paths))
+        return {"started": True}
+
+    def mm_cleanup(self, paths=None):
+        self.mm_calls.append(("mm_cleanup", paths))
+        return {"started": True}
 
     def workflow_model_matches(self, refs):
         return json.dumps([{"ref": r, "local": True, "path": "D:/m/" + r, "sha256": "abc"}
@@ -548,6 +582,178 @@ class ExpandedSurfaceTest(unittest.TestCase):
         self.assertTrue(folders["loras"]["exists"])
         self.assertFalse(folders["checkpoints"]["exists"])
         self.assertTrue(body["routing"]["enabled"])
+
+
+class BatchAndFilesTest(unittest.TestCase):
+    """一次 HTTP 多次调用（batch）、字段投影（fields）、文件管理（move/rename）"""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.api = FakeApi(__import__("pathlib").Path(self.tmpdir.name))
+        self.api.tasks.append({"id": "t1", "filename": "demo.safetensors", "status": "done",
+                               "dest_dir": "D:/m", "routed_dir": "D:/m/loras/demo",
+                               "progress": 100.0, "downloaded": 7, "total": 7,
+                               "error": "",
+                               "info": {"routed_dir": "D:/m/loras/demo"}})
+
+    def call(self, path, method="GET", query=None, body=None):
+        return automation_api.dispatch(path, method, query or {}, body, self.api, ctx(self.api))
+
+    def test_batch_runs_calls_in_order_and_keeps_http_status(self):
+        status, body = self.call("/api/automation/batch", "POST", body={"calls": [
+            {"method": "GET", "path": "/api/automation/tasks",
+             "query": {"limit": 5, "fields": "id,status"}},
+            {"method": "GET", "path": "/api/automation/schema"}]})
+        self.assertEqual(status, 200, body)                 # batch 本身恒 200
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(body["executed"], 2)
+        self.assertEqual(body["results"][0]["http_status"], 200)
+        row = body["results"][0]["result"]["tasks"][0]
+        self.assertEqual(set(row), {"id", "status"})        # fields 生效
+        self.assertIn("config", body["results"][1]["result"])
+
+    def test_batch_rejects_foreign_path_and_nesting(self):
+        status, body = self.call("/api/automation/batch", "POST", body={"calls": [
+            {"method": "POST", "path": "/api/rpc", "body": {"method": "x"}},
+            {"method": "POST", "path": "/api/automation/batch", "body": {"calls": []}}]})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["ok"])
+        self.assertEqual([r["http_status"] for r in body["results"]], [400, 400])
+        self.assertIn("hint", body["results"][0]["result"])
+
+    def test_batch_stop_on_error(self):
+        status, body = self.call("/api/automation/batch", "POST", body={
+            "calls": [{"method": "GET", "path": "/api/automation/nope"},
+                      {"method": "GET", "path": "/api/automation/tasks"}],
+            "stop_on_error": True})
+        self.assertEqual(len(body["results"]), 1)
+        self.assertEqual(body["results"][0]["http_status"], 404)
+        self.assertEqual(body["requested"], 2)
+
+    def test_batch_rejects_empty_and_too_many(self):
+        status, body = self.call("/api/automation/batch", "POST", body={"calls": []})
+        self.assertEqual(status, 400)
+        self.assertIn("hint", body)
+        status, body = self.call("/api/automation/batch", "POST",
+                                 body={"calls": [{"path": "/api/automation/state"}] * 51})
+        self.assertEqual(status, 400)
+
+    def test_fields_support_dotted_paths(self):
+        status, body = self.call("/api/automation/tasks", query={"fields": ["id,info.routed_dir"]})
+        self.assertEqual(status, 200)
+        row = body["tasks"][0]
+        self.assertEqual(row["id"], "t1")
+        self.assertEqual(row["info"]["routed_dir"], "D:/m/loras/demo")
+        self.assertIn("count", body)                        # 元信息永远保留
+
+    def test_fields_on_library_rows(self):
+        status, body = self.call("/api/automation/library", query={"fields": ["name,type"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body["rows"][0]), {"name", "type"})
+        self.assertIn("total", body)
+
+    def test_move_requires_existing_absolute_dir(self):
+        status, body = self.call("/api/automation/move", "POST", body={"path": "D:/m/a.safetensors"})
+        self.assertEqual(status, 400)
+        self.assertIn("hint", body)
+        status, body = self.call("/api/automation/move", "POST",
+                                 body={"path": "D:/m/a.safetensors", "dest_dir": "Z:/nope"})
+        self.assertEqual(status, 400)
+        self.assertIn("不存在", body["msg"])
+
+    def test_move_dispatches_to_the_right_action(self):
+        import tempfile
+        d = tempfile.mkdtemp(dir=self.tmpdir.name)
+        for body, expect in (
+                ({"path": "D:/m/a.safetensors", "dest_dir": d}, "file"),
+                ({"task_id": "t1", "dest_dir": d}, "task"),
+                ({"history_id": "h1", "dest_dir": d}, "history")):
+            status, out = self.call("/api/automation/move", "POST", body=body)
+            self.assertEqual(status, 200, out)
+            self.assertEqual(self.api.moves[-1][0], expect)
+        status, out = self.call("/api/automation/move", "POST", body={"dest_dir": d})
+        self.assertEqual(status, 400)
+
+    def test_rename_single_and_batch(self):
+        status, out = self.call("/api/automation/rename", "POST",
+                                body={"path": "D:/m/a.safetensors", "new_name": "b"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(self.api.renames[-1], ("file", "D:/m/a.safetensors", "b"))
+        status, out = self.call("/api/automation/rename", "POST",
+                                body={"paths": ["D:/m/a.safetensors"], "preview": True})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(self.api.renames[-1], ("preview", ["D:/m/a.safetensors"]))
+        self.call("/api/automation/rename", "POST", body={"paths": ["D:/m/a.safetensors"]})
+        self.assertEqual(self.api.renames[-1], ("batch", ["D:/m/a.safetensors"]))
+        status, out = self.call("/api/automation/rename", "POST", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("hint", out)
+
+    def test_organize_and_cleanup_are_library_ops(self):
+        status, out = self.call("/api/automation/library/op", "POST",
+                                body={"op": "organize", "paths": ["D:/m/a.safetensors"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(self.api.mm_calls[-1], ("mm_organize", ["D:/m/a.safetensors"]))
+        status, out = self.call("/api/automation/library/op", "POST",
+                                body={"op": "cleanup", "paths": ["D:/m/a.safetensors"]})
+        self.assertEqual(status, 400)
+        self.assertIn("confirm", out["msg"])
+
+
+
+class FsAndMigrateTest(unittest.TestCase):
+    """目录浏览（AI 选落点）与数据目录迁移的门禁"""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.api = FakeApi(__import__("pathlib").Path(self.tmpdir.name))
+
+    def call(self, path, method="GET", query=None, body=None):
+        return automation_api.dispatch(path, method, query or {}, body, self.api, ctx(self.api))
+
+    def test_fs_lists_drives_without_path(self):
+        status, body = self.call("/api/automation/fs")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["entries"])
+        self.assertTrue(all(e["dir"] for e in body["entries"]))
+
+    def test_fs_lists_one_level_dirs_only_by_default(self):
+        os.makedirs(os.path.join(self.tmpdir.name, "sub"), exist_ok=True)
+        with open(os.path.join(self.tmpdir.name, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("x")
+        status, body = self.call("/api/automation/fs", query={"path": [self.tmpdir.name]})
+        self.assertEqual(status, 200)
+        names = [e["name"] for e in body["entries"]]
+        self.assertIn("sub", names)
+        self.assertNotIn("a.txt", names)
+        self.assertEqual(os.path.normcase(body["parent"]),
+                         os.path.normcase(os.path.dirname(self.tmpdir.name)))
+        status, body = self.call("/api/automation/fs",
+                                 query={"path": [self.tmpdir.name], "dirs_only": ["0"]})
+        self.assertIn("a.txt", [e["name"] for e in body["entries"]])
+
+    def test_fs_missing_dir_is_404_with_hint(self):
+        status, body = self.call("/api/automation/fs", query={"path": ["Z:/definitely/not/here"]})
+        self.assertEqual(status, 404)
+        self.assertIn("hint", body)
+
+    def test_migrate_requires_confirm(self):
+        status, body = self.call("/api/automation/storage/migrate", "POST",
+                                 body={"directory": self.tmpdir.name})
+        self.assertEqual(status, 400)
+        self.assertIn("confirm", body["msg"])
+        self.assertIn("hint", body)
+        status, body = self.call("/api/automation/storage/migrate", "POST", body={})
+        self.assertEqual(status, 400)
+
+    def test_migrate_delegates_when_confirmed(self):
+        self.api.migrate_data_storage = lambda d, replace=False: {"ok": True, "directory": d}
+        status, body = self.call("/api/automation/storage/migrate", "POST",
+                                 body={"directory": self.tmpdir.name, "confirm": True})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["directory"], self.tmpdir.name)
 
 
 if __name__ == "__main__":

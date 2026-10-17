@@ -820,6 +820,31 @@ class Api:
         task._metadata_started = True
         threading.Thread(target=self._handle_dl_done, args=(task,), daemon=True).start()
 
+    def _note_postprocess_error(self, task, stage, err):
+        """下载已完成、但收尾（元数据/封面/视频/旧版清理）失败时留痕。
+
+        为什么不再静默：这些收尾原先一律 `except: pass`，用户只看到队列「已完成」，模型在库里
+        却没有名字/类型/海报 —— 「下载成功但库是坏的」是最难排查的状态之一。失败要写进 error.log，
+        并挂到任务行上（get_tasks 暴露 postprocess_errors），列表与自动化接口都看得见。
+        """
+        try:
+            self.log_error("dl_done", "%s 失败 [%s] %s" % (
+                stage, (task.info or {}).get("filename") or getattr(task, "filename", ""),
+                str(err)[:600]))
+        except Exception:
+            pass
+        try:
+            info = task.info if isinstance(task.info, dict) else {}
+            errs = info.get("postprocess_errors")
+            if not isinstance(errs, list):
+                errs = []
+                info["postprocess_errors"] = errs
+            if len(errs) < 20:
+                errs.append({"stage": stage, "error": str(err)[:300]})
+            task.info = info
+        except Exception:
+            pass
+
     def _handle_dl_done(self, task):
         try:
             dest = os.path.join(task.dest_dir, task.filename)
@@ -853,8 +878,8 @@ class Api:
                     if fmt in ("sd", "both") and sd:
                         with open(base + ".json", "w", encoding="utf-8") as f:
                             json.dump(sd, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._note_postprocess_error(task, "metadata", e)
             # 1.5) 评论/评价文本（<名>_评论.txt）：评论只有 C 站 tRPC 拿得到，公开 /api/v1 没这个能力。
             #      没 Key / Key 失效 / 限流一律跳过并写进 error.log，绝不让下载主流程失败。
             if self.cfg.get("archive_comments", True):
@@ -876,14 +901,18 @@ class Api:
                     try:
                         _download_image(cover_url, base + ".preview.png",
                                         proxy=proxy_cfg, verify=verify_cfg, cfg=self.cfg)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._note_postprocess_error(task, "cover", e)
                 has_video = any(_is_video_entry(im) and _video_source_url(im) for im in imgs)
                 if has_video:
-                    threading.Thread(target=_ensure_local_videos,
-                                     args=(base, imgs), kwargs={"proxy": proxy_cfg, "verify": verify_cfg,
-                                                                 "max_bytes": _video_cap_bytes(self.cfg)},
-                                     daemon=True).start()
+                    def _fetch_videos():
+                        try:
+                            _ensure_local_videos(
+                                base, imgs, proxy=proxy_cfg, verify=verify_cfg,
+                                max_bytes=_video_cap_bytes(self.cfg))
+                        except Exception as e:
+                            self._note_postprocess_error(task, "video", e)
+                    threading.Thread(target=_fetch_videos, daemon=True).start()
             # Completed files stay where the user classified them. Global target only affects
             # future downloads; relocation is exclusively an explicit move action.
             # 4) 「更新下载」完成：按设置处理旧版本（默认保留；删除走回收站，可还原）
@@ -909,18 +938,18 @@ class Api:
                                 _recycle_to_trash(side)
                             else:
                                 posix_compat.trash(side)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._note_postprocess_error(task, "replace_old_sidecars", e)
                     task.info["replace_old"] = ""
                     try:
                         self.dl.save_tasks()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as e:
+                        self._note_postprocess_error(task, "save_tasks", e)
+            except Exception as e:
+                self._note_postprocess_error(task, "replace_old", e)
 
-        except Exception:
-            pass
+        except Exception as e:
+            self._note_postprocess_error(task, "dl_done", e)
         finally:
             self._cache_history_task(task)
 
@@ -1591,6 +1620,8 @@ class Api:
                     "url": (t.info or {}).get("url", ""),
                     "modelName": (t.info or {}).get("modelName", ""),
                     "versionName": (t.info or {}).get("versionName", ""),
+                    # 收尾（元数据/封面/视频/旧版清理）失败留痕：列表要能提示「下完了但库不完整」
+                    "postprocess_errors": list((t.info or {}).get("postprocess_errors") or []),
                     "created_at": t.created_at, "finished_at": t.finished_at,
                 })
             return out
@@ -1755,7 +1786,8 @@ class Api:
                     finally:
                         if os.path.exists(temp): os.unlink(temp)
             mid = info.get("modelId") or info.get("model_id") or info.get("id")
-            url = "https://civitai.com/models/%s" % mid if str(mid or "").isdigit() else ""
+            # 站点根跟随 site_domain：用户设了 civitai.red 镜像站，点历史里的链接不该跳到 .com
+            url = self._site_url(mid) if str(mid or "").isdigit() else ""
             if not url:
                 import urllib.parse
                 candidate = (task.info or {}).get("url", "")
@@ -2340,7 +2372,7 @@ class Api:
             else:
                 idx = next((i for i,image in enumerate(images) if image.get('url')==c.get('url')), -1)
             image = images[idx] if 0<=idx<len(images) else {}
-            c.update(image_gallery.generation(image,c.get('local_path')))
+            c.update(image_gallery.generation(image,c.get('local_path'),site_base=self._site_base()))
             if isinstance(c.get('meta',{}).get('comfyPrompt'),dict):
                 c['prompt']=c['meta'].get('prompt') or '';c['negative']=c['meta'].get('negativePrompt') or ''
             if c.get('local_path') and not re.search(r'image_\d+',os.path.basename(c['local_path']),re.I) and c.get('metadata_source')=='C站模型信息缓存':
@@ -2434,7 +2466,7 @@ class Api:
             item=self._gallery_item(path,index,history_id)
             persisted=image_gallery.cache_load(item,self.cfg,'metadata')
             if isinstance(persisted,dict) and persisted.get('ok') and (persisted.get('meta') or persisted.get('resources')):return {**persisted,'metadata_cache_hit':True}
-            result=image_gallery.generation(item,item.get('local_path'));result['online_metadata']=False
+            result=image_gallery.generation(item,item.get('local_path'),site_base=self._site_base());result['online_metadata']=False
             image_id=item.get('image_id')
             if str(image_id or '').isdigit() and '自定义封面' not in item.get('metadata_source',''):
                 cache=getattr(self,'_gallery_metadata_cache',None)
@@ -2451,7 +2483,7 @@ class Api:
                     if len(cache)>=256:cache.pop(next(iter(cache)))
                     cache[cache_id]=(now,online)
                 if online:
-                    fresh=image_gallery.generation(online)
+                    fresh=image_gallery.generation(online,site_base=self._site_base())
                     result['meta']={**result['meta'],**fresh['meta']}
                     if fresh['resources']:result['resources']=fresh['resources']
                     if fresh['meta'] or fresh['resources']:result['metadata_source']='C站图片接口（withMeta=true）';result['online_metadata']=True
@@ -5451,10 +5483,17 @@ class Api:
         return {"ok": True, "started": True, "total": len(picked),
                 "msg": "开始更新 %d 个模型（下载新版到旧版所在文件夹）" % len(picked)}
 
+    def _site_base(self):
+        """站点根（带 scheme、无尾斜杠）：设置里的 site_domain，缺省 civitai.red。
+
+        链接与 API 必须用同一个根：设了镜像站却把「打开模型页/图片页」写成 civitai.com，
+        用户点过去只会得到污染解析或超时。
+        """
+        d = str(self.cfg.get("site_domain") or "civitai.red").strip().strip("/")
+        return d if "://" in d else "https://" + d
+
     def _site_url(self, model_id, version_id=None):
-        d = (self.cfg.get("site_domain", "civitai.red") or "civitai.red").strip("/")
-        base = d if "://" in d else "https://" + d
-        u = "%s/models/%s" % (base, model_id)
+        u = "%s/models/%s" % (self._site_base(), model_id)
         if version_id:
             u += "?modelVersionId=%s" % version_id
         return u

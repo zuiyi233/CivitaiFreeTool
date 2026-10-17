@@ -7,6 +7,8 @@
 import unittest
 
 import civitai_api
+import image_gallery
+import webui
 
 
 class SiteBaseTest(unittest.TestCase):
@@ -49,6 +51,27 @@ class SiteBaseTest(unittest.TestCase):
         api = civitai_api.CivitaiAPI(site_base="civitai.red")
         with self.assertRaises(civitai_api.CivitaiError):
             api.file_download_url({}, {"downloadUrl": "https://evil.example/api/download/models/1"})
+
+    def test_image_page_follows_site_base(self):
+        self.assertEqual(image_gallery.image_page_url(7, "civitai.red"),
+                         "https://civitai.red/images/7")
+        self.assertEqual(image_gallery.image_page_url(7, "https://civitai.red/"),
+                         "https://civitai.red/images/7")
+        self.assertEqual(image_gallery.image_page_url(7), "https://civitai.com/images/7")
+
+    def test_generation_uses_site_base_for_image_page(self):
+        out = image_gallery.generation({"id": 7, "meta": {}}, site_base="civitai.red")
+        self.assertEqual(out["image_page"], "https://civitai.red/images/7")
+        given = image_gallery.generation({"id": 7, "image_page": "https://x/y"}, site_base="civitai.red")
+        self.assertEqual(given["image_page"], "https://x/y")   # 已有链接不覆盖
+
+    def test_webui_site_base_normalizes_and_defaults(self):
+        a = webui.Api.__new__(webui.Api)
+        a.cfg = {"site_domain": "civitai.com/"}
+        self.assertEqual(a._site_base(), "https://civitai.com")
+        self.assertEqual(a._site_url(5, 6), "https://civitai.com/models/5?modelVersionId=6")
+        a.cfg = {}
+        self.assertEqual(a._site_base(), "https://civitai.red")
 
 
 if __name__ == "__main__":

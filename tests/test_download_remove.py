@@ -122,4 +122,25 @@ class RemoveDownloadTests(unittest.TestCase):
         self.assertTrue(self.part.exists());self.assertIn('其他任务',restarted.get_history()[0]['partial_cleanup_error'])
 
 
+
+    def test_promote_part_retries_through_transient_lock(self):
+        """Windows 上目标被杀软/资源管理器短占：退避重试后必须成功，不能假报完成。"""
+        src=self.root/'x.part';src.write_bytes(b'payload');dst=self.root/'x.bin'
+        real=os.replace;calls=[]
+        def flaky(a,b):
+            calls.append(1)
+            if len(calls)<3:raise PermissionError('locked')
+            return real(a,b)
+        with patch.object(downloader.os,'replace',side_effect=flaky):
+            ok,err=self.d._promote_part(str(src),str(dst))
+        self.assertTrue(ok);self.assertIsNone(err);self.assertEqual(dst.read_bytes(),b'payload')
+
+    def test_promote_part_reports_failure_and_keeps_source(self):
+        src=self.root/'y.part';src.write_bytes(b'payload');dst=self.root/'y.bin'
+        with patch.object(downloader.os,'replace',side_effect=PermissionError('locked')):
+            ok,err=self.d._promote_part(str(src),str(dst),attempts=2)
+        self.assertFalse(ok);self.assertIsInstance(err,OSError)
+        self.assertTrue(src.exists());self.assertFalse(dst.exists())
+
+
 if __name__=='__main__':unittest.main()

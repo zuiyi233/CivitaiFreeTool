@@ -17,7 +17,7 @@ class ModelHistoryTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(); self.root=Path(self.temp.name)
         self.patches=[patch.object(config,'APP_DIR',str(self.root)),patch.object(config,'TASKS_PATH',str(self.root/'tasks.json')),patch.object(config,'HISTORY_PATH',str(self.root/'history.json')),patch.object(downloader.Downloader,'_ensure_workers')]
         for p in self.patches:p.start()
-        self.api=webui.Api.__new__(webui.Api); self.api.cfg={'cache_detail_images':True,'models_dir':str(self.root),'models_dirs':[str(self.root)]}; self.api.dl=downloader.Downloader(self.api.cfg);self.api._history_migration_started=True
+        self.api=webui.Api.__new__(webui.Api); self.api.cfg={'cache_detail_images':True,'models_dir':str(self.root),'models_dirs':[str(self.root)],'site_domain':'civitai.red'}; self.api.dl=downloader.Downloader(self.api.cfg);self.api._history_migration_started=True
         self.path=self.root/'test.safetensors'; self.path.write_bytes(b'model fixture')
         self.info={'id':123,'modelId':123,'name':'fixture','trainedWords':['soft light'],'files':[{'name':'test.safetensors','downloadUrl':'https://example.invalid/?signature=secret'}],'images':[{'url':'https://image.civitai.com/a/width=1024/b.jpg','meta':{'prompt':'fixture prompt'}}]}
         self.task=downloader.DownloadTask('https://example.invalid/?signature=secret',str(self.root),self.path.name,info={'modelName':'fixture','meta':{'info':self.info}})
@@ -99,7 +99,7 @@ class ModelHistoryTests(unittest.TestCase):
         (self.root/'test.preview.png').rename(self.root/'renamed.preview.png')
         self.api._migrate_history_cache()
         row=self.api.get_download_history()['items'][0]
-        self.assertEqual(row['file_path'],str(new));self.assertTrue(row['file_exists']);self.assertTrue(row['cached_info']);self.assertTrue(row['cached_thumb']);self.assertEqual(row['model_url'],'https://civitai.com/models/123')
+        self.assertEqual(row['file_path'],str(new));self.assertTrue(row['file_exists']);self.assertTrue(row['cached_info']);self.assertTrue(row['cached_thumb']);self.assertEqual(row['model_url'],'https://civitai.red/models/123')
     def test_migrate_ambiguous_version_does_not_guess(self):
         self.info.update(versionId=456,version={'id':456})
         self.task.total=self.path.stat().st_size;self.path.unlink();self.api.dl.save_tasks()
@@ -113,7 +113,7 @@ class ModelHistoryTests(unittest.TestCase):
         self.path.unlink();(self.root/'test.preview.png').unlink()
         with patch.object(self.api,'get_cover_b64',return_value=''):self.api._migrate_history_cache()
         row=self.api.dl.get_history()[0]
-        self.assertTrue(row['cached_info']);self.assertEqual(row['model_url'],'https://civitai.com/models/123')
+        self.assertTrue(row['cached_info']);self.assertEqual(row['model_url'],'https://civitai.red/models/123')
         self.assertEqual(json.loads(self.api.get_history_detail(self.task.id))['info']['name'],'fixture')
     def test_history_move_rejects_failed_task(self):
         with self.api.dl._lock:self.api.dl.history[self.task.id]['status']=downloader.ST_ERROR

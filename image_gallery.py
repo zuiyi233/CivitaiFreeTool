@@ -310,7 +310,18 @@ def resource_ids(resource):
     return (int(mid) if str(mid or '').isdigit() and int(mid)>0 else None,int(vid) if str(vid or '').isdigit() and int(vid)>0 else None)
 
 
-def generation(image=None, local_path=None, saved=None):
+DEFAULT_SITE_BASE = 'https://civitai.com'
+
+
+def image_page_url(image_id, site_base=''):
+    """图片页链接：跟随调用方给的站点根（设置里的 site_domain），缺省 civitai.com。"""
+    base = str(site_base or DEFAULT_SITE_BASE).strip().rstrip('/')
+    if '://' not in base:
+        base = 'https://' + base
+    return base + '/images/' + str(image_id)
+
+
+def generation(image=None, local_path=None, saved=None, site_base=''):
     image=image if isinstance(image,dict) else {}
     meta=dict(image.get('meta') or {}) if isinstance(image.get('meta'),dict) else {}
     source=image.get('metadata_source') or ('C站模型信息缓存' if meta else '未提供生成数据')
@@ -362,7 +373,7 @@ def generation(image=None, local_path=None, saved=None):
             'image_id':image.get('id') or image.get('image_id'),'width':image.get('width'),'height':image.get('height'),
             'metadata_note':meta.get('promptExtractionNote',''),
             'orig_url':image.get('url') or image.get('orig_url') or '',
-            'image_page':image.get('image_page') or ('https://civitai.com/images/'+str(image['id']) if str(image.get('id','')).isdigit() else '')}
+            'image_page':image.get('image_page') or (image_page_url(image['id'], site_base) if str(image.get('id','')).isdigit() else '')}
 
 
 def original_url(url):

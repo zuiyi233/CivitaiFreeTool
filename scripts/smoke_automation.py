@@ -61,6 +61,18 @@ def main():
     st, tasks = http(B, "/api/automation/tasks?limit=5")
     check("tasks", st == 200 and isinstance(tasks.get("tasks"), list))
 
+    st, trimmed = http(B, "/api/automation/tasks?limit=5&fields=id,status")
+    rows = trimmed.get("tasks") or []
+    check("tasks-fields", st == 200 and all(set(r) <= {"id", "status"} for r in rows)
+          and "count" in trimmed, rows[:1])
+
+    st, bat = http(B, "/api/automation/batch", "POST", {"calls": [
+        {"method": "GET", "path": "/api/automation/state"},
+        {"method": "GET", "path": "/api/automation/storage",
+         "query": {"fields": "routing"}}]})
+    check("batch", st == 200 and bat.get("ok") and bat.get("executed") == 2
+          and bat["results"][1]["result"].get("routing") is not None, bat.get("results"))
+
     st, schema = http(B, "/api/automation/schema")
     check("schema", st == 200 and "config" in schema and "library_ops" in schema)
     check("schema-routing", bool((schema.get("routing") or {}).get("type_to_folder")),
@@ -76,6 +88,12 @@ def main():
     st, store = http(B, "/api/automation/storage")
     check("storage", st == 200 and isinstance(store.get("dirs"), list)
           and isinstance(store.get("type_dirs"), list))
+
+    st, fs = http(B, "/api/automation/fs")
+    check("fs-drives", st == 200 and bool(fs.get("entries"))
+          and all(e.get("dir") for e in fs["entries"]), fs.get("entries", [])[:2])
+    st, fs404 = http(B, "/api/automation/fs?path=Z%3A%2Fdefinitely%2Fnot%2Fhere")
+    check("fs-404", st == 404 and fs404.get("hint"), fs404)
 
     st, mmstate = http(B, "/api/automation/library/op?op=verify")
     check("library-op-state", st == 200 and "running" in mmstate)
@@ -129,6 +147,12 @@ def main():
     check("workflow-404", st == 404, wf)
     st, mm = http(B, "/api/automation/library/op", "POST", {"op": "nope"})
     check("library-op-400", st == 400, mm)
+    st, mv = http(B, "/api/automation/move", "POST", {"path": "Z:/nope.safetensors"})
+    check("move-400", st == 400 and mv.get("hint"), mv)
+    st, rn = http(B, "/api/automation/rename", "POST", {})
+    check("rename-400", st == 400 and rn.get("hint"), rn)
+    st, bad = http(B, "/api/automation/batch", "POST", {"calls": [{"path": "/api/rpc"}]})
+    check("batch-foreign-400", st == 200 and bad.get("results", [{}])[0].get("http_status") == 400, bad)
 
     ok = all(c["ok"] for c in checks)
     print(json.dumps({"ok": ok, "checks": checks}, ensure_ascii=False, indent=1))

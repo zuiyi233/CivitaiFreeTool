@@ -1092,7 +1092,7 @@ async function dlRefresh() {
   try {
     const tasks = await api.call("get_tasks");
     state.dlTasks = tasks || [];
-    $("#dlTable").dataset.hasErrors=state.dlTasks.some(t=>t.error)?"true":"false";
+    $("#dlTable").dataset.hasErrors=state.dlTasks.some(t=>t.error||(t.postprocess_errors||[]).length)?"true":"false";
     $("#dlRemoveCompleted").disabled=!state.dlTasks.some(t=>t.status==="done");
     const tbody = $("#dlTable tbody");
     const selPaths = new Set(Array.from(tbody.querySelectorAll("tr.sel-row")).map((tr) => tr.dataset.taskId));
@@ -1105,6 +1105,11 @@ async function dlRefresh() {
       const errCell = t.error
         ? "<td class='c-err err-copy' title='点击复制完整报错'>" + esc(t.error) + "</td>"
         : "<td class='c-err'></td>";
+      // 收尾失败（元数据/封面/视频/旧版清理）：下载本体没问题，但库里可能缺信息，必须显式提示
+      const pp = Array.isArray(t.postprocess_errors) ? t.postprocess_errors : [];
+      const ppBadge = pp.length
+        ? '<span class="pp-warn" title="' + esc(pp.map(e => (e.stage || "") + ": " + (e.error || "")).join("\n")) + '">收尾未完成</span>'
+        : "";
       // 「保存到」列：显示该任务会落在哪（未单独指定时显示全局目标）；点一下可单独换
       // 分流任务必须优先看 routed_dir：dest_dir 要到下载真正开始那一刻才写入，
       // 否则等待中的任务一直显示「默认」，用户看不出它会落进哪个 ComfyUI 类型目录。
@@ -1124,7 +1129,7 @@ async function dlRefresh() {
         '<td class="dl-check-col"><span class="dl-check-controls"><button type="button" class="dl-drag-handle" draggable="true" aria-label="拖动调整下载顺序" data-tip="拖动排序：前面的等待任务优先，不中断当前下载">'+ '<svg class="ic dl-grip" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="8" cy="6" r="1.7"/><circle cx="16" cy="6" r="1.7"/><circle cx="8" cy="12" r="1.7"/><circle cx="16" cy="12" r="1.7"/><circle cx="8" cy="18" r="1.7"/><circle cx="16" cy="18" r="1.7"/></svg>' +'</button><input type="checkbox" class="dl-task-check" aria-label="选择下载任务 ' + esc(t.filename) + '"'+(selPaths.has(t.id)?' checked':'')+'/></span></td>' + "<td class='c-thumb'>" + thumb + "</td><td class='c-file'><div>" + esc(t.filename) + "</div>" +
         (effFull ? '<div class="file-subpath" title="' + esc(effFull + (/[/\\]$/.test(effFull) ? "" : (effFull.includes("\\") || /^[a-z]:/i.test(effFull) ? "\\" : "/")) + t.filename) + '">' +
           esc(effFull + (/[/\\]$/.test(effFull) ? "" : (effFull.includes("\\") || /^[a-z]:/i.test(effFull) ? "\\" : "/")) + t.filename) + "</div>" : "") +
-        "</td>" + destCell + "<td class='dl-task-status'>" + esc(st) + (t.hash_mismatch && !t.manual_binding ? '<button type="button" class="btn btn-tiny" data-bind-download="' + esc(t.id) + '" data-tip="仅关联已保存的 C站信息，不修改文件、不代表通过校验">' + _icon('file') + '关联模型信息</button>' : '') + (["done", "error", "canceled"].includes(t.status) ? '<button class="btn btn-tiny task-archive" data-archive-task="' + esc(t.id) + '">' + _icon("clock") + '移入历史</button>' : "") + "</td><td>" + esc(prog) + "</td>" +
+        "</td>" + destCell + "<td class='dl-task-status'>" + esc(st) + ppBadge + (t.hash_mismatch && !t.manual_binding ? '<button type="button" class="btn btn-tiny" data-bind-download="' + esc(t.id) + '" data-tip="仅关联已保存的 C站信息，不修改文件、不代表通过校验">' + _icon('file') + '关联模型信息</button>' : '') + (["done", "error", "canceled"].includes(t.status) ? '<button class="btn btn-tiny task-archive" data-archive-task="' + esc(t.id) + '">' + _icon("clock") + '移入历史</button>' : "") + "</td><td>" + esc(prog) + "</td>" +
         "<td>" + esc(speed) + "</td><td>" + esc(size) + "</td>" + errCell + "</tr>";
     }).join("");
     syncDlSelection();

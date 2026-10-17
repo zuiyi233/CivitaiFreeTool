@@ -72,6 +72,90 @@ def _tasks_raw(api):
         return []
 
 
+# ---------------------------------------------------------------- 通用工具
+_MISSING = object()
+
+
+def _fail(status, msg, hint=""):
+    """失败响应：msg 说清「哪里不对」，hint 说清「下一步做什么」——AI 靠这两句决定重试还是改参数。"""
+    out = {"ok": False, "msg": str(msg)}
+    if hint:
+        out["hint"] = str(hint)
+    return status, out
+
+
+def _pick_path(obj, path):
+    """按点号路径取值："info.routed_dir" → obj["info"]["routed_dir"]；取不到返回 _MISSING"""
+    cur = obj
+    for part in str(path).split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return _MISSING
+    return cur
+
+
+def _set_path(dst, path, value):
+    parts = str(path).split(".")
+    cur = dst
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def _project_item(item, names):
+    out = {}
+    for n in names:
+        v = _pick_path(item, n)
+        if v is not _MISSING:
+            _set_path(out, n, v)
+    return out
+
+
+def _apply_fields(payload, fields, list_key=None):
+    """字段投影：`fields=id,status,progress,info.routed_dir` 只回这些字段。
+
+    存在的理由是省 token：`/library?limit=200` 与 `/tasks` 的完整行里有大量 AI 用不上的键。
+    列表端点（list_key）保留全部元信息（ok/count/waited_s…），只裁剪条目；
+    非列表端点保留 ok + 请求的字段。给 `*` 表示不裁剪。
+    """
+    names = [s.strip() for s in str(fields or "").split(",") if s.strip()]
+    if not names or "*" in names or not isinstance(payload, dict):
+        return payload
+    if list_key and isinstance(payload.get(list_key), list):
+        out = {k: v for k, v in payload.items() if k != list_key}
+        out[list_key] = [_project_item(it, names) if isinstance(it, dict) else it
+                         for it in payload[list_key]]
+        return out
+    projected = _project_item(payload, names)
+    if "ok" in payload:
+        projected.setdefault("ok", payload["ok"])
+    return projected
+
+
+def _fields_from(query, body=None):
+    if isinstance(body, dict) and body.get("fields"):
+        return str(body.get("fields"))
+    return ((query or {}).get("fields", [""])[0] or "")
+
+
+def _norm_query(q):
+    """batch 里 query 允许 {k: 标量} 或 {k: [..]}，统一成 parse_qs 的形状（dict[str, list[str]]）"""
+    out = {}
+    for k, v in (q or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            out[str(k)] = [str(x) for x in v]
+        else:
+            out[str(k)] = [str(v)]
+    return out
+
+
 def _find_task(api, task_id):
     for t in _tasks_raw(api):
         if t.get("id") == task_id:
@@ -143,12 +227,16 @@ def _manifest(api, ctx):
         "rpc": "POST /api/rpc {method, args:[...]}（长尾方法走这里，见 rpc_methods）",
         "endpoints": [
             {"method": "GET", "path": "/api/automation", "desc": "能力清单（本表）"},
+            {"method": "POST", "path": "/api/automation/batch",
+             "params": {"calls": "[{method,path,query?,body?}]", "stop_on_error": "bool"},
+             "desc": "一次 HTTP 跑多条本层调用（最多 50 条），逐条返回 http_status；batch 本身恒 200"},
             {"method": "GET", "path": "/api/automation/schema",
              "desc": "自描述：配置键类型/默认值/可选值 + 词表 + 类型目录映射"},
             {"method": "GET", "path": "/api/automation/state", "desc": "配置 + 最近任务 + 待选文件"},
             {"method": "GET", "path": "/api/automation/tasks",
-             "params": {"ids": "csv", "status": "csv", "limit": "int", "wait": "0|1", "timeout": "s", "since": "ms"},
-             "desc": "任务列表；wait=1 阻塞到终态"},
+             "params": {"ids": "csv", "status": "csv", "limit": "int", "wait": "0|1", "timeout": "s",
+                        "since": "ms", "fields": "csv"},
+             "desc": "任务列表；wait=1 阻塞到终态；fields= 裁剪字段（含 info.routed_dir 这类点号路径）"},
             {"method": "POST", "path": "/api/automation/tasks",
              "params": {"action": "pause|resume|retry|start|remove|archive", "ids": "[str]", "all": "bool"},
              "desc": "批量任务控制，逐项返回结果"},
@@ -156,10 +244,10 @@ def _manifest(api, ctx):
              "params": {"since": "int", "limit": "int"},
              "desc": "本层调用事件流（自检：请求到没到、多久、什么状态）"},
             {"method": "GET", "path": "/api/automation/history",
-             "params": {"limit": "int", "status": "str", "detail": "0|1"},
+             "params": {"limit": "int", "status": "str", "detail": "0|1", "fields": "csv"},
              "desc": "已完成/失败/取消的下载历史（倒序）"},
             {"method": "GET", "path": "/api/automation/prompts",
-             "params": {"path": "str", "limit": "int"},
+             "params": {"path": "str", "limit": "int", "fields": "csv"},
              "desc": "示例图提示词与生成参数（复现用）"},
             {"method": "POST", "path": "/api/automation/plan",
              "params": {"url": "str", "model_id": "int?", "version_id": "int?", "file_id": "int?", "probe": "0|1"},
@@ -180,11 +268,17 @@ def _manifest(api, ctx):
              "desc": "白名单配置写入"},
             {"method": "GET", "path": "/api/automation/storage",
              "desc": "落点目录存在/可写/剩余空间 + ComfyUI 类型目录清单"},
+            {"method": "GET", "path": "/api/automation/fs",
+             "params": {"path": "str?", "dirs_only": "0|1"},
+             "desc": "只读目录浏览：不带 path 列盘符，带 path 列一层（不读文件内容）"},
+            {"method": "POST", "path": "/api/automation/storage/migrate",
+             "params": {"directory": "str", "replace_existing": "bool?", "confirm": "true"},
+             "desc": "迁移数据目录（配置/任务/历史/缓存），需 confirm:true"},
             {"method": "GET", "path": "/api/automation/logs",
              "params": {"source": "error|events|both", "tail": "int"},
              "desc": "error.log 尾部 + 本层调用事件"},
             {"method": "GET", "path": "/api/automation/library",
-             "params": {"q": "str", "type": "str", "limit": "int", "offset": "int"},
+             "params": {"q": "str", "type": "str", "limit": "int", "offset": "int", "fields": "csv"},
              "desc": "模型库行数据（已解析成对象）"},
             {"method": "POST", "path": "/api/automation/library/op",
              "params": {"op": "|".join(_MM_OPS), "paths": "[str]?", "wait": "0|1",
@@ -200,7 +294,13 @@ def _manifest(api, ctx):
             {"method": "POST", "path": "/api/automation/workflow/analyze",
              "params": {"path": "str", "full": "0|1"},
              "desc": "解析 ComfyUI 工作流/生成参数 + 本地模型匹配（默认不带 base64 预览）"},
-            {"method": "GET", "path": "/api/automation/model", "params": {"path": "str"},
+            {"method": "POST", "path": "/api/automation/move",
+             "params": {"path": "str?", "task_id": "str?", "history_id": "str?", "dest_dir": "str"},
+             "desc": "移动模型 / 下载任务落点 / 历史记录到已存在的目录"},
+            {"method": "POST", "path": "/api/automation/rename",
+             "params": {"path": "str?", "new_name": "str?", "paths": "[str]?", "preview": "bool?"},
+             "desc": "单文件改名或批量改名（preview=true 只算不改）"},
+            {"method": "GET", "path": "/api/automation/model", "params": {"path": "str", "fields": "csv"},
              "desc": "单个模型详情（info + 画廊）+ 附属文件清单"},
             {"method": "POST", "path": "/api/automation/file-choice",
              "params": {"identity": "str", "indices": "[int]?", "pause": "bool", "ack": "bool"},
@@ -266,8 +366,9 @@ def _tasks(api, ctx, query):
             time.sleep(0.25)
         waited = round(time.time() - t0, 1)
     rows = snapshot()
-    return 200, {"ok": True, "tasks": rows, "count": len(rows),
-                 "waited_s": waited, "timed_out": timed_out}
+    return 200, _apply_fields({"ok": True, "tasks": rows, "count": len(rows),
+                               "waited_s": waited, "timed_out": timed_out},
+                              _fields_from(query), "tasks")
 
 
 def _tasks_action(api, ctx, body):
@@ -400,7 +501,7 @@ def _plan(api, ctx, body):
         lib = api.library_check(version_id)
     except Exception:
         lib = {}
-    return 200, {
+    return 200, _apply_fields({
         "ok": True, "url": str((body or {}).get("url") or ""),
         "model": {"id": model_id, "name": model.get("name"), "type": model.get("type")},
         "version": {"id": version_id, "name": version.get("name"),
@@ -409,7 +510,7 @@ def _plan(api, ctx, body):
         "in_library": bool((lib or {}).get("found")),
         "library_paths": list((lib or {}).get("paths") or []),
         "files": items,
-    }
+    }, _fields_from(None, body), "files")
 
 
 def _wait_new_tasks(api, before_ids, timeout):
@@ -614,8 +715,9 @@ def _library(api, ctx, query):
         state = api.get_scan_state()
     except Exception:
         pass
-    return 200, {"ok": True, "total": total, "offset": offset, "limit": limit,
-                 "rows": page, "scan": state}
+    return 200, _apply_fields({"ok": True, "total": total, "offset": offset, "limit": limit,
+                               "rows": page, "scan": state},
+                              _fields_from(query), "rows")
 
 
 def _library_scan(api, ctx, body):
@@ -753,10 +855,12 @@ def _model_detail(api, ctx, query):
     if not isinstance(detail, dict):
         detail = {"raw": detail}
     v = _verify_dir(os.path.dirname(path), os.path.basename(path))
-    return 200, {"ok": True, "path": path, "detail": detail,
-                 "files": {"exists": v["exists"], "size": v["size"],
-                           "sidecars": v["sidecars"], "images": v["images"],
-                           "artifacts": v["artifacts"]}}
+    return 200, _apply_fields(
+        {"ok": True, "path": path, "detail": detail,
+         "files": {"exists": v["exists"], "size": v["size"],
+                   "sidecars": v["sidecars"], "images": v["images"],
+                   "artifacts": v["artifacts"]}},
+        _fields_from(query))
 
 
 def _search(api, ctx, body):
@@ -829,7 +933,13 @@ _MM_OPS = {
     "check-updates": ("mm_check_updates", "upd", "检查 C 站更新（force 可绕过 24h 缓存）"),
     "update": ("mm_update_models", "mm", "把「有新版」的模型加入下载队列"),
     "sync-local": ("sync_local_model_updates", "sync", "按本地文件清理失效的更新记录"),
+    "organize": ("mm_organize", "mm", "按 target_env/organize_mode 把模型整理进分类目录"),
+    "rename-c": ("mm_rename", "mm", "批量重命名为 C 站模型名"),
+    "rename-preview": ("mm_rename_preview", "sync", "只算不改：预览批量重命名的新旧名"),
+    "translate-descs": ("mm_translate_descs", "mm", "把模型简介翻译成中文（需百度翻译密钥）"),
+    "cleanup": ("mm_cleanup", "mm", "删除元数据/封面/示例图（不可恢复，需 confirm:true）"),
 }
+_CONFIRM_OPS = {"dedupe-delete", "cleanup"}
 
 _SECRET_KEYS = ("api_key", "baidu_key", "baidu_appid")
 
@@ -934,8 +1044,9 @@ def _history(api, ctx, query):
                   "file_path": r.get("file_path"), "file_exists": r.get("file_exists"),
                   "total": r.get("total"), "error": r.get("error") or "",
                   "finished_at": r.get("finished_at")} for r in items]
-    return 200, {"ok": True, "count": len(items), "items": items,
-                 "error": (data or {}).get("error") if isinstance(data, dict) else None}
+    return 200, _apply_fields({"ok": True, "count": len(items), "items": items,
+                               "error": (data or {}).get("error") if isinstance(data, dict) else None},
+                              _fields_from(query), "items")
 
 
 def _prompts(api, ctx, query):
@@ -964,7 +1075,7 @@ def _prompts(api, ctx, query):
     out = {"ok": True, "path": path, "count": len(images), "shown": len(rows), "images": rows}
     if not images:
         out["hint"] = "该模型没有 info 或 images 为空；可先 POST /api/automation/library/op {op:'verify'} 补全元数据"
-    return 200, out
+    return 200, _apply_fields(out, _fields_from(query), "images")
 
 
 def _wait_mm(getter, timeout):
@@ -990,17 +1101,18 @@ def _library_op(api, ctx, body):
     if op not in _MM_OPS:
         return 400, {"ok": False, "msg": "op 必须是 %s 之一" % "|".join(_MM_OPS)}
     name, kind, desc = _MM_OPS[op]
-    fn = getattr(api, name, None)
-    if not callable(fn):
-        return 501, {"ok": False, "msg": "当前版本不支持 %s" % op}
     paths = b.get("paths")
     if paths is not None and not isinstance(paths, list):
-        return 400, {"ok": False, "msg": "paths 必须是数组（模型文件绝对路径）"}
-    if op == "dedupe-delete":
+        return _fail(400, "paths 必须是数组（模型文件绝对路径）", "传 [\"D:/models/loras/a.safetensors\"]")
+    if op in _CONFIRM_OPS:
         if not b.get("confirm"):
-            return 400, {"ok": False, "msg": "dedupe-delete 会移入回收站，必须显式传 confirm:true"}
+            return _fail(400, "%s 会删除文件/移入回收站，必须显式传 confirm:true" % op,
+                         "先跑只读的 dedupe / rename-preview 确认清单，再带 confirm:true 执行")
         if not paths:
-            return 400, {"ok": False, "msg": "dedupe-delete 必须指定 paths"}
+            return _fail(400, "%s 必须指定 paths" % op, "paths 是模型文件的绝对路径数组")
+    fn = getattr(api, name, None)
+    if not callable(fn):
+        return _fail(501, "当前版本不支持 %s" % op, "用 GET /api/automation/schema 看本机实际可用的 library_ops")
 
     kwargs = {}
     try:
@@ -1173,6 +1285,204 @@ def _storage(api, ctx):
                  "hint": "route_by_type=true 且类型目录存在时才分流；不存在的目录绝不新建"}
 
 
+_BATCH_MAX = 50
+_BATCH_BLOCKED = {"/api/automation/batch"}
+
+
+def _batch(api, ctx, body):
+    """一次 HTTP 跑多条自动化调用：AI 省往返、省 token、省心跳等待。
+
+    ```json
+    {"calls": [{"method": "GET", "path": "/api/automation/tasks",
+                "query": {"limit": 5, "fields": "id,status,progress"}},
+               {"method": "POST", "path": "/api/automation/plan", "body": {"url": "..."}}],
+     "stop_on_error": false}
+    ```
+    只允许调用本层端点（不允许嵌套 batch、不允许改走 /api/rpc），逐条按顺序执行，
+    每条独立记录自己的 http_status：**batch 本身永远 200**，成败看 `results[].ok`。
+    """
+    b = body or {}
+    calls = b.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return _fail(400, "calls 必须是非空数组", '形如 {"calls":[{"method":"GET","path":"/api/automation/tasks"}]}')
+    if len(calls) > _BATCH_MAX:
+        return _fail(400, "calls 最多 %d 条（拆成多次调用）" % _BATCH_MAX, "把只读查询合并，写操作单独发")
+    stop_on_error = bool(b.get("stop_on_error"))
+    results = []
+    for i, c in enumerate(calls):
+        if not isinstance(c, dict):
+            results.append({"index": i, "http_status": 400, "ok": False,
+                            "result": {"ok": False, "msg": "每条 call 必须是对象"}})
+            if stop_on_error:
+                break
+            continue
+        method = str(c.get("method") or "GET").upper()
+        path = str(c.get("path") or "")
+        if not path.startswith("/api/automation"):
+            results.append({"index": i, "http_status": 400, "ok": False, "result": {
+                "ok": False, "msg": "path 必须是 /api/automation 下的端点",
+                "hint": "需要长尾方法请直接 POST /api/rpc（batch 只包自动化层）"}})
+            if stop_on_error:
+                break
+            continue
+        if path in _BATCH_BLOCKED:
+            results.append({"index": i, "http_status": 400, "ok": False,
+                            "result": {"ok": False, "msg": "batch 不能嵌套 batch"}})
+            if stop_on_error:
+                break
+            continue
+        try:
+            r = dispatch(path, method, _norm_query(c.get("query")), c.get("body"), api, ctx)
+        except Exception as e:
+            r = (500, {"ok": False, "msg": "调用异常: %s" % str(e)[:200]})
+        if r is None:
+            r = (404, {"ok": False, "msg": "端点不存在: %s" % path})
+        status, payload = r
+        if not isinstance(payload, dict):
+            payload = {"ok": bool(status == 200), "result": payload}
+        results.append({"index": i, "method": method, "path": path,
+                        "http_status": status, "ok": bool(payload.get("ok")),
+                        "result": payload})
+        if stop_on_error and status >= 400:
+            break
+    return 200, {"ok": all(r["ok"] for r in results), "count": len(results),
+                 "executed": len(results), "requested": len(calls), "results": results}
+
+
+def _move(api, ctx, body):
+    """移动模型或其落点：`path`+`dest_dir`（模型文件）/ `task_id`（下载任务）/ `history_id`（历史记录）。
+
+    只接受**已存在**的绝对目录：不代建目录是刻意的——分流与整理都只写已注册的目录，
+    凭空造一个目录 ComfyUI 扫不到，用户只会得到一堆看不见的模型。
+    """
+    b = body or {}
+    dest = str(b.get("dest_dir") or "").strip()
+    if not dest:
+        return _fail(400, "dest_dir 不能为空", "可先用 GET /api/automation/storage 看有哪些目录")
+    if not os.path.isdir(dest):
+        return _fail(400, "目标目录不存在: %s" % dest, "只接受已存在的绝对目录（不代建）")
+    path = str(b.get("path") or "").strip()
+    task_id = str(b.get("task_id") or "").strip()
+    history_id = str(b.get("history_id") or "").strip()
+    try:
+        if task_id:
+            r = api.set_task_target(task_id, dest)
+        elif history_id:
+            r = api.history_move_to(history_id, dest)
+        elif path:
+            r = api.move_file_to(path, dest)
+        else:
+            return _fail(400, "path / task_id / history_id 至少给一个", "见 GET /api/automation/tasks 与 /history")
+    except Exception as e:
+        return _fail(500, "移动失败: %s" % str(e)[:200], "看 GET /api/automation/logs?source=error")
+    r = _jsonish(r) or {}
+    return (200 if isinstance(r, dict) and r.get("ok") else 400), r
+
+
+def _rename(api, ctx, body):
+    """重命名：单文件 `path`+`new_name`；批量 `paths`（`preview:true` 只算不改）。
+
+    批量走 mm_rename，会连附属文件（info/json/封面）一起改名；预览走 mm_rename_preview，
+    返回每条的新旧名与 `same`，执行前建议先预览。
+    """
+    b = body or {}
+    paths = b.get("paths")
+    preview = bool(b.get("preview"))
+    if paths is not None or preview:
+        if not isinstance(paths, list) or not paths:
+            return _fail(400, "paths 必须是非空数组", '形如 {"paths":["D:/models/loras/a.safetensors"],"preview":true}')
+        fn = api.mm_rename_preview if preview else api.mm_rename
+        try:
+            r = _jsonish(fn(paths=paths)) or {}
+        except Exception as e:
+            return _fail(500, "重命名失败: %s" % str(e)[:200], "看 GET /api/automation/logs?source=error")
+        ok = bool(r.get("ok", r.get("started")))
+        if not ok:
+            return _fail(400, r.get("msg") or "重命名未开始", "先 GET /api/automation/library 确认模型已扫描")
+        if not preview and not r.get("ok"):
+            return 200, {"ok": True, "started": r,
+                         "hint": "后台执行中，用 GET /api/automation/library/op?op=rename-c 看进度"}
+        return 200, r
+    path = str(b.get("path") or "").strip()
+    new_name = str(b.get("new_name") or "").strip()
+    if not path or not new_name:
+        return _fail(400, "path + new_name 不能为空", "批量请传 paths（可先 preview:true 预览）")
+    try:
+        r = _jsonish(api.rename_file(path, new_name)) or {}
+    except Exception as e:
+        return _fail(500, "重命名失败: %s" % str(e)[:200], "看 GET /api/automation/logs?source=error")
+    return (200 if isinstance(r, dict) and r.get("ok") else 400), r
+
+
+_FS_MAX = 500
+
+
+def _fs(api, ctx, query):
+    """只读目录浏览：给 AI 一个「能选到真实落点」的入口。
+
+    原生 pick_dir 弹窗必须有人点，AI 拿不到任何目录名；只靠 get_folders 又只能看到已登记的
+    模型目录，于是「移动到任意目录」这类动作无从下手。这里只做两件事：列盘符、列一层目录名，
+    **不读文件内容、不返回文件大小**，条目上限 500。
+    """
+    path = (query.get("path", [""])[0] or "").strip()
+    dirs_only = str(query.get("dirs_only", ["1"])[0]).lower() not in ("0", "false", "no")
+    if not path:
+        roots = []
+        if os.name == "nt":
+            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                d = letter + ":\\"
+                if os.path.isdir(d):
+                    roots.append({"name": d, "path": d, "dir": True})
+        cfg = getattr(api, "cfg", None) or {}
+        for extra in (os.path.expanduser("~"), str(cfg.get("download_dir") or "")):
+            if extra and os.path.isdir(extra):
+                roots.append({"name": extra, "path": extra, "dir": True})
+        return 200, {"ok": True, "path": "", "parent": "", "entries": roots[:40],
+                     "hint": "带 path=<某个目录> 再列一层；dirs_only=0 才包含文件"}
+    if not os.path.isdir(path):
+        return _fail(404, "目录不存在: %s" % path, "先用不带 path 的调用列盘符，再逐层进入")
+    try:
+        names = sorted(os.listdir(path),
+                       key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
+    except OSError as e:
+        return _fail(400, "读取目录失败: %s" % str(e)[:120], "检查权限，或换一个可读目录")
+    entries, truncated = [], False
+    for name in names:
+        full = os.path.join(path, name)
+        try:
+            is_dir = os.path.isdir(full)
+        except OSError:
+            is_dir = False
+        if dirs_only and not is_dir:
+            continue
+        if len(entries) >= _FS_MAX:
+            truncated = True
+            break
+        entries.append({"name": name, "path": full, "dir": is_dir})
+    parent = os.path.dirname(os.path.abspath(path))
+    return 200, {"ok": True, "path": path,
+                 "parent": "" if os.path.normcase(parent) == os.path.normcase(path) else parent,
+                 "entries": entries, "truncated": truncated}
+
+
+def _storage_migrate(api, ctx, body):
+    """把数据目录（配置/任务/历史/缓存）迁移到指定目录。会搬文件，必须显式 confirm:true。"""
+    b = body or {}
+    directory = str(b.get("directory") or "").strip()
+    if not directory:
+        return _fail(400, "directory 不能为空", "推荐先用 GET /api/automation/fs 选一个真实存在的目录")
+    if not b.get("confirm"):
+        return _fail(400, "迁移会移动配置/任务/历史/缓存，必须显式传 confirm:true",
+                     "先 GET /api/automation/config 看 storage.current 与 storage.suggested")
+    try:
+        r = _jsonish(api.migrate_data_storage(directory, bool(b.get("replace_existing")))) or {}
+    except Exception as e:
+        return _fail(500, "迁移失败: %s" % str(e)[:200], "看 GET /api/automation/logs?source=error")
+    if not isinstance(r, dict):
+        r = {"ok": True, "raw": r}
+    return (200 if r.get("ok") else 400), r
+
+
 # ---------------------------------------------------------------- 分发
 
 def dispatch(path, method, query, body, api, ctx):
@@ -1215,6 +1525,8 @@ def dispatch(path, method, query, body, api, ctx):
             return _images_state(api, ctx, q)
         if path == "/api/automation/storage":
             return _storage(api, ctx)
+        if path == "/api/automation/fs":
+            return _fs(api, ctx, q)
         if path == "/api/automation/model":
             return _model_detail(api, ctx, q)
         if path == "/api/automation/extension":
@@ -1224,6 +1536,8 @@ def dispatch(path, method, query, body, api, ctx):
         return None
 
     if m == "POST":
+        if path == "/api/automation/batch":
+            return _batch(api, ctx, body)
         if path == "/api/automation/tasks":
             return _tasks_action(api, ctx, body)
         if path == "/api/automation/plan":
@@ -1244,6 +1558,12 @@ def dispatch(path, method, query, body, api, ctx):
             return _images_download(api, ctx, body)
         if path == "/api/automation/workflow/analyze":
             return _workflow(api, ctx, body)
+        if path == "/api/automation/move":
+            return _move(api, ctx, body)
+        if path == "/api/automation/storage/migrate":
+            return _storage_migrate(api, ctx, body)
+        if path == "/api/automation/rename":
+            return _rename(api, ctx, body)
         if path == "/api/automation/config":
             return ctx["save_config"](body)
         return None

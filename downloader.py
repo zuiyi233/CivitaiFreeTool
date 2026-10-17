@@ -190,6 +190,25 @@ class Downloader:
         except OSError:
             task.partial_cleanup_error = '临时文件清理失败（占用或权限），请在所在目录核对'
 
+    @staticmethod
+    def _promote_part(tmp, dest, attempts=4):
+        """把 .part 改名成最终文件；Windows 上被杀软/资源管理器短占会失败，退避重试几次。
+
+        返回 (是否成功, 最后一次的 OSError)。**调用方必须据此决定状态**：改名没成功就不能
+        报 DONE —— 否则队列显示「已完成」，目录里却只有一个 .part，用户按最终名找不到文件。
+        """
+        delay = 0.4
+        last = None
+        for _ in range(max(1, int(attempts))):
+            try:
+                os.replace(tmp, dest)
+                return True, None
+            except OSError as e:
+                last = e
+                time.sleep(delay)
+                delay *= 2
+        return False, last
+
     def pause_task(self, task):
         ev = self._pause_events.get(task.id)
         if ev:
@@ -542,10 +561,14 @@ class Downloader:
                     pass
             if cancel_ev.is_set() or pause_ev.is_set():
                 task.status=ST_CANCELED if cancel_ev.is_set() else ST_PAUSED;self._notify(task);return
-            try:
-                os.replace(tmp, dest)
-            except OSError:
-                pass
+            ok, err = self._promote_part(tmp, dest)
+            if not ok:
+                task.status = ST_ERROR
+                task.error = ("文件已下载完但改名失败（目标被占用或只读）：%s。完整内容在 %s；"
+                              "关闭占用该文件的程序后点「重试」即可，无需重新下载。"
+                              % (err, os.path.basename(tmp)))
+                self._notify(task)
+                return
             task.status = ST_DONE
             task.progress = 100.0
             task.speed = 0.0
@@ -636,15 +659,22 @@ class Downloader:
                 task.verification_status = "verified" if task.actual_sha256 == task.expected_sha256.strip().lower() else "mismatch"
                 if task.verification_status == "mismatch":
                     # 校验失败：保留文件（可能是 C 站 CDN 哈希不匹配而非损坏），重命名为最终名
-                    try:
-                        os.replace(tmp, dest)
-                    except OSError:
-                        pass
+                    ok, err = self._promote_part(tmp, dest)
                     task.status = ST_ERROR
-                    task.error = "SHA256 校验失败（文件已保留；可能为 C 站哈希不匹配或下载不完整）"
+                    task.error = ("SHA256 校验失败（文件已保留；可能为 C 站哈希不匹配或下载不完整）"
+                                  if ok else
+                                  "SHA256 校验失败，且保留文件改名失败（%s）；完整内容在 %s"
+                                  % (err, os.path.basename(tmp)))
                     self._notify(task)
                     return
-            os.replace(tmp, dest)
+            ok, err = self._promote_part(tmp, dest)
+            if not ok:
+                task.status = ST_ERROR
+                task.error = ("文件已下载完但改名失败（目标被占用或只读）：%s。完整内容在 %s；"
+                              "关闭占用该文件的程序后点「重试」即可，无需重新下载。"
+                              % (err, os.path.basename(tmp)))
+                self._notify(task)
+                return
             task.status = ST_DONE
             task.progress = 100.0
             task.speed = 0.0

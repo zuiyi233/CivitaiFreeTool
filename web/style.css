@@ -1779,3 +1779,16 @@ html[data-theme^="dark"] { color-scheme: dark; }
 .lib-dt-pos { padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface2); font-size: calc(12px * var(--type-scale, 1)); color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; cursor: help; }
 .lib-dt-nav { display: inline-flex; align-items: center; justify-content: center; font-size: calc(16px * var(--type-scale, 1)); }
 .lib-dt-nav:disabled { background: var(--surface2); border-color: var(--border); color: var(--text-dim); cursor: not-allowed; }
+
+/* 收尾未完成标记：下载本体成功、但元数据/封面/视频等后处理失败时挂在状态列 */
+.pp-warn {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: calc(11px * var(--type-scale, 1));
+  background: var(--warn, #d29922);
+  color: #111;
+  font-weight: 700;
+  cursor: help;
+}

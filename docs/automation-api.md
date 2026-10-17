@@ -13,6 +13,39 @@ curl http://127.0.0.1:47531/api/automation
 返回端点表、可写配置键、任务状态词表、数据目录、RPC 方法数量。**这是给 AI 的自描述入口**，
 字段与本文一致；新增端点会同步出现在这里。
 
+### 一次调用做多件事：`POST /api/automation/batch`
+
+```json
+{"calls": [
+  {"method": "GET", "path": "/api/automation/tasks",
+   "query": {"limit": 5, "fields": "id,status,progress"}},
+  {"method": "POST", "path": "/api/automation/plan", "body": {"url": "..."}}
+ ],
+ "stop_on_error": false}
+```
+
+- 最多 50 条，**按顺序**执行；只允许本层端点（不能嵌套 batch，也不能改走 `/api/rpc`）。
+- **batch 本身永远返回 200**：成败看 `results[].ok` 与 `results[].http_status`。
+  这样一条失败不会让整个请求看起来「请求都没到」。
+- `stop_on_error=true` 时遇到第一个 `http_status >= 400` 就停，`executed < requested`。
+- 典型用法：`state + tasks + storage` 合成一次请求；或「plan → download → verify」串成一条。
+
+### 只回你要的字段：`fields=`
+
+所有列表/详情端点都接受 `fields=id,status,info.routed_dir`（逗号分隔，支持点号路径）：
+
+- 列表端点（`tasks` / `items` / `rows` / `images` / `files`）只裁剪条目，
+  `ok` / `count` / `waited_s` / `timed_out` 等元信息永远保留；
+- 非列表端点保留 `ok` + 你点名的字段（`model` 详情可用 `detail.name` 这种路径）；
+- `fields=*` 或不传 = 不裁剪。
+
+存在的理由是省 token：`/library?limit=200` 的完整行里有大量 AI 用不上的键。
+
+### 失败一定带下一步：`hint`
+
+自动化层的错误响应统一为 `{ok:false, msg, hint?}`：`msg` 说清哪里不对，
+`hint` 说清下一步该做什么（换参数 / 看日志 / 先跑预览）。AI 不需要靠猜来决定重试还是放弃。
+
 ### `GET /api/automation/schema`（自描述）
 
 AI 不必猜配置值形状、也不必读源码：
@@ -170,6 +203,11 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 | `check-updates` | 检查 C 站更新 | `force:true` 绕过 24h 缓存 |
 | `update` | 把「有新版」的模型加入下载队列 | 先跑 `check-updates` |
 | `sync-local` | 按本地文件清理失效更新记录 | 同步执行，最长约 2 分钟 |
+| `organize` | 按 `target_env` / `organize_mode` 把模型整理进分类目录 | 需要先选目标环境 |
+| `rename-c` | 批量重命名为 C 站模型名 | 连附属文件一起改 |
+| `rename-preview` | 只算不改：预览批量重命名的新旧名 | 同步返回 `items[]` |
+| `translate-descs` | 把模型简介翻译成中文 | 需要百度翻译密钥 |
+| `cleanup` | 删除元数据/封面/示例图 | **不可恢复，需 `confirm:true`** |
 
 参数：`paths`（模型文件绝对路径数组，省略=全部）、`wait=1`（默认，阻塞到 `running=false`）、
 `timeout`。返回 `{ok, op, start, progress, waited_s, timed_out}`。
@@ -192,6 +230,40 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 落点与磁盘：`download_dir` / `download_target_dir` / `models_dir` / `comfyui_models_root`
 的存在性、可写性、剩余空间；`type_dirs` 列出 ComfyUI 核心类型目录哪些已存在。
 用于回答「为什么没分流」——分流只写已存在的类型目录，不新建。
+
+### `POST /api/automation/move`
+移动模型或其落点，三种目标任选其一：
+
+```json
+{"path": "D:/models/loras/a.safetensors", "dest_dir": "D:/ComfyUI/models/loras"}
+{"task_id": "<下载任务 id>", "dest_dir": "..."}
+{"history_id": "<历史记录 id>", "dest_dir": "..."}
+```
+
+`dest_dir` 必须是**已存在的绝对目录**：不代建是刻意的（凭空造目录 ComfyUI 扫不到）。
+正在下载的文件会被拒绝（先暂停）；目标有同名模型/附属文件时整条拒绝，绝不覆盖。
+
+### `POST /api/automation/rename`
+- 单文件：`{"path": "...", "new_name": "新名字"}` —— 主文件与附属（info/json/封面/评论）同步改名。
+- 批量：`{"paths": ["..."], "preview": true}` 先看新旧名（只算不改）；
+  去掉 `preview` 后走后台批量改名，用 `GET /api/automation/library/op?op=rename-c` 看进度。
+
+### `GET /api/automation/fs`
+只读目录浏览，解决「原生 pick_dir 必须有人点」的缺口：
+
+- 不带 `path`：列盘符（Windows）+ 家目录 + `download_dir`；
+- 带 `path`：列该目录一层，默认只回目录（`dirs_only=0` 才含文件），最多 500 条，带 `parent`；
+- **只回名字与路径，不读文件内容、不返回大小**；目录不存在返回 404 + `hint`。
+
+### `POST /api/automation/storage/migrate`
+把数据目录（配置/任务/历史/缓存）迁到 `directory`，**必须 `confirm:true`**；
+`replace_existing:true` 表示允许覆盖目标已有数据。下载/扫描/整理进行中会被拒绝（先停掉）。
+
+### 收尾失败可见：`postprocess_errors`
+下载本体完成、但元数据/封面/视频/旧版清理失败时，任务行会带
+`postprocess_errors: [{stage, error}]`（同时写进 `error.log`）。
+下载页状态列显示「收尾未完成」，自动化可以直接据此决定要不要重跑
+`library/op {op:"verify"}` 或 `images/download`——**不再出现「显示已完成、库里却没有信息」的静默状态**。
 
 ## 4. 校验
 
