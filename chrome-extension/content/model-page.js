@@ -69,6 +69,22 @@
     } catch (_) { return '该模型版本已归档过，确定重新下载？'; }
   }
 
+  /* ============ 自动化开关（供 AI/无头流程免交互） ============ */
+
+  // 读 cft_config_v1.autoConfirmDuplicate；storage 不可用/读失败一律按 false（保持原生确认）
+  function readAutoConfirm() {
+    return new Promise(function (resolve) {
+      try {
+        var st = (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) || null;
+        if (!st || typeof st.get !== 'function') { resolve(false); return; }
+        st.get('cft_config_v1').then(function (raw) {
+          var cfg = raw && raw.cft_config_v1;
+          resolve(!!(cfg && cfg.autoConfirmDuplicate === true));
+        }).catch(function () { resolve(false); });
+      } catch (_) { resolve(false); }
+    });
+  }
+
   /* ============ pageFetch 纯校验（无 DOM，可在 node 下单测） ============ */
 
   var PAGE_FETCH_HOSTS = ['civitai.com', 'civitai.red'];
@@ -266,6 +282,7 @@
   var btnEls = { btn: null, fill: null, label: null };
   var btnBusy = false;
   var restoreTimer = 0;
+  var busyWatch = 0;        // 首帧看门狗：进忙态后迟迟没有 progress/archiveDone 就自己解套（见 armBusyWatch）
   var btnMounted = false;   // 按钮当前是否在 DOM 里（由 body childList 观察者维护）
   var handledPath = null;   // 上次处理完（挂载或确认卸载）的 pathname：路由没变则 ensure 直接早退
 
@@ -297,9 +314,34 @@
     restoreTimer = 0;
   }
 
+  function clearBusyWatch() {
+    try { if (busyWatch) clearTimeout(busyWatch); } catch (_) {}
+    busyWatch = 0;
+  }
+
+  // 首帧看门狗：消息链路一旦断在 offscreen/BG 之间，页面会永远停在「准备归档…」——
+  // 用户看到的只是一个死掉的按钮，没有任何原因。这里在进入忙态时上表，收到首条 progress
+  // 即撤表（长下载期间进度可能稀疏，所以只盯首帧，不用固定总时长）。
+  var BUSY_FIRST_FRAME_MS = 45000;
+  function armBusyWatch() {
+    clearBusyWatch();
+    busyWatch = setTimeout(function () {
+      busyWatch = 0;
+      if (!btnBusy) return;
+      try { warn('archive first frame timeout'); } catch (_) {}
+      try {
+        var btn = getButton();
+        if (btn) { btn.classList.add('cft-error'); setLabel('✗ 无响应：请重试'); }
+        showToast('归档没有开始：扩展离屏文档未响应，请重试一次', true);
+      } catch (_) {}
+      resetButton();
+    }, BUSY_FIRST_FRAME_MS);
+  }
+
   function resetButton() {
     try {
       clearRestoreTimer();
+      clearBusyWatch();
       btnBusy = false;
       var btn = getButton();
       if (!btn) { setBtnRefs(null); btnMounted = false; handledPath = null; return; } // 按钮被页面摘掉：复位，等下一次路由事件/兜底重挂
@@ -324,12 +366,14 @@
       try { btn.disabled = true; } catch (_) {}
       setFill(0);
       setLabel(text || '准备归档…');
+      armBusyWatch();
     } catch (e) { warn('enterBusyState failed', e); }
   }
 
   // progress {percent, text, level}（level==='error' 时按钮标红）
   function applyProgress(p) {
     try {
+      clearBusyWatch();   // 首帧已到，之后按阶段推进，不再用固定时长判死
       var btn = getButton();
       if (!btn) return;
       setBtnRefs(btn);
@@ -352,6 +396,7 @@
       if (!btn) return;
       setBtnRefs(btn);
       clearRestoreTimer();
+      clearBusyWatch();
       btn.classList.remove('cft-archiving');
       try { btn.disabled = true; } catch (_) {}
       if (r && r.ok) {
@@ -622,12 +667,20 @@
           return true; // 异步响应
         }
         case 'askArchiveConfirm': {
-          var proceed = false;
-          try {
-            if (typeof confirm === 'function') proceed = confirm(buildArchiveConfirmText(payload.record));
-          } catch (e) { warn('confirm failed', e); }
-          answer('offscreen', 'archiveConfirm', { cid: payload.cid, proceed: !!proceed }, sendResponse);
-          return;
+          var cid0 = payload.cid;
+          var record = payload.record;
+          // 自动化开关（cft_config_v1.autoConfirmDuplicate）：原生 confirm 会卡住任何无人值守
+          // 流程（自动化/无头环境默认 dismiss），开启后直接按「继续」处理，其余行为不变。
+          readAutoConfirm().then(function (auto) {
+            var proceed = auto === true;
+            if (!proceed) {
+              try {
+                if (typeof confirm === 'function') proceed = confirm(buildArchiveConfirmText(record));
+              } catch (e) { warn('confirm failed', e); }
+            }
+            answer('offscreen', 'archiveConfirm', { cid: cid0, proceed: !!proceed }, sendResponse);
+          });
+          return true; // 异步响应（要等 storage 读回来）
         }
         case 'requestDomComments': {
           var results = collectDomComments();

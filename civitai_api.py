@@ -175,7 +175,13 @@ class CivitaiAPI:
         self.opener = build_opener(proxy, verify)
         # tRPC 的站点根：默认与公开 API 同一个 host（civitai.com）。
         # 只做 https + 无账号信息的裸 origin，绝不允许把 path/query 拼进来（build_trpc_url 会校验）。
-        self.site_base = _normalize_site_base(site_base) or SITE_BASE
+        # 公开 API 与 tRPC 共用同一个站点根：设置里的 site_domain 是 civitai.red 时，
+        # 公开 API 也必须打到 .red —— 硬编码 civitai.com 会在「只有镜像站可达」的网络里
+        # 整条下载链路超时（实测 civitai.com 15s 无响应、civitai.red 2s 正常）。
+        explicit = _normalize_site_base(site_base)
+        self._site_explicit = bool(explicit)
+        self.site_base = explicit or SITE_BASE
+        self.api_base = self.site_base + "/api/v1"
         self.trpc_base = self.site_base + "/api/trpc"
         self._lock = threading.Lock()
 
@@ -209,7 +215,7 @@ class CivitaiAPI:
                 raise CivitaiError(str(err))
 
     def _get(self, path, params=None, raw=False, retries=3):
-        url = API_BASE + path
+        url = self.api_base + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
         return self._request(url, raw=raw, retries=retries)
@@ -485,6 +491,12 @@ class CivitaiAPI:
             u = urllib.parse.urlsplit(url)
             if u.scheme != "https" or u.hostname not in ("civitai.com", "civitai.red") or not u.path.startswith("/api/download/models/"):
                 raise CivitaiError("文件下载链接不属于 Civitai 官方下载端点")
+            # 同一套下载端点两个域名都提供，但网络里可能只有一个可达：**显式配置了站点根**时
+            # 把 host 对齐过去，绝不改动 path/query（fileId 等选择器必须逐字保留）。
+            # 未配置时保持 API 返回的原样（历史行为，不做无依据的改写）。
+            want = urllib.parse.urlsplit(self.site_base)
+            if self._site_explicit and want.hostname and u.hostname != want.hostname:
+                u = u._replace(scheme=want.scheme, netloc=want.netloc)
             query = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
             if file.get("id") is not None:
                 existing = [value for key, value in query if key.lower() == "fileid"]
@@ -492,8 +504,9 @@ class CivitaiAPI:
                     raise CivitaiError("文件下载链接与文件 ID 不一致")
                 if not existing:
                     query.append(("fileId", str(file["id"])))
-                    url = urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, urllib.parse.urlencode(query), u.fragment))
-            return url
+            # 总是从 u 重建：host 改写（上面的站点根对齐）必须生效，不能只在补 fileId 时才用 u
+            return urllib.parse.urlunsplit((u.scheme, u.netloc, u.path,
+                                            urllib.parse.urlencode(query), u.fragment))
         if file.get("id") is not None:
             return self.build_download_url(version["id"], file["id"])
         files = self.model_files(version)
@@ -503,7 +516,7 @@ class CivitaiAPI:
 
     def build_download_url(self, version_id, file_id=None):
         # Current website uses fileId for exact variants, including GGUF/quantized files.
-        url = "https://civitai.com/api/download/models/%s" % version_id
+        url = self.site_base + "/api/download/models/%s" % version_id
         return url + "?" + urllib.parse.urlencode({"fileId": file_id}) if file_id is not None else url
 
 

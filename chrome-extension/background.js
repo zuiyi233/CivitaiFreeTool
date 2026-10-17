@@ -165,7 +165,7 @@ async function ensureOffscreen() {
   if (_offscreenPromise) return _offscreenPromise;
   _offscreenPromise = (async () => {
     try {
-      if (await hasOffscreen()) return true;
+      if (await hasOffscreen()) return await waitOffscreenReady();
       try {
         await chrome.offscreen.createDocument({
           url: OFFSCREEN_URL,
@@ -173,15 +173,30 @@ async function ensureOffscreen() {
           justification: '归档长任务需要 DOM 解析与持续网络/写盘，SW 无 DOM 且会被休眠',
         });
       } catch (e) {
-        if (await hasOffscreen()) return true; // 已存在竞态（并发/残留）：视为成功
-        throw e;
+        if (!(await hasOffscreen())) throw e; // 已存在竞态（并发/残留）：继续等就绪
       }
-      return true;
+      // createDocument 只保证文档已创建，模块里的 onMessage 监听可能还没注册。
+      // 不握手就直接发 archive，消息会被静默丢弃（sendMessage 的 .catch 吞掉），
+      // 页面按钮永远停在「准备归档…」—— 实测复现过。
+      return await waitOffscreenReady();
     } finally {
       _offscreenPromise = null;
     }
   })();
   return _offscreenPromise;
+}
+
+// 等 offscreen 模块真正能应答 ping；超时抛错，让上层把「离屏文档未就绪」明确报给用户
+async function waitOffscreenReady(timeoutMs = 4000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      const r = await chrome.runtime.sendMessage({ __cft: true, to: 'offscreen', type: 'ping', payload: {} });
+      if (r && r.ready) return true;
+    } catch (_) { /* 监听还没注册：继续等 */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error('离屏文档未就绪（模块加载超时）');
 }
 
 // ---- getArchiveConfig（探活 2.5s + 认人 + 读软件归档配置，缓存 30s） ----
@@ -591,6 +606,27 @@ ext.runtime.onMessage.addListener((msg, sender, respond) => {
           break;
         case 'checkLibrary':
           respond(await handleCheckLibrary(payload));
+          break;
+        case 'sendContent': {
+          // offscreen 文档没有 chrome.tabs，content 消息统一由这里代发（见 archive-worker.sendContent）
+          const tabId = Number(payload && payload.tabId);
+          if (!Number.isFinite(tabId)) { respond({ ok: false, msg: '无效的标签页' }); break; }
+          try {
+            respond(await chrome.tabs.sendMessage(tabId, {
+              __cft: true, to: 'content',
+              type: (payload && payload.type) || '', payload: (payload && payload.payload) || {},
+            }));
+          } catch (e) {
+            respond({ ok: false, msg: String((e && e.message) || e) });
+          }
+          break;
+        }
+        case 'log':
+          // offscreen 无 chrome.storage，日志由这里落到扩展存储（诊断用）
+          bgLog((payload && payload.lvl) || 'info',
+                '[offscreen] ' + String((payload && payload.msg) || ''),
+                (payload && payload.err) || undefined);
+          respond({ ok: true });
           break;
         case 'notifyArchiveDone':
           respond(await handleNotifyArchiveDone(payload));

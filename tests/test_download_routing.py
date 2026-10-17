@@ -251,6 +251,28 @@ def test_lora_routes_into_nested_bundle_dir(tmp_path):
     assert make_downloader(a.cfg)._resolve_dest(task) == expect     # 压过 download_target_dir
 
 
+def test_download_url_derives_model_id_from_version(tmp_path):
+    """扩展归档提交的是 /api/download/models/<vid>：URL 里没有 modelId，但版本载荷自带。
+
+    不补这一步，model.type 永远拿不到，类型分流必然判成「判不出」并落回 dest_subdir
+    —— 实测归档把 20 多个配图写进了 D:\\C站\\<模型名_版本> 而不是 ComfyUI 的 loras\\<名>。
+    """
+    root = comfy_root(tmp_path, "loras")
+    (tmp_path / "global").mkdir(parents=True, exist_ok=True)
+    a = make_app(tmp_path, route_by_type=True, comfyui_models_root=root)
+    a.api.resolve_url = Mock(return_value=(None, 123))       # 下载链接只解析出版本号
+    a.api.get_model = Mock(return_value={"id": 456, "name": "Demo Model", "type": "LORA"})
+    version = dict(version_for([LORA_FILE]), modelId=456)
+    a.api.get_model_version = Mock(return_value=version)
+    item = a._enqueue_one("https://civitai.red/api/download/models/123?fileId=1",
+                          _version=dict(version, files=copy_files(version["files"])),
+                          _file=version["files"][0])
+    assert item["ok"] and item.get("routed") is True, item
+    assert item["dest_dir"].startswith(os.path.join(root, "loras")), item["dest_dir"]
+    assert item["bundle"], "分流与令牌必须成对出现"
+    assert a.api.get_model.call_args.args[0] == "456", "必须用版本载荷里的 modelId 回查模型"
+
+
 def test_checkpoint_header_splits_checkpoints_and_diffusion_models(tmp_path):
     root = comfy_root(tmp_path, "checkpoints", "diffusion_models")
     a = make_app(tmp_path, route_by_type=True, comfyui_models_root=root)

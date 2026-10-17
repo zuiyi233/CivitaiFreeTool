@@ -14,6 +14,9 @@ const CONFIG_DEFAULTS = {
     badgeEnabled: true,
     globalConcurrency: 4,       // 写盘通道并发（chrome.downloads / 软件写盘）
     fallbackDirPrefix: 'CivitaiArchive',  // 降级 downloads 时的子目录前缀
+    // 自动化：重复归档不再弹原生 confirm（无人值守/无头环境默认 dismiss，会直接取消归档）。
+    // 默认 false 保持人工确认；AI 调试时置 true 即可全程免交互。
+    autoConfirmDuplicate: false,
 };
 const CONFIG_STORAGE_KEY = 'cft_config_v1';
 

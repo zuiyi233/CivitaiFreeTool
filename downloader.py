@@ -152,12 +152,25 @@ class Downloader:
     def _cleanup_removed_part(self, task):
         """Called under _lock after the writer closes. Only unlink this task's owned .part."""
         path = getattr(task, '_partial_path', None)
-        if not path:
-            if task.dest_dir and os.path.basename(task.filename) == task.filename and os.path.isfile(os.path.join(task.dest_dir,task.filename)+'.part'):
-                task.partial_cleanup_error = '临时文件无此任务的归属记录，已保留'
+        if not task.dest_dir:
             return
         expected = os.path.abspath(os.path.join(task.dest_dir, task.filename)) + '.part'
-        if os.path.basename(task.filename) != task.filename or os.path.normcase(path) != os.path.normcase(expected):
+        if os.path.basename(task.filename) != task.filename:
+            task.partial_cleanup_error = '临时文件路径已变化，未删除'
+            return
+        if not path:
+            # 没登记归属的孤儿 .part：只清理「0 字节」这一种。任务刚被认领、写入端还没赋 _partial_path
+            # 就被移除时，会留下一个 0 字节壳体（实测「批量提交后立刻取消」必现）。
+            # 非空的一律保留 —— 那是别人的续传数据，宁可留垃圾也不误删。
+            try:
+                if not os.path.isfile(expected) or os.path.islink(expected) or os.path.getsize(expected) != 0:
+                    if os.path.isfile(expected) and not os.path.islink(expected):
+                        task.partial_cleanup_error = '临时文件无此任务的归属记录，已保留'
+                    return
+            except OSError:
+                return
+            path = expected
+        if os.path.normcase(path) != os.path.normcase(expected):
             task.partial_cleanup_error = '临时文件路径已变化，未删除'
             return
         norm = os.path.normcase(os.path.abspath(path[:-5]))

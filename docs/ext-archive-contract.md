@@ -134,7 +134,23 @@ SFW 图 145676249 有完整 meta）。**丢的是登录上下文，不是接口*
   被「通配 ACAO + 凭据」规则拦下时自动降级 `credentials:'omit'` 重试一次，最坏等于改造前行为）。
   产物文本要写清当次实际通道；"匿名直连拿到 0 条"不能写成"这个模型没有评论"。
 
-### 2.2 C 站内部接口的实测入参/出参（2026-10-16 复测）
+### 2.2 offscreen 文档的 API 边界（硬约束）
+
+**offscreen 文档只暴露 `chrome.runtime`**：实测 Edge 155 里 `chrome.tabs` 与 `chrome.storage`
+都是 `undefined`（Chrome 同此设计）。因此：
+
+- offscreen → content 的消息**必须**经 background 代发：`sendBg('sendContent', {tabId, type, payload})`，
+  bg 用 `chrome.tabs.sendMessage` 投递并把 content 的应答原样返回。直连 `chrome.tabs.sendMessage`
+  会在第一次 `reportProgress` 时抛 `TypeError`，整条归档链路中断且没有任何日志。
+- `CFT.log` 在 offscreen 里只能留在内存（`_storage()` 返回 null）。`clog` 额外把日志转给
+  `sendBg('log', ...)`，由 bg 落盘，否则线上排障看不到归档阶段。
+- bg 发 `archive` 之前必须等 offscreen 就绪：`createDocument` 只保证文档存在，模块的
+  `onMessage` 可能尚未注册。`ensureOffscreen()` 用 `ping → {ready:true}` 握手（4s 上限），
+  失败要明确报错，绝不能静默丢弃消息。
+- content 侧对「进入忙态后 45s 内没有任何 progress/archiveDone」设首帧看门狗，超时复位按钮
+  并提示重试——消息断链时不能让用户面对一个永远转圈的死按钮。
+
+### 2.3 C 站内部接口的实测入参/出参（2026-10-16 复测）
 
 请求形态：`GET <base>/api/trpc/<procedure>?input=<urlencoded {"json":{...}}>`，带
 `Sec-Fetch-Site: same-origin` + `Origin` + `Referer` 时**不再 401，而是正常 200/400**，

@@ -268,6 +268,117 @@ def page_alive(max_silence=8.0):
     return (time.time() - _last_seen) < max_silence
 
 
+# ---- 自动化接口（AI / 脚本调试用，只读 + 白名单写配置）----
+# 设计目标：把「人肉点界面才能拿到/改到的东西」变成一条 HTTP 调用，省掉截图-点击-轮询。
+# 不新增写盘/下载能力：下载仍走 /api/download，归档仍走 /api/archive/*，这里只做观测与配置。
+AUTOMATION_CONFIG_KEYS = (
+    "route_by_type", "comfyui_models_root", "ask_move_after_download",
+    "multi_file_download", "download_target_dir", "download_dir",
+    "models_dirs", "site_domain", "max_images_per_model", "download_cover",
+    "proxy_enabled", "proxy_address", "ssl_verify",
+    # 影响文件名/目录名与批量吞吐：自动化脚本常需要显式固定这些
+    "download_name_mode", "filename_include_version", "rename_clean_rules",
+    "max_concurrent_downloads", "download_timeout", "download_retry",
+    "gen_metadata", "save_raw_json", "save_translated_json", "auto_translate",
+    "target_env", "organize_mode", "archive_root",
+)
+
+
+def automation_state():
+    """GET /api/automation/state：一条请求拿到「配置 + 任务 + 待选文件 + 界面状态」"""
+    api = _api
+    if api is None:
+        return {"ok": False, "msg": "RPC 未就绪"}
+    cfg = getattr(api, "cfg", None) or {}
+    tasks = []
+    for t in list(getattr(getattr(api, "dl", None), "tasks", []) or [])[-20:]:
+        try:
+            d = t.to_dict()
+        except Exception:
+            continue
+        info = d.get("info") or {}
+        tasks.append({
+            "id": d.get("id"), "filename": d.get("filename"), "status": d.get("status"),
+            "dest_dir": d.get("dest_dir") or "", "routed_dir": info.get("routed_dir") or "",
+            "route_reason": info.get("route_reason") or "",
+            "progress": d.get("progress"), "downloaded": d.get("downloaded"),
+            "total": d.get("total"), "error": d.get("error") or "",
+        })
+    try:
+        pending = api.get_download_file_choice()
+    except Exception:
+        pending = None
+    return {
+        "ok": True, "version": _version,
+        "config": {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS},
+        "pending_file_choice": pending,
+        "tasks": tasks,
+        "ui": dict(_ui_state),
+    }
+
+
+def rpc_methods():
+    """GET /api/rpc/methods：列出 /api/rpc 可调用方法及参数名（AI 不必猜方法名）"""
+    return {"ok": True, "rpc": "POST /api/rpc {method, args:[...]}", "methods": _rpc_method_list()}
+
+
+def _rpc_method_list():
+    api = _api
+    if api is None:
+        return []
+    out = []
+    for name in dir(api):
+        if name.startswith("_") or name in ("pick_dir", "pick_file", "pick_files"):
+            continue
+        fn = getattr(api, name, None)
+        if not callable(fn):
+            continue
+        try:
+            args = list(inspect.signature(fn).parameters)
+        except Exception:
+            args = []
+        out.append({"method": name, "args": args})
+    return out
+
+
+# 浏览器扩展通道的观测（AI 验证「插件到底连没连上、有没有真的提交」）
+_EXT_STATE = {"download_count": 0, "archive_file_count": 0, "archive_done_count": 0,
+              "last_download_at": 0.0, "last_download_origin": "", "last_download_caps": [],
+              "last_download_url": ""}
+
+
+def note_extension_download(origin, caps, url):
+    _EXT_STATE["download_count"] += 1
+    _EXT_STATE["last_download_at"] = time.time()
+    _EXT_STATE["last_download_origin"] = str(origin or "")
+    _EXT_STATE["last_download_caps"] = list(caps or [])
+    _EXT_STATE["last_download_url"] = str(url or "")
+
+
+def note_extension_archive(kind):
+    if kind == "file":
+        _EXT_STATE["archive_file_count"] += 1
+    else:
+        _EXT_STATE["archive_done_count"] += 1
+
+
+def extension_status():
+    last = _EXT_STATE["last_download_at"]
+    return {
+        "download_requests": _EXT_STATE["download_count"],
+        "archive_files_written": _EXT_STATE["archive_file_count"],
+        "archive_done_calls": _EXT_STATE["archive_done_count"],
+        "last_download": ({
+            "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last)),
+            "age_s": round(time.time() - last, 1),
+            "origin": _EXT_STATE["last_download_origin"],
+            "caps": _EXT_STATE["last_download_caps"],
+            "url": _EXT_STATE["last_download_url"],
+        } if last else None),
+        "active_bundle_tokens": len(_bundles),
+    }
+
+
 def port():
     """桥服务端口（未启动返回 0）"""
     return _server.server_port if _server is not None else 0
@@ -512,6 +623,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, d, origin)
         if path == "/api/heartbeat":
             return self._json(200, {"ok": True}, origin)
+        if path == "/api/rpc/methods":
+            return self._json(200, rpc_methods(), origin)
+        if path.startswith("/api/automation"):
+            return self._automation(origin, "GET")
         if path == "/api/archive/config":
             fn = _archive_config_fn
             if fn is None:
@@ -674,6 +789,78 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _automation(self, origin, method):
+        """所有 /api/automation* 请求的统一入口：解析 query/body → automation_api.dispatch
+
+        每次调用记一条事件（AI 自检：请求到没到、耗时多少、状态码），可用
+        GET /api/automation/logs?source=events 取回。
+        """
+        import automation_api
+        split = urlsplit(self.path)
+        path = split.path
+        query = urllib.parse.parse_qs(split.query)
+        body = None
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(min(length, 1 << 20)) if length else b"{}"
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception:
+                return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "msg": "body 必须是 JSON 对象"}, origin)
+        t0 = time.time()
+        try:
+            result = automation_api.dispatch(path, method, query, body, _api, self._automation_ctx())
+        except Exception as e:
+            result = (500, {"ok": False, "msg": "自动化接口异常: %s" % str(e)[:200]})
+        if result is None:
+            result = (404, {"ok": False, "msg": "Not Found"})
+        status, payload = result
+        payload = payload if isinstance(payload, dict) else {"ok": bool(status == 200), "result": payload}
+        automation_api.record_event(method, path, status, (time.time() - t0) * 1000.0,
+                                    payload.get("msg") or ("ok" if payload.get("ok") else ""))
+        return self._json(status, payload, origin)
+
+    def _automation_ctx(self):
+        import config
+        return {
+            "version": _version,
+            "state": automation_state,
+            "extension": extension_status,
+            "config_keys": AUTOMATION_CONFIG_KEYS,
+            "rpc_methods": _rpc_method_list(),
+            "data_dir": getattr(config, "APP_DIR", ""),
+            "error_log": os.path.join(getattr(config, "APP_DIR", ""), "error.log"),
+            "save_config": self._automation_save_config,
+        }
+
+    def _automation_save_config(self, body):
+        """POST /api/automation/config 的实现：只改白名单键，走 Api.save_config
+
+        非法键整条拒绝，不做部分生效——自动化脚本最怕「改了一半」，静默半成功会让后续断言
+        落在错误前提上。body 两种形态都收：{"config": {...}} 或直接 {...}。
+        """
+        api = _api
+        if api is None:
+            return 500, dict(_NOT_READY)
+        b = body or {}
+        patch = b.get("config") if isinstance(b.get("config"), dict) else b
+        if not isinstance(patch, dict) or not patch:
+            return 400, {"ok": False, "msg": "config 必须是非空对象"}
+        bad = sorted(k for k in patch if k not in AUTOMATION_CONFIG_KEYS)
+        if bad:
+            return 400, {"ok": False, "msg": "不允许修改的配置项: " + ", ".join(bad),
+                         "allowed": list(AUTOMATION_CONFIG_KEYS)}
+        try:
+            ok = api.save_config(dict(patch))
+        except Exception as e:
+            return 500, {"ok": False, "msg": "保存失败: %s" % str(e)[:120]}
+        if ok is False:
+            return 500, {"ok": False, "msg": "保存失败（配置未变更）"}
+        cfg = getattr(api, "cfg", None) or {}
+        return 200, {"ok": True, "config": {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS}}
+
     def _rpc(self, origin):
         """浏览器模式通用方法调用：{method, args:[...]} → {result} / {error}"""
         if _api is None:
@@ -749,6 +936,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "msg": str(e)[:200]}, origin)
         if saved is False or saved is None:
             return self._json(400, {"ok": False, "msg": "写入失败"}, origin)
+        note_extension_archive("file")
         return self._json(200, {"ok": True, "path": str(saved)}, origin)
 
     def _handle_archive_done(self, origin):
@@ -772,6 +960,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(500, dict(_NOT_READY), origin)
         if bundle:
             release_bundle(bundle)
+        note_extension_archive("done")
         try:
             fn(dir_name)
         except Exception as e:
@@ -791,6 +980,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._handle_archive_file(origin)
         if path == "/api/archive/done":
             return self._handle_archive_done(origin)
+        if path.startswith("/api/automation"):
+            return self._automation(origin, "POST")
         if path != "/api/download":
             return self._json(404, {"ok": False, "msg": "Not Found"}, origin)
         try:
@@ -807,6 +998,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "msg": "链接不能为空"}, origin)
         if not is_model_url(url):
             return self._json(400, {"ok": False, "msg": "仅支持 Civitai 模型页链接"}, origin)
+        note_extension_download(origin, caps, url)
         fn = _handler
         if fn is None:
             return self._json(500, {"ok": False, "msg": "下载服务未就绪"}, origin)

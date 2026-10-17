@@ -42,6 +42,17 @@ function newCid() {
 
 function clog(lvl, msg, err, ctx) {
   try { CFT.log.log(lvl, 'archive-worker', msg, err, ctx); } catch (_) { /* 日志失败不影响主流程 */ }
+  // offscreen 没有 chrome.storage，CFT.log 只留在本上下文内存里（文档重建即丢）。
+  // 转一份给 bg 落盘，否则线上排障看不到归档阶段。
+  try {
+    if (!(typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local)) {
+      sendBg('log', {
+        lvl: lvl || 'info', mod: 'archive-worker', msg: String(msg || ''),
+        err: err ? String((err && (err.stack || err.message)) || err) : '',
+        ctx: ctx || null,
+      });
+    }
+  } catch (_) { /* 诊断转发失败不影响主流程 */ }
 }
 
 // ---- 消息收发 ----
@@ -66,8 +77,11 @@ function sendBg(type, payload) {
   return chrome.runtime.sendMessage({ __cft: true, to: 'bg', type, payload: payload || {} });
 }
 
+// offscreen 文档只暴露 chrome.runtime（Chrome/Edge 同此限制，实测 Edge 155 的 chrome.tabs 为
+// undefined）。直连 chrome.tabs.sendMessage 会在第一次上报进度时抛 TypeError，整条归档链路中断
+// 且不留日志；content 消息一律交给 background 代发到具体 tab。
 function sendContent(tabId, type, payload) {
-  return chrome.tabs.sendMessage(tabId, { __cft: true, to: 'content', type, payload: payload || {} });
+  return sendBg('sendContent', { tabId, type, payload: payload || {} });
 }
 
 // 请求-答复：payload 自动带 cid；超时或 content 不可达时 resolve(null)（按取消处理）
@@ -1519,6 +1533,11 @@ function handleMessage(msg, sender, sendResponse) {
     // pageFetchResult 与 domComments 同一套 cid 请求-答复：content 侧既走 sendResponse（本函数收不到，
     // 由 askContent 的 sendMessage 链丢弃）也走 runtime 广播（这里消费），resolveCid 先到先得、天然去重
     if (payload.cid != null) resolveCid(payload.cid, payload);
+    return false;
+  }
+  if (type === 'ping') {
+    // bg 的就绪握手：offscreen 模块刚加载完时 onMessage 可能还没注册，bg 靠这个确认可以发任务了
+    try { sendResponse({ ok: true, ready: true }); } catch (_) { /* 忽略 */ }
     return false;
   }
   if (type === 'archive') {

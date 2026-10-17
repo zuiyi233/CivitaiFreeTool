@@ -804,7 +804,8 @@ class Api:
         return civitai_api.CivitaiAPI(
             self.cfg.get("api_key", ""), 20,
             self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None,
-            self.cfg.get("ssl_verify", True))
+            self.cfg.get("ssl_verify", True),
+            site_base=self.cfg.get("site_domain", ""))
 
     # ---------------- 下载完成回调 ----------------
     def _on_dl_update(self, task):
@@ -2444,7 +2445,7 @@ class Api:
                 if cached and now-cached[0]<600:online=cached[1]
                 else:
                     proxy=self.cfg.get('proxy_address') if self.cfg.get('proxy_enabled') else None
-                    client=civitai_api.CivitaiAPI(self.cfg.get('api_key',''),timeout=10,proxy=proxy,verify=self.cfg.get('ssl_verify',True))
+                    client=civitai_api.CivitaiAPI(self.cfg.get('api_key',''),timeout=10,proxy=proxy,verify=self.cfg.get('ssl_verify',True),site_base=self.cfg.get('site_domain',''))
                     try:online=client.get_image_metadata(image_id)
                     except Exception:online={}
                     if len(cache)>=256:cache.pop(next(iter(cache)))
@@ -3052,6 +3053,13 @@ class Api:
                     return item
                 version_id = vs[0]["id"]
             version = _version if _version is not None else api.get_model_version(version_id)
+            # 下载链接（/api/download/models/<vid>?fileId=...）解析不出 modelId，但版本载荷自带
+            # modelId。不补这一步，归档链路（扩展提交的是 downloadUrl）就永远拿不到 model.type，
+            # 类型分流必然判成「判不出」而落回 dest_subdir —— 实测复现过。
+            if not model_id:
+                mid = version.get("modelId")
+                if isinstance(mid, (int, str)) and str(mid).strip().isdigit():
+                    model_id = str(mid).strip()
             if _file is None:
                 from urllib.parse import urlsplit, parse_qs
                 query = parse_qs(urlsplit(u).query, keep_blank_values=True)

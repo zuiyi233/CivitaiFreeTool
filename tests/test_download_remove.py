@@ -33,6 +33,16 @@ class RemoveDownloadTests(unittest.TestCase):
         self.part.write_bytes(b'unrelated old data');self.d.remove_task(self.t)
         self.assertEqual(self.part.read_bytes(),b'unrelated old data')
 
+    def test_unowned_empty_part_shell_removed(self):
+        """刚认领就被移除的任务会留下 0 字节 .part 壳体（没有归属记录），必须清掉。"""
+        self.part.write_bytes(b'');self.d.remove_task(self.t)
+        self.assertFalse(self.part.exists());self.assertTrue(self.dest.exists())
+
+    def test_unowned_empty_part_kept_while_other_writer_active(self):
+        self.part.write_bytes(b'');self.d._active_ids.add('other');self.d._active_paths['other']=os.path.normcase(str(self.dest.resolve()))
+        self.d.remove_task(self.t)
+        self.assertTrue(self.part.exists());self.assertIn('其他写入',self.t.partial_cleanup_error)
+
     def test_shared_part_protected(self):
         self.own_partial();other=downloader.DownloadTask('https://example.invalid/file',str(self.root),self.t.filename);self.d.add_task(other)
         self.d.remove_task(self.t);self.assertTrue(self.part.exists());self.assertIn('其他任务',self.t.partial_cleanup_error)

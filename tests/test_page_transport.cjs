@@ -68,6 +68,16 @@ function offscreen() {
           for (const f of senders['runtime.onMessage'] || []) f(m, { id: 'test-id' }, () => {});
           return undefined;
         }
+        // offscreen 没有 chrome.tabs（真实环境实测 Edge/Chrome 只暴露 chrome.runtime），
+        // content 消息由 background 代发；这里按同一契约转发到假标签页。
+        if (m && m.__cft === true && m.to === 'bg' && m.type === 'sendContent') {
+          const p = m.payload || {};
+          const out = { __cft: true, to: 'content', type: p.type, payload: p.payload || {} };
+          log.pageFetch.push({ tabId: p.tabId, msg: out });
+          const h = onTabMessage;
+          if (!h) return new Promise(() => {});   // 不应答：复现「两条应答路全断」
+          return h(Number(p.tabId), out);
+        }
         const t = String((m && m.type) || '');
         if (t === 'checkLibrary') return { found: false, paths: [] };
         if (t === 'writeFile') return { ok: true, saved: 'software', channel: 'software' };
@@ -75,15 +85,7 @@ function offscreen() {
       },
     }),
     storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } },
-    tabs: mkNs('tabs', {
-      query: async () => [],
-      sendMessage: async (tabId, msg) => {
-        log.pageFetch.push({ tabId, msg });
-        const h = onTabMessage;
-        if (!h) return new Promise(() => {});   // 不应答：复现「两条应答路全断」
-        return h(tabId, msg);
-      },
-    }),
+    // 刻意不提供 tabs：offscreen 文档拿不到 chrome.tabs，回归到直连会立刻抛 TypeError
     action: mkNs('action'), offscreen: mkNs('offscreen'), downloads: mkNs('downloads'),
     contextMenus: mkNs('contextMenus'), windows: mkNs('windows'), sidePanel: mkNs('sidePanel'),
     alarms: mkNs('alarms'), notifications: mkNs('notifications'),
@@ -360,7 +362,12 @@ function offscreen() {
         id: 'test-id', lastError: undefined,
         getContexts: async () => [{ url: 'offscreen' }],
         getURL: (p) => 'chrome-extension://test-id/' + p,
-        sendMessage: async (m) => { out.push(m); return { ok: true, msg: '已转发' }; },
+        sendMessage: async (m) => {
+          out.push(m);
+          // bg 的就绪握手：offscreen 模块真正能应答 ping 才发任务（见 ensureOffscreen）
+          if (m && m.__cft === true && m.to === 'offscreen' && m.type === 'ping') return { ok: true, ready: true };
+          return { ok: true, msg: '已转发' };
+        },
       }),
       storage: { local: { get: async () => ({}), set: async () => {} } },
       action: mkNs('action'), tabs: mkNs('tabs', { query: async () => [] }),

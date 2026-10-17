@@ -1259,5 +1259,94 @@ class BundleCapsTest(unittest.TestCase):
         self.assertIsNone(browser_bridge.resolve_bundle(token), "done 后令牌应释放")
 
 
+class _AutoTask:
+    def to_dict(self):
+        return {"id": "t1", "filename": "a.safetensors", "status": "done",
+                "dest_dir": "D:/out",
+                "info": {"routed_dir": "D:/models/loras/a",
+                         "route_reason": "按 C 站模型类型 LORA 落 loras"},
+                "progress": 100.0, "downloaded": 10, "total": 10, "error": ""}
+
+
+class _AutoDL:
+    tasks = [_AutoTask()]
+
+
+class _AutoApi:
+    """自动化接口的最小替身：配置 + 任务 + 待选文件，不碰网络/磁盘"""
+    def __init__(self):
+        self.cfg = {"route_by_type": True, "comfyui_models_root": "D:/models",
+                    "ask_move_after_download": False, "multi_file_download": "ask",
+                    "download_target_dir": "", "download_dir": "D:/out",
+                    "models_dirs": ["D:/out"], "site_domain": "civitai.red",
+                    "max_images_per_model": 5, "download_cover": True,
+                    "api_key": "secret-should-not-leak"}
+        self.dl = _AutoDL()
+
+    def get_download_file_choice(self):
+        return {"id": "choice-1", "title": "t", "files": [], "paused": False,
+                "shown": True, "seconds": 5}
+
+    def save_config(self, patch):
+        self.cfg.update(patch)
+        return True
+
+
+class AutomationApiTest(unittest.TestCase):
+    """AI/脚本调试接口：状态一条拿全、方法可发现、配置只放行白名单键"""
+    @classmethod
+    def setUpClass(cls):
+        boot_bridge()
+        cls._prev = browser_bridge._api
+        cls.api = _AutoApi()
+        browser_bridge.set_api(cls.api)
+
+    @classmethod
+    def tearDownClass(cls):
+        browser_bridge._api = cls._prev
+
+    def test_state_exposes_config_tasks_and_choice(self):
+        st, d = req("/api/automation/state")
+        self.assertEqual(st, 200)
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["config"]["route_by_type"], True)
+        self.assertNotIn("api_key", d["config"], "自动化状态绝不能回传密钥")
+        self.assertEqual(d["tasks"][0]["routed_dir"], "D:/models/loras/a")
+        self.assertEqual(d["pending_file_choice"]["id"], "choice-1")
+
+    def test_rpc_methods_discoverable(self):
+        st, d = req("/api/rpc/methods")
+        self.assertEqual(st, 200)
+        names = {m["method"] for m in d["methods"]}
+        self.assertIn("save_config", names)
+        self.assertIn("get_download_file_choice", names)
+        self.assertNotIn("pick_file", names, "系统选择框类方法不能暴露给 RPC")
+        self.assertFalse(any(n.startswith("_") for n in names))
+
+    def test_config_whitelist_applies(self):
+        st, d = req("/api/automation/config", "POST",
+                    {"config": {"ask_move_after_download": True}},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 200, d)
+        self.assertTrue(d["ok"])
+        self.assertEqual(self.api.cfg["ask_move_after_download"], True)
+        self.assertTrue(d["config"]["ask_move_after_download"])
+
+    def test_config_rejects_unknown_key_atomically(self):
+        before = self.api.cfg["route_by_type"]
+        st, d = req("/api/automation/config", "POST",
+                    {"config": {"route_by_type": False, "api_key": "x"}},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400)
+        self.assertFalse(d["ok"])
+        self.assertIn("api_key", d["msg"])
+        self.assertEqual(self.api.cfg["route_by_type"], before, "整条拒绝，不允许半成功")
+
+    def test_config_rejects_foreign_origin(self):
+        st, d = req("/api/automation/config", "POST",
+                    {"config": {"route_by_type": False}}, origin="https://evil.example")
+        self.assertEqual(st, 403)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
