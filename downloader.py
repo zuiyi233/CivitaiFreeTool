@@ -175,6 +175,10 @@ class Downloader:
             return
         norm = os.path.normcase(os.path.abspath(path[:-5]))
         for other in self.tasks:
+            # 只有「还可能在写」的任务才算引用：已完成任务占的是最终文件，不碰 .part。
+            # 不筛状态的话，重复下载一个已存在的模型再移除任务，191MB 的 .part 会永远留下（实测）。
+            if other.status not in (ST_PENDING, ST_DOWNLOADING, ST_PAUSED):
+                continue
             other_path = os.path.abspath(os.path.join(other.dest_dir or self._resolve_dest(other), other.filename))
             if os.path.normcase(other_path) == norm:
                 task.partial_cleanup_error = '临时文件仍被其他任务引用，已保留'

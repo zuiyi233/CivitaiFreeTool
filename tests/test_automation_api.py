@@ -330,6 +330,29 @@ class DispatchTest(unittest.TestCase):
         self.assertTrue(body["verify"]["ok"])
         self.assertFalse(body["timed_out"])
 
+    def test_download_skips_when_target_exists(self):
+        """已下载过的模型不该被再传一遍（实测 284MB 白下 + 覆盖同名文件）。"""
+        dest = os.path.join(self.api.cfg["comfyui_models_root"], "loras", "demo")
+        make_tree(dest)
+        status, body = automation_api.dispatch("/api/automation/download", "POST", {},
+                                               {"url": "https://civitai.red/models/456",
+                                                "wait": True, "timeout": 5}, self.api, ctx(self.api))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body.get("skipped"), "exists", body)
+        self.assertIn("force", body.get("hint") or "")
+        self.assertEqual(self.api.submitted, [], "已存在时绝不能入队")
+
+    def test_download_force_redownloads_existing_target(self):
+        dest = os.path.join(self.api.cfg["comfyui_models_root"], "loras", "demo")
+        make_tree(dest)
+        status, body = automation_api.dispatch("/api/automation/download", "POST", {},
+                                               {"url": "https://civitai.red/models/456",
+                                                "wait": True, "timeout": 5, "force": True},
+                                               self.api, ctx(self.api))
+        self.assertEqual(status, 200, body)
+        self.assertNotEqual(body.get("skipped"), "exists")
+        self.assertEqual(len(self.api.submitted), 1)
+
     def test_tasks_wait_returns_terminal(self):
         self.api.tasks.append({"id": "t1", "filename": "a", "status": "done",
                                "created_at": 1, "dest_dir": "", "routed_dir": "",

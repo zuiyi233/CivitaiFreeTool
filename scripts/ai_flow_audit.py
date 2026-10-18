@@ -110,22 +110,21 @@ class Audit:
                               if pending else "无待选文件"}
 
     def download_gate(self, url):
-        """只提交不等待，确认「能不能入队」，然后立刻移除，避免白下 300MB。"""
-        st, out, ms, _ = http(self.bridge, "/api/automation/download", "POST",
-                              {"url": url, "wait": False, "verify": False}, timeout=120)
-        items = out.get("items") or []
-        ids = [t.get("id") for t in (out.get("task") and [out["task"]] or []) if t.get("id")]
-        st2, tasks, ms2, _ = http(self.bridge, "/api/automation/tasks?limit=5")
-        active = [t["id"] for t in (tasks.get("tasks") or [])
-                  if t.get("status") in ("pending", "downloading", "paused")]
-        removed = 0
-        if active:
-            st3, rm, _, _ = http(self.bridge, "/api/automation/tasks", "POST",
-                                 {"action": "remove", "ids": active})
-            removed = len([r for r in (rm.get("results") or []) if r.get("ok")])
-        ok = st == 200 and bool(items) and all(i.get("ok") for i in items)
+        """检查下载入口的契约，**不提交真实下载**。
+
+        以前这里真的提交一次再删任务：每次审计都拉起一条 284MB 传输，而「提交 → 列表 →
+        移除」之间有竞态，删不掉时就会留下一条「下载中」和几十上百 MB 的 .part（实测踩到）。
+        真实「提交 → 等完 → 校验」由 --e2e 的小模型覆盖，这条只测参数校验与自述。
+        """
+        st, bad, ms, _ = http(self.bridge, "/api/automation/download", "POST", {}, timeout=60)
+        st2, man, ms2, _ = http(self.bridge, "/api/automation")
+        entry = next((e for e in (man.get("endpoints") or [])
+                      if e.get("path") == "/api/automation/download"), {})
+        has_force = "force" in (entry.get("params") or {})
+        ok = st == 400 and bool(bad.get("hint")) and has_force
         return ok, {"ms": ms + ms2,
-                    "note": "入队 %d 条，清理 %d 条（未等待真实传输）" % (len(items), removed)}
+                    "note": "空 body 被拒=%s（带 hint=%s）；入口声明 force=%s（已存在不重下）"
+                            % (st == 400, bool(bad.get("hint")), has_force)}
 
     def live_done_task(self):
         """挑一个「已完成且文件还在」的任务当探针。
@@ -270,10 +269,13 @@ class Audit:
         if not self.keep_e2e:
             removed = self.cleanup_e2e(verify)
             tid = (out.get("task") or {}).get("id")
+            task_gone = True
             if tid:
-                http(self.bridge, "/api/automation/tasks", "POST",
-                     {"action": "remove", "ids": [tid]})
-            cleaned = "；已清理 %d 个测试文件（下载历史仍会留一条记录）" % len(removed)
+                _st, rm, _, _ = http(self.bridge, "/api/automation/tasks", "POST",
+                                     {"action": "remove", "ids": [tid]})
+                task_gone = any(r.get("ok") for r in (rm.get("results") or []))
+            cleaned = "；已清理 %d 个测试文件%s（下载历史仍会留一条记录）" % (
+                len(removed), "" if task_gone else "；⚠ 任务行未移除")
         return ok, {"ms": ms,
                     "note": "%s（%s，%.1fMB）→ %s；ok=%s bundle_ok=%s 等待=%.1fs%s"
                             % (name, model_name, kb / 1024.0,

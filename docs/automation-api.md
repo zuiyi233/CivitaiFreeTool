@@ -165,6 +165,11 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 - `{"urls": ["...", "..."]}`：批量提交（`file_ids` 不能与 `urls` 同用）。
 
 - `caps` 缺省就是 `["bundle"]`：自动化默认开启类型分流，本体与附属文件才会进同一个目录。
+- **目标文件已存在时不会重下**：返回 `{ok:true, skipped:"exists", files:[...]}`（`task` 为 null），
+  `hint` 指向 `force:true`。这是给 AI 兜底的——它看不到界面，直接对已下载过的模型调
+  `/download` 会白传几百 MB 并覆盖同名文件（实测 284MB）。`force:true` 显式要求重下。
+  预判只看单条 `url`/`model_id`；`urls`/`file_ids` 批量不做预判（避免 N 次解析）。
+  分流关闭时算不出落点，也就无从预判，行为与旧版一致。
 - `wait=true`（默认）：阻塞到本次提交产生的**全部**新任务进入终态，返回 `task`（单条）或
   `items`（多条，每条含 `submit`/`task`/`verify`）；`timed_out=true` 表示到点未完成。
 - `verify=true`（默认）：完成后再跑一次落点校验（文件/附属文件）。**会先等收尾结束**

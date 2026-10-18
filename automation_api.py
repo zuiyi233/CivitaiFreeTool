@@ -291,8 +291,9 @@ def _manifest(api, ctx):
             {"method": "POST", "path": "/api/automation/download",
              "params": {"url": "str?", "urls": "[str]?", "model_id": "int?", "version_id": "int?",
                         "file_ids": "[int]?", "dest_subdir": "str?", "caps": "[str]?",
-                        "wait": "0|1", "timeout": "s", "verify": "0|1"},
-             "desc": "提交下载（默认 caps=[bundle] 以启用分流），支持批量，可阻塞到终态并顺带校验"},
+                        "wait": "0|1", "timeout": "s", "verify": "0|1", "force": "0|1"},
+             "desc": "提交下载（默认 caps=[bundle] 以启用分流），支持批量，可阻塞到终态并顺带校验；"
+                     "目标文件已存在时返回 skipped=exists（不重复传几百 MB），force=1 才重下"},
             {"method": "GET", "path": "/api/automation/verify",
              "params": {"task_id": "str?", "path": "str?", "hash": "0|1"},
              "desc": "校验模型文件/哈希/附属文件（视频封面也算封面）；ok=模型文件本身可用，"
@@ -677,17 +678,52 @@ def _download_targets(api, b):
         return [], "file_ids 里必须都是数字"
 
 
+def _existing_target(api, b):
+    """目标文件已存在时返回 (plan, hits)，否则 None。
+
+    为什么要在自动化层拦：`POST /download` 对已下载过的模型会老老实实再传一遍，
+    实测 284MB 白下 + 覆盖同名文件。AI 看不到界面，最容易踩这个坑。
+    `force=1` 显式要求重下时才放过；批量（urls/file_ids）不做预判，避免 N 次解析。
+    """
+    if str(b.get("force", "0")).lower() in ("1", "true", "yes"):
+        return None
+    if b.get("urls") or b.get("file_ids"):
+        return None
+    civ = getattr(api, "api", None)
+    if civ is None:
+        return None
+    model_id, version_id, version, model, files, err = _resolve_target(civ, b)
+    if err:
+        return None
+    files, ferr = _filter_files(files, b.get("file_id"))
+    if ferr:
+        return None
+    plan = _plan_payload(api, b, model_id, version_id, version, model, files)
+    hits = [f for f in (plan.get("files") or []) if f.get("exists")]
+    return (plan, hits) if hits else None
+
+
 def _download(api, ctx, body):
     b = body or {}
+    hit = _existing_target(api, b)
+    if hit:
+        plan, files = hit
+        return 200, {"ok": True, "skipped": "exists", "task": None, "files": files,
+                     "model": plan.get("model"), "version": plan.get("version"),
+                     "waited_s": 0, "timed_out": False,
+                     "hint": "目标文件已存在，未重复下载；确需重新下载请传 force:true"}
     targets, err = _download_targets(api, b)
     if err:
-        return 400, {"ok": False, "msg": err}
+        return 400, {"ok": False, "msg": err,
+                     "hint": '最小用法：{"url":"https://<site_domain>/models/<id>?modelVersionId=<vid>",'
+                             '"wait":true}；批量用 urls 或 file_ids；已存在的模型要重下才加 force:true'}
     dest_subdir = str(b.get("dest_subdir") or "")
     caps = b.get("caps")
     if caps is None:
         caps = ["bundle"]          # 自动化默认开启分流：本体与附属文件才会进同一个类型目录
     if not isinstance(caps, list):
-        return 400, {"ok": False, "msg": "caps 必须是数组"}
+        return 400, {"ok": False, "msg": "caps 必须是数组",
+                     "hint": 'caps 由能力协商决定，手工调用一般省略；要显式关闭分流传 []'}
     wait = str(b.get("wait", "1")).lower() not in ("0", "false", "no")
     timeout = _int(b.get("timeout", DEFAULT_WAIT_S), DEFAULT_WAIT_S, 1, MAX_WAIT_S)
     want_verify = str(b.get("verify", "1")).lower() not in ("0", "false", "no")

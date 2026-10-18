@@ -47,6 +47,19 @@ class RemoveDownloadTests(unittest.TestCase):
         self.own_partial();other=downloader.DownloadTask('https://example.invalid/file',str(self.root),self.t.filename);self.d.add_task(other)
         self.d.remove_task(self.t);self.assertTrue(self.part.exists());self.assertIn('其他任务',self.t.partial_cleanup_error)
 
+    def test_completed_task_same_destination_does_not_block_cleanup(self):
+        """同目录那条已完成任务占的是最终文件，不是 .part。
+
+        实测：对已存在的模型再下一次（284MB）后移除任务，191MB 的 .part 因为「仍被其他任务引用」
+        被永久保留。引用判断必须只看还可能写的任务。
+        """
+        self.own_partial()
+        done=downloader.DownloadTask('https://example.invalid/file',str(self.root),self.t.filename)
+        done.status=downloader.ST_DONE;self.d.add_task(done)
+        self.d.remove_task(self.t)
+        self.assertFalse(self.part.exists())
+        self.assertEqual(self.dest.read_bytes(),b'existing complete model')
+
     def test_active_occupancy_and_cancel_token_retained(self):
         self.own_partial();self.d._active_ids.add(self.t.id);path=os.path.normcase(str(self.dest.resolve()));self.d._active_paths[self.t.id]=path
         self.d.remove_task(self.t);self.assertTrue(self.part.exists());self.assertIn(path,self.d._active_paths.values())
