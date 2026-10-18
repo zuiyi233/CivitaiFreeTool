@@ -141,7 +141,7 @@
       <div class="detail" id="dlInfo"></div>
       </div>
       <div id="dlHistoryPanel" role="tabpanel" aria-labelledby="dlHistoryTab" hidden>
-        <div class="history-toolbar"><input class="input" id="dlHistorySearch" type="search" aria-label="搜索下载历史" placeholder="搜索文件名、模型名、路径或状态"/><span id="dlHistoryCount" aria-live="polite"></span><button class="btn" id="dlHistoryRefresh">刷新记录</button></div>
+        <div class="history-toolbar"><input class="input" id="dlHistorySearch" type="search" aria-label="搜索下载历史" placeholder="搜索文件名、模型名、路径或状态"/><span id="dlHistoryCount" aria-live="polite"></span><button class="btn" id="dlHistoryRefresh">刷新记录</button><button class="btn" id="dlHistoryClear" title="只删除记录与缩略图缓存，不删除模型文件">清空历史</button></div>
         <p class="history-warning" id="dlHistoryError" role="status" hidden></p>
         <div class="table-wrap"><table class="grid" id="dlHistoryTable"><thead><tr><th class="c-file">文件 / 模型</th><th>结果</th><th>大小</th><th class="c-time">结束时间</th><th>操作</th></tr></thead><tbody></tbody></table></div>
         <div class="history-pagination"><button class="btn" id="historyPrev">上一页</button><span id="historyPage"></span><button class="btn" id="historyNext">下一页</button></div>

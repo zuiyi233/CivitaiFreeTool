@@ -94,6 +94,27 @@ AI 不必猜配置值形状、也不必读源码：
 默认返回精简字段（id/filename/status/dest_dir/routed_dir/file_path/file_exists/total/error/finished_at）；
 `detail=1` 返回原始行。用于回答「上次那个下完了吗、文件还在不在」。
 
+### `POST /api/automation/history`
+清理历史记录。**只删记录与历史缓存（缩略图/信息快照），绝不删模型文件**——与「删除模型」正交。
+
+```json
+{"action": "remove", "ids": ["1792..."]}
+{"action": "clear"}                     // 清空全部
+{"action": "remove", "ids": ["..."], "preview": true}   // 只回报将删哪些，不落盘
+```
+
+- 返回 `{ok, removed:[id], missing:[id], skipped:[{id,reason}], tasks_removed:[id],
+  assets_removed:int, parts_cleaned:int, msg}`。
+- **会同时摘掉队列里同 id 的终态任务**：历史行在每次保存时由队列里的终态任务重写
+  （`_record_history`），只删记录不摘队列行，下一次保存就会「复活」。`tasks_removed` 如实告知；
+  `_record_history` 另有墓碑集合，拦住「删除瞬间还在路上的 `_notify`」把同一行写回。
+- 删除失败/中断记录的 `.part`（续传数据）会一并清理（`parts_cleaned`）：记录没了，续传上下文
+  也就没了，留着只是磁盘垃圾。清理沿用既有的归属校验，不会碰其他任务正在写的临时文件。
+- 仍在下载/等待中的任务不算历史记录（`GET /history` 本来就过滤掉），遇到会进 `skipped` 并说明原因。
+- 幂等：不存在的 id 进 `missing`、不报错；`ids` 为空或 `action` 非法返回 400 + `hint`；
+  `clear` 在历史本来就为空时返回 `ok:true, removed:[]`（不是错误）。
+- 界面等价入口：下载管理 → 下载历史 → 每行「删除」/ 工具栏「清空历史」。
+
 ### `GET /api/automation/prompts`
 参数：`path`（模型文件绝对路径）、`limit`。直接读 `.civitai.info` 的 `images[].meta`，返回
 `{index, type, url, width, height, nsfw, prompt, negative_prompt, params:{steps, sampler, seed, ...}}`。

@@ -2007,6 +2007,68 @@ class Api:
             except OSError:row["thumb_revision"]=0
         return {"items": items, "error": self.dl.persistence_error}
 
+    def remove_download_history(self, task_id=None, ids=None, all=False, preview=False):
+        """清理下载历史记录（默认只删记录 + 缩略图/信息快照，**绝不删模型文件**）。
+
+        与「删除模型」是两件正交的事：这里只动 download_history.json 与 history_assets。
+        `all=True` 清空全部（UI 的「清空历史」）；`preview=True` 只回报将删的 id，不落盘。
+        幂等：重复调用不存在的 id 只记进 missing，不报错。
+        「历史」的口径与界面/GET /history 一致：仍在下载/等待中的任务不算历史，已过滤掉。
+        """
+        visible = [row for row in (self.get_download_history().get("items") or []) if row.get("id")]
+        wanted = []
+        if all:
+            wanted = [row.get("id") for row in visible]
+        else:
+            if task_id:
+                wanted.append(task_id)
+            wanted.extend(ids or [])
+        seen, ordered = set(), []
+        for raw in wanted:
+            key = str(raw or "").strip()
+            if key and key not in seen:
+                seen.add(key)
+                ordered.append(key)
+        if not ordered:
+            if all:
+                return {"ok": True, "removed": [], "missing": [], "skipped": [],
+                        "tasks_removed": [], "assets_removed": 0,
+                        "msg": "下载历史已经是空的"}
+            return {"ok": False, "msg": "需要 task_id / ids，或 all=True 清空历史",
+                    "hint": "先 GET /api/automation/history 或读界面列表拿 id"}
+        if preview:
+            known = {str(row.get("id")) for row in visible}
+            return {"ok": True, "preview": True,
+                    "ids": [i for i in ordered if i in known],
+                    "unknown": [i for i in ordered if i not in known],
+                    "count": len([i for i in ordered if i in known])}
+        result = self.dl.drop_history(ordered)
+        assets = 0
+        for key in result.get("removed") or []:
+            for suffix in (".json", ".jpg"):
+                path = self._history_asset(key, suffix)
+                try:
+                    if os.path.isfile(path):
+                        os.unlink(path)
+                        assets += 1
+                except OSError as e:
+                    # 缓存文件删不掉不影响记录已清理，但必须留痕（否则缩略图永久占位）
+                    try:
+                        self.log_error("history", "历史缓存删除失败 %s: %s" % (path, e))
+                    except Exception:
+                        pass
+        result["assets_removed"] = assets
+        msg = ("已清理 %d 条历史记录（其中 %d 条同时从任务列表移除）；模型文件保留"
+               % (len(result.get("removed") or []), len(result.get("tasks_removed") or [])))
+        if result.get("parts_cleaned"):
+            msg += "；清理了 %d 个未完成临时文件" % result["parts_cleaned"]
+        if result.get("missing"):
+            msg += "；%d 个 ID 不存在" % len(result["missing"])
+        if result.get("skipped"):
+            msg += "；%d 条仍在队列中已跳过" % len(result["skipped"])
+        result["msg"] = msg
+        return result
+
     def get_history_thumbnail(self, task_id):
         import base64
         if not any(row["id"] == task_id for row in self.dl.get_history()): return ""

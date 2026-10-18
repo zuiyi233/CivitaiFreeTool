@@ -126,6 +126,39 @@ class Audit:
                     "note": "空 body 被拒=%s（带 hint=%s）；入口声明 force=%s（已存在不重下）"
                             % (st == 400, bool(bad.get("hint")), has_force)}
 
+    def history_cleanup(self):
+        """历史清理入口：只做只读/幂等探测，绝不删真实记录。
+
+        检查三件事：manifest 是否声明 POST /history；空 ids 是否被拒且给 hint；
+        不存在的 id 是否按幂等处理（removed=0 / missing=1），以及 preview 是否真的不落盘。
+        """
+        st, man, ms, _ = http(self.bridge, "/api/automation")
+        paths = {(e.get("method"), e.get("path")) for e in (man.get("endpoints") or [])}
+        declared = ("POST", "/api/automation/history") in paths
+        st2, bad, ms2, _ = http(self.bridge, "/api/automation/history", "POST",
+                                {"action": "remove", "ids": []}, timeout=30)
+        st3, ghost, ms3, _ = http(self.bridge, "/api/automation/history", "POST",
+                                  {"action": "remove", "ids": ["__audit_missing_id__"]}, timeout=30)
+        st4, hist, ms4, _ = http(self.bridge, "/api/automation/history?limit=1")
+        rows = hist.get("items") or []
+        preview_ok, still_there = True, True
+        if rows:
+            rid = rows[0].get("id")
+            st5, prev, ms5, _ = http(self.bridge, "/api/automation/history", "POST",
+                                     {"action": "remove", "ids": [rid], "preview": True}, timeout=30)
+            ms4 += ms5
+            preview_ok = st5 == 200 and prev.get("preview") is True and prev.get("count") == 1
+            _st, after, _ms, _ = http(self.bridge, "/api/automation/history?limit=200")
+            still_there = any(r.get("id") == rid for r in (after.get("items") or []))
+        ok = (declared and st2 == 400 and bool(bad.get("hint"))
+              and st3 == 200 and ghost.get("ok") is False and ghost.get("missing") == ["__audit_missing_id__"]
+              and preview_ok and still_there)
+        return ok, {"ms": ms + ms2 + ms3 + ms4,
+                    "note": "声明=%s；空 ids 被拒=%s；未知 id 幂等=%s；preview 不落盘=%s"
+                            % (declared, st2 == 400,
+                               (ghost.get("missing") or []) == ["__audit_missing_id__"],
+                               preview_ok and still_there)}
+
     def live_done_task(self):
         """挑一个「已完成且文件还在」的任务当探针。
 
@@ -269,13 +302,18 @@ class Audit:
         if not self.keep_e2e:
             removed = self.cleanup_e2e(verify)
             tid = (out.get("task") or {}).get("id")
-            task_gone = True
+            gone = True
             if tid:
-                _st, rm, _, _ = http(self.bridge, "/api/automation/tasks", "POST",
-                                     {"action": "remove", "ids": [tid]})
-                task_gone = any(r.get("ok") for r in (rm.get("results") or []))
-            cleaned = "；已清理 %d 个测试文件%s（下载历史仍会留一条记录）" % (
-                len(removed), "" if task_gone else "；⚠ 任务行未移除")
+                # 一次调用同时清掉「历史记录 + 队列里同 id 的终态任务」，不再留测试垃圾
+                _st, rm, _, _ = http(self.bridge, "/api/automation/history", "POST",
+                                     {"action": "remove", "ids": [tid]}, timeout=60)
+                gone = bool(rm.get("removed"))
+                if not gone:
+                    _st, rm2, _, _ = http(self.bridge, "/api/automation/tasks", "POST",
+                                          {"action": "remove", "ids": [tid]})
+                    gone = any(r.get("ok") for r in (rm2.get("results") or []))
+            cleaned = "；已清理 %d 个测试文件%s" % (
+                len(removed), "" if gone else "；⚠ 记录未清理")
         return ok, {"ms": ms,
                     "note": "%s（%s，%.1fMB）→ %s；ok=%s bundle_ok=%s 等待=%.1fs%s"
                             % (name, model_name, kb / 1024.0,
@@ -301,6 +339,8 @@ class Audit:
         self.step("文件操作（预览/移动/浏览）", self.file_ops,
                   blocked_by="模型库为空或接口缺失")
         self.step("批量调用（batch）", self.batch_roundtrip)
+        self.step("历史清理接口", self.history_cleanup,
+                  blocked_by="缺少 POST /history：历史只能手工清，审计自己也会留垃圾")
         self.step("连通性体检", self.connectivity)
         if e2e:
             self.step("真实下载小文件 → 校验", self.e2e_small_download,

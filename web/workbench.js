@@ -364,7 +364,7 @@ function renderDownloadHistory() {
   if(signature===historyRenderSignature&&$("#dlHistoryTable tbody").children.length)return;
   historyRenderSignature=signature;
   $("#dlHistoryTable tbody").innerHTML = rows.slice((historyPage - 1) * 100, historyPage * 100).map(row =>
-    '<tr data-history-id="' + esc(row.id) + '"><td class="c-file" title="' + esc(row.filename) + '"><div class="history-thumb" data-history-thumb="' + esc(row.id) + '">' + _icon('image') + '</div><div class="history-file-name">' + esc(row.filename) + '</div><div class="file-subpath" title="' + esc(row.dest_dir) + '">' + esc(row.dest_dir || "") + '</div>' + (row.modelName ? '<div class="history-model">' + esc(row.modelName) + '</div>' : "") + '</td><td><span class="history-result ' + esc(row.status) + '">' + esc(row.verification_status==='mismatch' || /SHA256 校验失败/.test(row.error||'') ? (row.manual_binding ? '已关联 · 校验不一致' : '已下载 · 校验不一致') : status[row.status] || row.status) + '</span>' + (row.error || row.partial_cleanup_error ? '<div class="history-error" title="' + esc([row.error,row.partial_cleanup_error].filter(Boolean).join("；")) + '">' + esc([row.error,row.partial_cleanup_error].filter(Boolean).join("；")) + '</div>' : "") + '</td><td>' + fmtSize(row.total || row.downloaded) + '</td><td>' + (row.finished_at ? fmtTime(row.finished_at) : '时间未记录') + '</td><td><button class="btn btn-tiny" data-history-open="' + esc(row.id) + '"' + (row.dest_dir ? "" : " disabled") + '>' + _icon("folder") + '打开目录</button><button class="btn btn-tiny" data-history-save="' + esc(row.id) + '"' + (row.file_exists === false || row.status !== 'done' ? ' disabled' : '') + '>' + _icon('folder') + '保存到…</button><button class="btn btn-tiny" data-history-site="' + esc(row.id) + '"' + (row.model_url ? '' : ' disabled') + '>' + _icon('external') + '打开 C 站</button><button class="btn btn-tiny" data-history-info="' + esc(row.id) + '">' + _icon('info') + '模型信息</button></td></tr>').join("") ||
+    '<tr data-history-id="' + esc(row.id) + '"><td class="c-file" title="' + esc(row.filename) + '"><div class="history-thumb" data-history-thumb="' + esc(row.id) + '">' + _icon('image') + '</div><div class="history-file-name">' + esc(row.filename) + '</div><div class="file-subpath" title="' + esc(row.dest_dir) + '">' + esc(row.dest_dir || "") + '</div>' + (row.modelName ? '<div class="history-model">' + esc(row.modelName) + '</div>' : "") + '</td><td><span class="history-result ' + esc(row.status) + '">' + esc(row.verification_status==='mismatch' || /SHA256 校验失败/.test(row.error||'') ? (row.manual_binding ? '已关联 · 校验不一致' : '已下载 · 校验不一致') : status[row.status] || row.status) + '</span>' + (row.error || row.partial_cleanup_error ? '<div class="history-error" title="' + esc([row.error,row.partial_cleanup_error].filter(Boolean).join("；")) + '">' + esc([row.error,row.partial_cleanup_error].filter(Boolean).join("；")) + '</div>' : "") + '</td><td>' + fmtSize(row.total || row.downloaded) + '</td><td>' + (row.finished_at ? fmtTime(row.finished_at) : '时间未记录') + '</td><td><button class="btn btn-tiny" data-history-open="' + esc(row.id) + '"' + (row.dest_dir ? "" : " disabled") + '>' + _icon("folder") + '打开目录</button><button class="btn btn-tiny" data-history-save="' + esc(row.id) + '"' + (row.file_exists === false || row.status !== 'done' ? ' disabled' : '') + '>' + _icon('folder') + '保存到…</button><button class="btn btn-tiny" data-history-site="' + esc(row.id) + '"' + (row.model_url ? '' : ' disabled') + '>' + _icon('external') + '打开 C 站</button><button class="btn btn-tiny" data-history-info="' + esc(row.id) + '">' + _icon('info') + '模型信息</button><button class="btn btn-tiny" data-history-del="' + esc(row.id) + '" title="只删除记录与缩略图缓存，不删除模型文件">' + _icon('trash') + '删除</button></td></tr>').join("") ||
     '<tr><td colspan="5" class="history-empty">' + (q ? '没有匹配的历史记录' : '暂无下载历史。完成、失败、取消的任务会自动保留；收起队列不会删除它们。') + '</td></tr>';
   $("#dlHistoryTable").querySelectorAll("[data-history-thumb]").forEach(async cell => {
     const item = historyItems.find(row => row.id === cell.dataset.historyThumb);
@@ -581,13 +581,20 @@ function initializeWorkbench() {
     await openHistoryModel(item);
   });
   $("#dlHistoryTable").addEventListener("click", async e => {
-    const button = e.target.closest("[data-history-open], [data-history-save], [data-history-site], [data-history-info]");
+    const button = e.target.closest("[data-history-open], [data-history-save], [data-history-site], [data-history-info], [data-history-del]");
     if (!button) return;
-    const id = button.dataset.historyOpen || button.dataset.historySave || button.dataset.historySite || button.dataset.historyInfo;
+    const id = button.dataset.historyOpen || button.dataset.historySave || button.dataset.historySite || button.dataset.historyInfo || button.dataset.historyDel;
     const item = historyItems.find(row => row.id === id);
     if (!item) return;
     try {
-      if (button.hasAttribute("data-history-open")) {
+      if (button.hasAttribute("data-history-del")) {
+        if (!(await confirmBox("删除这条下载历史记录？\n" + item.filename +
+            "\n\n只删除记录和缩略图缓存，模型文件不会被删除；该任务也会从下载列表移除。"))) return;
+        const result = await api.call("remove_download_history", id);
+        setStatus(result?.msg || "历史记录已清理");
+        historyThumbCache.delete(id + ":" + (item.thumb_revision || 0));
+        await refreshDownloadHistory();
+      } else if (button.hasAttribute("data-history-open")) {
         const result = await api.call("open_in_folder", item.file_exists ? item.file_path : item.dest_dir);
         if (result?.ok === false) setStatus(result.msg || "目录可能已移动或删除");
       } else if (button.hasAttribute("data-history-save")) {
@@ -602,6 +609,14 @@ function initializeWorkbench() {
         await openHistoryModel(item);
       }
     } catch(e) { setStatus("历史操作失败，请重试"); }
+  });
+  $("#dlHistoryClear").addEventListener("click", async () => {
+    if (!historyItems.length) { setStatus("下载历史已经是空的"); return; }
+    if (!(await confirmBox("清空全部 " + historyItems.length + " 条下载历史？\n\n只删除记录与缩略图缓存，模型文件不会被删除。"))) return;
+    const result = await api.call("remove_download_history", null, null, true);
+    setStatus(result?.msg || "下载历史已清空");
+    historyThumbCache.clear();
+    await refreshDownloadHistory();
   });
 }
 document.addEventListener("DOMContentLoaded", initializeWorkbench);

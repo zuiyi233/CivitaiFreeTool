@@ -279,6 +279,12 @@ def _manifest(api, ctx):
             {"method": "GET", "path": "/api/automation/history",
              "params": {"limit": "int", "status": "str", "detail": "0|1", "fields": "csv"},
              "desc": "已完成/失败/取消的下载历史（倒序）"},
+            {"method": "POST", "path": "/api/automation/history",
+             "params": {"action": "remove|clear", "ids": "[str]?", "all": "bool?",
+                        "preview": "0|1"},
+             "desc": "清理下载历史记录：只删记录与缩略图/信息快照，绝不删模型文件；"
+                     "同时摘掉队列里同 id 的终态任务（否则下次保存会把记录写回来）；"
+                     "preview=1 只回报将删的 id；不存在的 id 进 missing，可重复调用"},
             {"method": "GET", "path": "/api/automation/prompts",
              "params": {"path": "str", "limit": "int", "fields": "csv"},
              "desc": "示例图提示词与生成参数（复现用）"},
@@ -1698,6 +1704,41 @@ def _task_repair(api, ctx, body):
 
 # ---------------------------------------------------------------- 分发
 
+def _history_action(api, ctx, body):
+    """清理下载历史：`{action:"remove", ids:[...]}` / `{action:"clear", all:true}`。
+
+    只删记录与历史缓存（缩略图/信息快照），**绝不删模型文件**——与「删除模型」正交。
+    `preview=1` 只回报将删除的 id，不落盘；幂等：不存在的 id 记进 missing 而不报错。
+    """
+    b = body or {}
+    action = str(b.get("action") or "remove").strip().lower()
+    preview = str(b.get("preview", "0")).lower() in ("1", "true", "yes")
+    if action not in ("remove", "clear"):
+        return 400, {"ok": False, "msg": "action 只能是 remove 或 clear",
+                     "hint": "remove 传 ids；clear（或 all:true）清空全部"}
+    fn = getattr(api, "remove_download_history", None)
+    if not callable(fn):
+        return 501, {"ok": False, "msg": "当前版本不支持清理历史记录",
+                     "hint": "升级桌面端后重试"}
+    ids = b.get("ids")
+    if ids is not None and not isinstance(ids, list):
+        return 400, {"ok": False, "msg": "ids 必须是数组",
+                     "hint": "先 GET /api/automation/history?limit=200 取 id"}
+    kwargs = {"preview": preview}
+    if action == "clear" or b.get("all"):
+        kwargs["all"] = True
+    else:
+        kwargs["ids"] = [str(i) for i in (ids or []) if str(i or "").strip()]
+        if not kwargs["ids"]:
+            return 400, {"ok": False, "msg": "remove 需要 ids",
+                         "hint": "GET /api/automation/history 取 id；清空全部用 {action:'clear'}"}
+    try:
+        out = fn(**kwargs) or {}
+    except Exception as e:
+        return 500, {"ok": False, "msg": "清理历史失败: %s" % str(e)[:200]}
+    return 200, out
+
+
 def dispatch(path, method, query, body, api, ctx):
     """返回 (status, payload)；路径不认识返回 None（交给上层 404）。
 
@@ -1751,6 +1792,8 @@ def dispatch(path, method, query, body, api, ctx):
     if m == "POST":
         if path == "/api/automation/batch":
             return _batch(api, ctx, body)
+        if path == "/api/automation/history":
+            return _history_action(api, ctx, body)
         if path == "/api/automation/tasks":
             return _tasks_action(api, ctx, body)
         if path == "/api/automation/tasks/repair":

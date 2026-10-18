@@ -9,6 +9,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 
 import civitai_api
 import config
@@ -103,6 +104,9 @@ class Downloader:
         self._loaded = False
         self.history = {str(row["id"]): row for row in config.load_history()
                         if isinstance(row, dict) and row.get("id")}
+        # 已删除历史记录的墓碑：拦住 in-flight 的 _notify 在 pop 之后把同一行写回来。
+        # OrderedDict 当有界有序集合用（只留最近 2000 个 id）。
+        self._dropped_history = OrderedDict()
         self.persistence_error = ""
 
     # ---------- 任务管理 ----------
@@ -149,11 +153,86 @@ class Downloader:
         return {'ok': True, 'msg': '任务已移除；写入停止后清理未完成 .part，模型及历史保留' if active else
                 ('任务已移除；' + task.partial_cleanup_error if task.partial_cleanup_error else '任务已移除，未完成 .part 已清理或不存在；模型及历史保留')}
 
+    def drop_history(self, ids):
+        """删除指定历史记录行（只删记录，绝不动物理文件）。
+
+        为什么不能只 pop 历史字典：`save_tasks()` 每次都从队列里的终态任务重写历史
+        （`_record_history`），同 id 的任务还在队列里，删掉的行下一次保存就会复活。
+        所以对仍留在队列里的同 id 终态任务，一并把它从队列摘掉——「删掉这条记录」在界面上
+        必须是一次真的删除。
+
+        仍在下载/等待中的任务不算历史记录（`get_download_history` 本来就把它过滤掉），
+        遇到就跳过并给原因，不做半截删除。
+
+        返回 {ok, removed:[id], missing:[id], skipped:[{id,reason}], tasks_removed:[id]}
+        """
+        wanted, seen = [], set()
+        for raw in (ids or []):
+            key = str(raw or "").strip()
+            if key and key not in seen:
+                seen.add(key)
+                wanted.append(key)
+        if not wanted:
+            return {"ok": False, "msg": "没有有效的历史记录 ID",
+                    "removed": [], "missing": [], "skipped": [], "tasks_removed": []}
+        removed, missing, skipped, dropped_tasks = [], [], [], []
+        parts_cleaned = 0
+        with self._lock:
+            by_id = {t.id: t for t in self.tasks}
+            for key in wanted:
+                task = by_id.get(key)
+                if task is not None and task.status not in (ST_DONE, ST_ERROR, ST_CANCELED):
+                    skipped.append({"id": key, "reason": "任务仍在队列中（%s），先移除任务再清理记录"
+                                                       % task.status})
+                    continue
+                row = self.history.get(key)
+                if row is None and task is None:
+                    missing.append(key)
+                    continue
+                # 删除记录 = 放弃续传上下文：owned .part 一并清理（同样的归属校验，别误删别人的）。
+                # 不清理的话，一条失败记录的 .part 会变成没人引用、也无法续传的孤儿文件。
+                if key not in self._active_ids:
+                    if task is not None and getattr(task, "_partial_path", None):
+                        if self._cleanup_removed_part(task):
+                            parts_cleaned += 1
+                    elif isinstance(row, dict) and row.get("removed_partial_path"):
+                        ghost = DownloadTask.from_dict(row)
+                        ghost._partial_path = row["removed_partial_path"]
+                        if self._cleanup_removed_part(ghost):
+                            parts_cleaned += 1
+                if task is not None:
+                    # 只摘队列行，不触发 _notify（它会立刻把历史写回来）
+                    self.tasks.remove(task)
+                    self._pause_events.pop(key, None)
+                    self._cancel_events.pop(key, None)
+                    dropped_tasks.append(key)
+                self.history.pop(key, None)
+                self._dropped_history[key] = None   # 拦住 in-flight 的 _notify 把记录写回
+                self._dropped_history.move_to_end(key)
+                removed.append(key)
+            self._trim_dropped_history()
+        # save_tasks 会自己取 _lock（普通 Lock，不可重入），必须在锁外调用
+        if removed:
+            self.save_tasks()
+        return {"ok": bool(removed), "removed": removed, "missing": missing,
+                "skipped": skipped, "tasks_removed": dropped_tasks,
+                "parts_cleaned": parts_cleaned,
+                "persistence_error": self.persistence_error}
+
+    def _trim_dropped_history(self):
+        """墓碑集合只防在途 _notify，留最近 2000 个足够，不随使用无限增长。"""
+        while len(self._dropped_history) > 2000:
+            self._dropped_history.popitem(last=False)
+
     def _cleanup_removed_part(self, task):
-        """Called under _lock after the writer closes. Only unlink this task's owned .part."""
+        """Called under _lock after the writer closes. Only unlink this task's owned .part.
+
+        返回 True 表示确实删掉了一个文件；False 表示没删（无归属/仍被引用/链接/失败）。
+        调用方据此计数——多条历史行可能指向同一个 .part，按「调用次数」计会虚报。
+        """
         path = getattr(task, '_partial_path', None)
         if not task.dest_dir:
-            return
+            return False
         expected = os.path.abspath(os.path.join(task.dest_dir, task.filename)) + '.part'
         if os.path.basename(task.filename) != task.filename:
             task.partial_cleanup_error = '临时文件路径已变化，未删除'
@@ -166,13 +245,13 @@ class Downloader:
                 if not os.path.isfile(expected) or os.path.islink(expected) or os.path.getsize(expected) != 0:
                     if os.path.isfile(expected) and not os.path.islink(expected):
                         task.partial_cleanup_error = '临时文件无此任务的归属记录，已保留'
-                    return
+                    return False
             except OSError:
-                return
+                return False
             path = expected
         if os.path.normcase(path) != os.path.normcase(expected):
             task.partial_cleanup_error = '临时文件路径已变化，未删除'
-            return
+            return False
         norm = os.path.normcase(os.path.abspath(path[:-5]))
         for other in self.tasks:
             # 只有「还可能在写」的任务才算引用：已完成任务占的是最终文件，不碰 .part。
@@ -182,17 +261,20 @@ class Downloader:
             other_path = os.path.abspath(os.path.join(other.dest_dir or self._resolve_dest(other), other.filename))
             if os.path.normcase(other_path) == norm:
                 task.partial_cleanup_error = '临时文件仍被其他任务引用，已保留'
-                return
+                return False
         if any(identity != task.id and value == norm for identity,value in self._active_paths.items()):
             task.partial_cleanup_error = '临时文件仍有其他写入，已保留'
-            return
+            return False
         try:
             if os.path.islink(path):
                 task.partial_cleanup_error = '临时文件是链接，未删除'
-            elif os.path.isfile(path):
+                return False
+            if os.path.isfile(path):
                 os.unlink(path)
+                return True
         except OSError:
             task.partial_cleanup_error = '临时文件清理失败（占用或权限），请在所在目录核对'
+        return False
 
     @staticmethod
     def _promote_part(tmp, dest, attempts=4):
@@ -332,6 +414,9 @@ class Downloader:
     def _record_history(self, task):
         """调用时必须持有 _lock；不保存签名下载 URL 或大型元数据。"""
         if task.status not in (ST_DONE, ST_ERROR, ST_CANCELED):
+            return
+        if task.id in self._dropped_history:
+            # 记录刚被用户删除，而这条任务的 _notify 还在路上：不能再写回来
             return
         previous = self.history.get(task.id, {})
         self.history[task.id] = {

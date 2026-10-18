@@ -171,7 +171,7 @@ function confirmBox(msg) {
     dlg.style.width = "420px";
     dlg.innerHTML =
       '<div class="rd-title">确认操作</div>' +
-      '<div style="font-size:calc(13px * var(--type-scale, 1));color:var(--text);line-height:1.7;word-break:break-all">' + esc(msg) + "</div>" +
+      '<div style="font-size:calc(13px * var(--type-scale, 1));color:var(--text);line-height:1.7;word-break:break-all">' + esc(msg).replace(/\n/g, "<br>") + "</div>" +
       '<div class="rd-actions">' +
       ((state.cfg && state.cfg.confirm_buttons_flip)
         ? '<button class="btn" id="cfCancel">取消</button><button class="btn btn-danger" id="cfOk">确定</button>'
@@ -179,9 +179,14 @@ function confirmBox(msg) {
       "</div>";
     document.body.appendChild(mask);
     document.body.appendChild(dlg);
+    // 双击触发的第二次点击会落在刚出现的遮罩上，等于「弹窗一闪就取消」；开窗瞬间的遮罩点击忽略
+    const openedAt = Date.now();
     const close = () => { mask.remove(); dlg.remove(); };
     $("#cfCancel", dlg).addEventListener("click", () => { close(); resolve(false); });
-    mask.addEventListener("click", () => { close(); resolve(false); });
+    mask.addEventListener("click", () => {
+      if (Date.now() - openedAt < 250) return;
+      close(); resolve(false);
+    });
     $("#cfOk", dlg).addEventListener("click", () => { close(); resolve(true); });
   });
 }
@@ -204,9 +209,13 @@ function confirmBoxRaw(html, title) {
       "</div>";
     document.body.appendChild(mask);
     document.body.appendChild(dlg);
+    const openedAt = Date.now();
     const close = () => { mask.remove(); dlg.remove(); };
     $("#cfCancel", dlg).addEventListener("click", () => { close(); resolve(false); });
-    mask.addEventListener("click", () => { close(); resolve(false); });
+    mask.addEventListener("click", () => {
+      if (Date.now() - openedAt < 250) return;
+      close(); resolve(false);
+    });
     $("#cfOk", dlg).addEventListener("click", () => { mask.remove(); resolve({ ok: true, root: dlg }); });
   });
 }
