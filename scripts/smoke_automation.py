@@ -153,6 +153,8 @@ def main():
     check("rename-400", st == 400 and rn.get("hint"), rn)
     st, bad = http(B, "/api/automation/batch", "POST", {"calls": [{"path": "/api/rpc"}]})
     check("batch-foreign-400", st == 200 and bad.get("results", [{}])[0].get("http_status") == 400, bad)
+    st, rep = http(B, "/api/automation/tasks/repair", "POST", {})
+    check("repair-400", st == 400 and rep.get("hint"), rep)
 
     ok = all(c["ok"] for c in checks)
     print(json.dumps({"ok": ok, "checks": checks}, ensure_ascii=False, indent=1))

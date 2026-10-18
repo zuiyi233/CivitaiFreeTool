@@ -167,14 +167,36 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 - `caps` 缺省就是 `["bundle"]`：自动化默认开启类型分流，本体与附属文件才会进同一个目录。
 - `wait=true`（默认）：阻塞到本次提交产生的**全部**新任务进入终态，返回 `task`（单条）或
   `items`（多条，每条含 `submit`/`task`/`verify`）；`timed_out=true` 表示到点未完成。
-- `verify=true`（默认）：完成后再跑一次落点校验（文件/附属文件）。
+- `verify=true`（默认）：完成后再跑一次落点校验（文件/附属文件）。**会先等收尾结束**
+  （`postprocess.done`，预算 30s）：`status=done` 只代表传输完成，sidecar/封面此时还在写，
+  不等就会把成功下载判成失败（实测复现过）。
 
 单条返回 `{ok, submit, task, verify, waited_s, timed_out}`，批量返回
-`{ok, items, count, waited_s, timed_out}`。**一次调用覆盖「提交→等完→校验」。**
+`{ok, items, count, waited_s, timed_out}`。**一次调用覆盖「提交→等完→收尾→校验」。**
+
+`verify.ok` 只回答「模型文件本身可用」，`verify.bundle_ok` 才回答「配置要求写的附属文件都齐了」；
+不齐时返回 `hint` 指向 `/tasks/repair`。两者分开是因为没配 API Key 时评论文件本就不会写，
+把它算进 `ok` 会让每次校验都假失败。
 
 ### `POST /api/automation/tasks`
 批量控制：`{"action": "pause|resume|retry|start|remove|archive", "ids": ["..."], "all": false}`。
 逐项返回 `{id, ok, result|error}`；`all:true` 只支持 pause/resume/start/remove。
+
+### `POST /api/automation/tasks/repair`
+重跑下载收尾（元数据 / 评论 / 封面 / 示例视频 / 旧版清理），默认阻塞到完成：
+
+```json
+{"task_id": "1792...", "stages": ["metadata", "cover"], "wait": true, "timeout": 180}
+```
+
+- `stages` 省略 = 全部五个阶段；幂等（元数据重写、封面/视频已存在即跳过）。
+- 重跑前会清掉这些 stage 的历史错误，结束后返回 `postprocess_errors`（空数组 = 全好了）。
+- 只接受**已完成且文件仍在**的任务；历史记录也能重跑（从 `to_dict` 还原任务）。
+- 缺少 C 站元数据（`info.meta.info`）时直接拒绝并给 `hint`（先用 `library/op {op:"verify"}` 补）。
+- `wait=false` 返回 202，用 `GET /tasks?ids=...&fields=id,postprocess_repair` 轮询 `done`。
+
+这条端点是为「下载完成但库不完整」准备的唯一收口：以前 AI 只能 verify / images/download /
+cover 分头补，既不知道补完没有，也没有一次做完的入口。
 
 ### `POST /api/automation/file-choice`
 回答多文件选择（自动化最常见的阻塞点）：
@@ -259,11 +281,15 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 把数据目录（配置/任务/历史/缓存）迁到 `directory`，**必须 `confirm:true`**；
 `replace_existing:true` 表示允许覆盖目标已有数据。下载/扫描/整理进行中会被拒绝（先停掉）。
 
-### 收尾失败可见：`postprocess_errors`
-下载本体完成、但元数据/封面/视频/旧版清理失败时，任务行会带
-`postprocess_errors: [{stage, error}]`（同时写进 `error.log`）。
-下载页状态列显示「收尾未完成」，自动化可以直接据此决定要不要重跑
-`library/op {op:"verify"}` 或 `images/download`——**不再出现「显示已完成、库里却没有信息」的静默状态**。
+### 收尾状态与失败可见：`postprocess` / `postprocess_errors`
+`status=done` 只代表传输结束，收尾在独立线程继续。任务行因此带两个字段：
+
+- `postprocess: {stages, started_at, done, finished_at}`：收尾是否真的跑完。
+  `download(wait=true, verify=true)` 与 `/tasks/repair` 都靠它判断，不要自己猜文件齐没齐。
+- `postprocess_errors: [{stage, error}]`：元数据/封面/视频/旧版清理失败时留痕（同时写 `error.log`）。
+
+下载页状态列显示「收尾未完成」，自动化可以直接据此重跑 `POST /tasks/repair`——**不再出现
+「显示已完成、库里却没有信息」的静默状态**。
 
 ## 4. 校验
 
@@ -274,6 +300,15 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 `.civitai.info` / `.json` / `_评论.txt`、封面、`.images/` 目录与帧数、
 扩展产物 `评论.txt` / `example.json`。
 `path` 是目录时自动挑最大的权重文件当本体。
+
+两个结论字段（分开的理由见 §3 download）：
+
+- `ok`：模型文件本身可用（存在、非空、哈希不是 False）。
+- `bundle_ok`：再加上「当前配置要求写出的附属文件都在」。缺哪些看
+  `sidecars.expected_missing`；`sidecars.missing` 是全部缺失项（含配置不要求的，只作参考）。
+
+期望值随配置变：`gen_metadata=false` 不要求 `.civitai.info`/`.json`；`metadata_format=civitai`
+不要求 `.json`；`archive_comments=false` 或没配 API Key 不要求 `_评论.txt`。
 
 封面判定：`<stem>.preview.png|.preview.jpg|.preview.webp|.cover.png|.cover.jpg` 与
 `<stem>.preview.mp4|.preview.webm|<stem>.mp4|.webm` **任一存在即算通过**，命中的文件名放在
@@ -313,7 +348,15 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 python scripts/verify_e2e.py --url "<模型页>" --json      # 提交→等待→校验，一行 JSON
 python scripts/verify_e2e.py --url "<模型页>" --plan      # 只干跑
 python scripts/verify_e2e.py --task <task_id> --hash      # 只校验已有任务
+
+python scripts/ai_flow_audit.py                            # 卡点审计：API 层走完整流程并计时
+python scripts/ai_flow_audit.py --e2e                      # 额外真实下载一个 1–20MB 的小模型
+python scripts/ai_ui_audit.py                              # 卡点审计：真 Chromium 打开界面，验配置改动是否即时生效
 ```
+
+`ai_flow_audit.py` 只回答三个问题：某一步是不是**必须人工介入**、是不是**没有完成信号**、
+是不是**要多跳几次**。退出码非 0 表示有阻塞项。`ai_ui_audit.py` 需要 Playwright（Python 版），
+用真实浏览器验证前端是否跟得上后端配置变更（无头模式，不影响正在运行的窗口，结束会恢复原配置）。
 
 退出码 0 = 全部符合预期。
 

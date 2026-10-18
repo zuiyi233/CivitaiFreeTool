@@ -60,6 +60,7 @@ class FakeApi:
         self.mm_calls = []
         self.moves = []
         self.renames = []
+        self.repairs = []
 
     def get_tasks(self):
         return list(self.tasks)
@@ -97,7 +98,7 @@ class FakeApi:
         self.tasks.append({"id": "t%d" % (len(self.tasks) + 1), "filename": "demo.safetensors",
                            "status": "done", "dest_dir": dest, "routed_dir": dest,
                            "progress": 100.0, "downloaded": 7, "total": 7, "error": "",
-                           "info": {}})
+                           "postprocess": {"done": True}, "info": {}})
         return {"ok": True, "started": True, "dest_dir": dest, "routed": True, "bundle": "tok"}
 
     # ---- 扩展面用到的既有能力（都保持离线/无副作用）----
@@ -180,6 +181,15 @@ class FakeApi:
         self.mm_calls.append(("mm_organize", paths))
         return {"started": True}
 
+    def repair_download_postprocess(self, task_id, stages=None):
+        self.repairs.append((task_id, stages))
+        for t in self.tasks:
+            if t.get("id") == task_id:
+                t["postprocess_repair"] = {"stages": stages or ["metadata"], "done": True}
+                t["postprocess_errors"] = []
+        return {"ok": True, "started": True, "task_id": task_id,
+                "stages": stages or ["metadata"]}
+
     def mm_cleanup(self, paths=None):
         self.mm_calls.append(("mm_cleanup", paths))
         return {"started": True}
@@ -202,18 +212,36 @@ class VerifyDirTest(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             make_tree(d)
-            out = automation_api._verify_dir(d, "demo.safetensors")
+            out = automation_api._verify_dir(d, "demo.safetensors",
+                                            expect=[".civitai.info", ".json", "_评论.txt"])
             self.assertTrue(out["ok"], out)
+            self.assertTrue(out["bundle_ok"], out)
             self.assertTrue(out["exists"])
             self.assertEqual(out["images"]["count"], 1)
             self.assertEqual(out["sidecars"]["missing"], [])
+            self.assertEqual(out["sidecars"]["expected_missing"], [])
 
-    def test_missing_sidecar_fails(self):
+    def test_missing_sidecar_keeps_file_ok_but_fails_bundle(self):
+        """ok 只对模型文件负责：配置要求写的附属文件缺失走 bundle_ok。
+
+        分开的理由：没配 API Key 时评论文件本就不会写，算进 ok 会让每次 verify 假失败。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            make_tree(d, with_sidecars=False)
+            out = automation_api._verify_dir(d, "demo.safetensors", expect=[".civitai.info"])
+            self.assertTrue(out["ok"], out)
+            self.assertFalse(out["bundle_ok"])
+            self.assertIn("demo.civitai.info", out["sidecars"]["missing"])
+            self.assertEqual(out["sidecars"]["expected_missing"], ["demo.civitai.info"])
+
+    def test_no_expectation_means_bundle_ok(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             make_tree(d, with_sidecars=False)
             out = automation_api._verify_dir(d, "demo.safetensors")
-            self.assertFalse(out["ok"])
+            self.assertTrue(out["ok"])
+            self.assertTrue(out["bundle_ok"])
             self.assertIn("demo.civitai.info", out["sidecars"]["missing"])
 
     def test_video_cover_satisfies_preview(self):
@@ -223,10 +251,12 @@ class VerifyDirTest(unittest.TestCase):
             p = make_tree(d)
             os.remove(os.path.join(d, "demo.preview.png"))
             out = automation_api._verify_dir(d, "demo.safetensors")
-            self.assertFalse(out["ok"])                     # 两者都没有才判缺失
+            self.assertEqual(out["preview"], "")
+            self.assertIn("demo.preview.png|.mp4", out["sidecars"]["missing"])
             open(os.path.join(d, "demo.mp4"), "wb").write(b"v")
             out = automation_api._verify_dir(d, "demo.safetensors")
             self.assertEqual(out["preview"], "demo.mp4")
+            self.assertNotIn("demo.preview.png|.mp4", out["sidecars"]["missing"])
             self.assertTrue(out["ok"], out)
 
     def test_hash_checked_when_requested(self):
@@ -754,6 +784,169 @@ class FsAndMigrateTest(unittest.TestCase):
                                  body={"directory": self.tmpdir.name, "confirm": True})
         self.assertEqual(status, 200, body)
         self.assertEqual(body["directory"], self.tmpdir.name)
+
+
+
+class RepairAndCacheTest(unittest.TestCase):
+    """收尾重跑入口 + plan/resolve 的请求复用（30s 缓存）"""
+
+    def setUp(self):
+        import tempfile
+        automation_api._API_CACHE.clear()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.api = FakeApi(__import__("pathlib").Path(self.tmpdir.name))
+        self.api.tasks.append({"id": "t1", "filename": "demo.safetensors", "status": "done",
+                               "dest_dir": "D:/m", "routed_dir": "D:/m/loras/demo",
+                               "progress": 100.0, "downloaded": 7, "total": 7,
+                               "error": "", "info": {}, "postprocess_errors": []})
+
+    def tearDown(self):
+        automation_api._API_CACHE.clear()
+
+    def call(self, path, method="GET", query=None, body=None):
+        return automation_api.dispatch(path, method, query or {}, body, self.api, ctx(self.api))
+
+    def test_repair_waits_and_reports_errors(self):
+        status, out = self.call("/api/automation/tasks/repair", "POST",
+                                body={"task_id": "t1", "stages": ["metadata"], "timeout": 3})
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["finished"], out)
+        self.assertFalse(out["timed_out"])
+        self.assertEqual(out["postprocess_errors"], [])
+        self.assertEqual(self.api.repairs[-1], ("t1", ["metadata"]))
+
+    def test_repair_requires_task_id_and_list_stages(self):
+        status, out = self.call("/api/automation/tasks/repair", "POST", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("hint", out)
+        status, out = self.call("/api/automation/tasks/repair", "POST",
+                                body={"task_id": "t1", "stages": "metadata"})
+        self.assertEqual(status, 400)
+        self.assertIn("metadata", out["hint"])
+
+    def test_repair_times_out_without_finishing(self):
+        status, out = self.call("/api/automation/tasks/repair", "POST",
+                                body={"task_id": "ghost", "timeout": 1})
+        self.assertEqual(status, 200, out)
+        self.assertFalse(out["finished"])
+        self.assertTrue(out["timed_out"])
+        self.assertIn("hint", out)
+
+    def test_repair_without_wait_returns_202(self):
+        status, out = self.call("/api/automation/tasks/repair", "POST",
+                                body={"task_id": "t1", "wait": False})
+        self.assertEqual(status, 202, out)
+        self.assertTrue(out["started"])
+
+    def test_plan_then_resolve_fetch_each_resource_once(self):
+        civ = self.api.api
+        calls = {"model": 0, "version": 0}
+        real_m, real_v = civ.get_model, civ.get_model_version
+
+        def counted_m(mid):
+            calls["model"] += 1
+            return real_m(mid)
+
+        def counted_v(vid):
+            calls["version"] += 1
+            return real_v(vid)
+
+        civ.get_model, civ.get_model_version = counted_m, counted_v
+        self.call("/api/automation/plan", "POST", body={"url": "https://civitai.red/models/456"})
+        self.call("/api/automation/resolve", "POST", body={"url": "https://civitai.red/models/456"})
+        self.assertEqual(calls, {"model": 1, "version": 1}, calls)
+
+    def test_plan_uses_embedded_model_without_second_request(self):
+        """`/v1/model-versions/<id>` 自带 model{name,type}：plan 不该再拉一次模型详情。"""
+        civ = self.api.api
+        real_v = civ.get_model_version
+        calls = {"model": 0}
+
+        def version_with_model(vid):
+            v = dict(real_v(vid))
+            v["model"] = {"id": 456, "name": "Demo", "type": "LORA"}
+            return v
+
+        def counted_model(mid):
+            calls["model"] += 1
+            return {"id": 456, "name": "Demo", "type": "LORA", "modelVersions": [{"id": 123}]}
+
+        civ.get_model_version, civ.get_model = version_with_model, counted_model
+        status, out = self.call("/api/automation/plan", "POST",
+                                body={"url": "https://civitai.red/models/456"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(calls["model"], 0, "plan 不该为命名/分流再请求一次模型详情")
+        self.assertEqual(out["model"]["name"], "Demo")
+        self.assertEqual(out["model"]["type"], "LORA")
+
+    def test_cache_expires(self):
+        civ = self.api.api
+        calls = {"n": 0}
+        real = civ.get_model_version
+        civ.get_model_version = lambda vid: (calls.__setitem__("n", calls["n"] + 1), real(vid))[1]
+        self.call("/api/automation/plan", "POST", body={"url": "https://civitai.red/models/456"})
+        automation_api._API_CACHE.clear()          # 模拟 TTL 过期
+        self.call("/api/automation/plan", "POST", body={"url": "https://civitai.red/models/456"})
+        self.assertEqual(calls["n"], 2)
+
+
+class PostprocessWaitTest(unittest.TestCase):
+    """status=done 之后收尾还在写 sidecar：download(wait=1,verify=1) 必须等它。
+
+    实测事故：9.1MB 模型下载成功，但 verify 在收尾线程写完 sidecar 前返回 ok=false，
+    AI 只能重试或人工重跑——这是调用层卡点，不是下载失败。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.api = FakeApi(__import__("pathlib").Path(self.tmpdir.name))
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_waits_until_postprocess_done(self):
+        import threading
+        import time
+        task = {"id": "t1", "status": "done", "postprocess": {"done": False}}
+        self.api.tasks.append(task)
+
+        def finish():
+            time.sleep(0.4)
+            task["postprocess"]["done"] = True
+
+        threading.Thread(target=finish, daemon=True).start()
+        t0 = time.time()
+        extra = automation_api._wait_postprocess(self.api, [task], timeout=10)
+        self.assertTrue(task["postprocess"]["done"])
+        self.assertLess(time.time() - t0, 5)
+        self.assertGreaterEqual(extra, 0.3, extra)
+
+    def test_task_without_marker_does_not_burn_full_timeout(self):
+        import time
+        legacy = {"id": "old", "status": "done"}
+        self.api.tasks.append(legacy)
+        t0 = time.time()
+        automation_api._wait_postprocess(self.api, [legacy], timeout=30)
+        self.assertLess(time.time() - t0, 6, "没有 postprocess 标记的历史任务不该等满 30s")
+
+    def test_failed_task_is_not_waited(self):
+        import time
+        bad = {"id": "t2", "status": "error", "postprocess": {"done": False}}
+        self.api.tasks.append(bad)
+        t0 = time.time()
+        automation_api._wait_postprocess(self.api, [bad], timeout=30)
+        self.assertLess(time.time() - t0, 1)
+
+    def test_expect_sidecars_follows_config(self):
+        cfg = self.api.cfg
+        self.assertIn("_评论.txt", automation_api._expect_sidecars(self.api))
+        cfg["api_key"] = ""                        # 没 Key 就不会写评论文件
+        self.assertNotIn("_评论.txt", automation_api._expect_sidecars(self.api))
+        cfg["metadata_format"] = "civitai"         # 这种格式不写 .json
+        self.assertEqual(automation_api._expect_sidecars(self.api), [".civitai.info"])
+        cfg["gen_metadata"] = False
+        self.assertEqual(automation_api._expect_sidecars(self.api), [])
 
 
 if __name__ == "__main__":

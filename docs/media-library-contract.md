@@ -314,6 +314,19 @@ def scan(self, roots, exclude=(), progress=None, cancel=None):
 | 图片扩展名 | `.png .jpg .jpeg .webp .gif` | §3.1 |
 | 视频扩展名 | `.mp4 .mov .webm .mkv`（webm/mkv 自第三轮起按 §21 解析 EBML） | §3.1 |
 | PNG 文本块 | 单块上限 8MB，最多 64 块，命中即停 | §2.3 |
+
+> **视频扩展名有两个不同的问题，不要「统一」它们**（2026-10-18 复核）：
+> - **资源库**（本节 §3.1）回答「能不能入库/播放/出海报」——只收浏览器可解码且有元数据解析的
+>   格式，所以 `.avi` 不在内。测试 `tests/test_media_library.py` 钉死这 4 个值。
+> - **模型示例图**（`image_gallery.VIDEO_SUFFIXES` / `reverse_parse.VIDEO_URL_EXTS`）回答
+>   「这条 C 站示例项是不是视频」——包含 `.avi`，否则 `.avi` 原片会被当成静帧存成
+>   `image_XX.jpg`（浏览器收到 video 字节永远解码不出）。测试
+>   `tests/test_gallery_display_tier.py` / `tests/test_images_autofill.py` 钉死这 5 个值。
+>
+> 两侧都要遵守的一条：**落盘扩展名必须跟源一致**（`webui._video_ext_for`）。把 `.avi` 存成
+> `video_XX.mp4` 是在撒谎，浏览器会按 mp4 解码并失败；前端反查序号的正则
+> `video_(\d+)\.[a-z0-9]+` 本来就认任意扩展名，保留真扩展名不会破坏任何消费方。
+
 | mp4 窗口 | 整读 ≤16MB，否则首/尾各 16MB | §2.4 |
 | sidecar | 上限 8MB，`<base>.json` → `<base>.workflow.json` | §2.5 |
 | `extra` 上限 | 64KB，超出截断并置 `truncated` | §2.1 |

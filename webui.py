@@ -10,6 +10,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.parse
 
 import webview
 
@@ -153,9 +154,41 @@ def _frame_slot(fp):
     return -1 if not m else int(m.group(1)) - 1
 
 
-def _local_video_file(base, idx):
-    """第 idx 个视频项的本地落盘路径（<base>.images/video_XX.mp4，与 image_XX 首帧同索引）"""
-    return os.path.join(base + ".images", "video_%02d.mp4" % idx)
+_VIDEO_FILE_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".avi")
+
+_POST_STAGES = ("metadata", "comments", "cover", "video", "replace_old")
+"""下载收尾可单独重跑的阶段名。与 _handle_dl_done 里的 _want(stage) 一一对应，
+也是任务行 postprocess_errors[].stage 的取值域（重跑接口按它过滤/清理）。"""
+
+
+def _video_ext_for(url):
+    """视频落盘扩展名：跟源一致。
+
+    为什么不一律 .mp4：把 .avi 原片存成 video_XX.mp4 是在撒谎 —— 浏览器会按 mp4 解码并失败，
+    而前端反查序号用的正则是 `video_(\\d+)\\.[a-z0-9]+`，认任意扩展名，所以保留真扩展名是安全的。
+    """
+    try:
+        ext = os.path.splitext(urllib.parse.urlsplit(str(url or "")).path)[1].lower()
+    except Exception:
+        ext = ""
+    return ext if ext in _VIDEO_FILE_EXTS else ".mp4"
+
+
+def _local_video_file(base, idx, ext=".mp4"):
+    """第 idx 个视频项的本地落盘路径（<base>.images/video_XX.<ext>，与 image_XX 首帧同索引）"""
+    return os.path.join(base + ".images", "video_%02d%s" % (idx, ext or ".mp4"))
+
+
+def _find_local_video(base, idx):
+    """已落盘的本地视频（扩展名可能不是 mp4），不存在返回 ''"""
+    for ext in _VIDEO_FILE_EXTS:
+        fp = _local_video_file(base, idx, ext)
+        try:
+            if os.path.isfile(fp) and os.path.getsize(fp) > 1024:
+                return fp
+        except OSError:
+            continue
+    return ""
 
 
 def _is_video_entry(img):
@@ -263,10 +296,10 @@ def _ensure_local_videos(base, images, proxy=None, verify=True, limit=_VIDEO_LIM
         u = _video_source_url(im)
         if not u:
             continue
-        dest = _local_video_file(base, i + 1)
+        dest = _local_video_file(base, i + 1, _video_ext_for(u))
         if _is_reparse_path(dest) or os.path.islink(dest):
             continue   # 绝不跟随符号链接/junction 往模型目录外写
-        if os.path.exists(dest) and os.path.getsize(dest) > 1024:
+        if _find_local_video(base, i + 1):
             continue
         if _download_video(u, dest, proxy=proxy, verify=verify, max_bytes=max_bytes):
             added += 1
@@ -358,13 +391,11 @@ def _images_fill_targets(base, images, want_videos=True, video_limit=None, want_
             poster_dest = os.path.join(out_dir, "image_%02d.jpg" % (i + 1))
             if poster:
                 targets.append(("image", poster, poster_dest))
-            vdest = _local_video_file(base, i + 1)
-            try:
-                have_video = os.path.isfile(vdest) and os.path.getsize(vdest) > 1024
-            except OSError:
-                have_video = False
+            local_video = _find_local_video(base, i + 1)   # 扩展名可能不是 mp4，取真实路径
+            have_video = bool(local_video)
             mp4 = _video_source_url(im)
             if mp4 and want_videos and (videos_left is None or videos_left > 0):
+                vdest = _local_video_file(base, i + 1, _video_ext_for(mp4))
                 if videos_left is not None:
                     videos_left -= 1
                 targets.append(("video", mp4, vdest))
@@ -375,7 +406,7 @@ def _images_fill_targets(base, images, want_videos=True, video_limit=None, want_
             # 真实库 108 个模型里 19 个是「示例图全是视频」，界面因此长时间停在「正在补齐示例图 0/N」。
             if want_posters and not poster:
                 if have_video:
-                    targets.append(("poster", vdest, poster_dest))
+                    targets.append(("poster", local_video, poster_dest))
                 elif mp4:
                     targets.append(("poster", _civitai_thumb_url(mp4, _POSTER_VIDEO_TIER_W), poster_dest))
             continue
@@ -683,8 +714,8 @@ def _gallery_preview(item, cfg):
 def _local_video_uri(base, idx):
     """本地视频的 file:/// URI（不存在返回 ''）。页面经 file:// 加载时同源可播；
     浏览器兜底模式（http origin）下由前端降级远程 URL。"""
-    fp = _local_video_file(base, idx)
-    if os.path.exists(fp) and os.path.getsize(fp) > 1024:
+    fp = _find_local_video(base, idx)
+    if fp:
         try:
             import pathlib
             return pathlib.Path(fp).as_uri()
@@ -845,7 +876,29 @@ class Api:
         except Exception:
             pass
 
-    def _handle_dl_done(self, task):
+    def _handle_dl_done(self, task, stages=None, repair=False):
+        """下载完成后收尾。stages 限定跑哪几段（None=全部）；repair=True 时同步拉视频，
+        并在 task.info['postprocess_repair'] 上写完成标记，供 /tasks/repair 等待。"""
+        want = None if stages is None else {s for s in stages if s in _POST_STAGES}
+        marker = None
+        # status=done 只代表「传输结束」，收尾线程此时还在写 sidecar/封面。自动化层要判断
+        # 「收尾真的完了」只能看这个标记（download(wait=1,verify=1) 曾因此假失败）。
+        info = task.info if isinstance(task.info, dict) else {}
+        info["postprocess"] = {"stages": sorted(want) if want is not None else list(_POST_STAGES),
+                               "started_at": time.time(), "done": False}
+        task.info = info
+
+        def _want(stage):
+            return want is None or stage in want
+
+        if repair:
+            cleared = want if want is not None else set(_POST_STAGES)
+            info["postprocess_errors"] = [
+                e for e in (info.get("postprocess_errors") or [])
+                if not isinstance(e, dict) or e.get("stage") not in cleared]
+            marker = {"stages": sorted(cleared), "started_at": time.time(), "done": False}
+            info["postprocess_repair"] = marker
+            task.info = info
         try:
             dest = os.path.join(task.dest_dir, task.filename)
             if not os.path.exists(dest):
@@ -864,7 +917,7 @@ class Api:
                 task.info['meta'] = meta
                 task.info.pop('manual_binding', None)
             # 1) metadata 文件（按配置）
-            if self.cfg.get("gen_metadata", True):
+            if _want("metadata") and self.cfg.get("gen_metadata", True):
                 fmt = self.cfg.get("metadata_format", "sd")
                 m = meta.get("info")
                 sd = meta.get("sd")
@@ -882,7 +935,7 @@ class Api:
                     self._note_postprocess_error(task, "metadata", e)
             # 1.5) 评论/评价文本（<名>_评论.txt）：评论只有 C 站 tRPC 拿得到，公开 /api/v1 没这个能力。
             #      没 Key / Key 失效 / 限流一律跳过并写进 error.log，绝不让下载主流程失败。
-            if self.cfg.get("archive_comments", True):
+            if _want("comments") and self.cfg.get("archive_comments", True):
                 try:
                     self._archive_comments_sidecar(task, base)
                 except Exception as e:      # 尽力而为的补充产物：出问题只留日志
@@ -892,19 +945,19 @@ class Api:
                         pass
             # 2) 封面下载（后台，已存在则跳过；走代理，直连 C 站图片 CDN 会被墙）
             #    + 视频项 mp4 落盘（后台 daemon 线程，不阻塞完成回调；跳过已存在）
-            if self.cfg.get("download_cover", True):
+            if (_want("cover") or _want("video")) and self.cfg.get("download_cover", True):
                 imgs = (meta.get("info") or {}).get("images") or []
                 cover_url = _pick_cover_url(imgs)
                 proxy_cfg = self.cfg.get("proxy_address") if self.cfg.get("proxy_enabled") else None
                 verify_cfg = self.cfg.get("ssl_verify", True)
-                if cover_url:
+                if cover_url and _want("cover"):
                     try:
                         _download_image(cover_url, base + ".preview.png",
                                         proxy=proxy_cfg, verify=verify_cfg, cfg=self.cfg)
                     except Exception as e:
                         self._note_postprocess_error(task, "cover", e)
                 has_video = any(_is_video_entry(im) and _video_source_url(im) for im in imgs)
-                if has_video:
+                if has_video and _want("video"):
                     def _fetch_videos():
                         try:
                             _ensure_local_videos(
@@ -912,14 +965,19 @@ class Api:
                                 max_bytes=_video_cap_bytes(self.cfg))
                         except Exception as e:
                             self._note_postprocess_error(task, "video", e)
-                    threading.Thread(target=_fetch_videos, daemon=True).start()
+                    # 重跑时同步执行：否则「重跑完成」会比视频落盘早到，等待方会误判成功
+                    if repair:
+                        _fetch_videos()
+                    else:
+                        threading.Thread(target=_fetch_videos, daemon=True).start()
             # Completed files stay where the user classified them. Global target only affects
             # future downloads; relocation is exclusively an explicit move action.
             # 4) 「更新下载」完成：按设置处理旧版本（默认保留；删除走回收站，可还原）
             try:
                 old = str((task.info or {}).get("replace_old") or "")
                 keep = str(self.cfg.get("update_keep_old", "keep") or "keep").strip().lower() != "delete"
-                if old and (not keep) and os.path.exists(old) and os.path.abspath(old) != os.path.abspath(dest):
+                if _want("replace_old") and old and (not keep) and os.path.exists(old) \
+                        and os.path.abspath(old) != os.path.abspath(dest):
                     if posix_compat.IS_WINDOWS:
                         from gui import _recycle_to_trash
                         _recycle_to_trash([old])
@@ -952,6 +1010,55 @@ class Api:
             self._note_postprocess_error(task, "dl_done", e)
         finally:
             self._cache_history_task(task)
+            info = task.info if isinstance(task.info, dict) else {}
+            pp = info.get("postprocess")
+            if isinstance(pp, dict):
+                pp["done"] = True
+                pp["finished_at"] = time.time()
+            if marker is not None:
+                marker["done"] = True
+                marker["finished_at"] = time.time()
+
+    def repair_download_postprocess(self, task_id, stages=None):
+        """按 task_id 重跑下载收尾（可只跑指定阶段）。
+
+        为什么需要：收尾失败现在会被记录（postprocess_errors），但原先只能靠 verify / images /
+        cover 几个入口分头补，且没有「全部补完了」的信号。这里一次重跑并留下完成标记
+        （task.info['postprocess_repair'].done），调用方可以等它。
+        幂等：元数据重写、封面/视频已存在即跳过、旧版清理只在 replace_old 仍存在时动作。
+        """
+        tid = str(task_id or "").strip()
+        if not tid:
+            return {"ok": False, "msg": "task_id 不能为空"}
+        task = next((t for t in getattr(self.dl, "tasks", []) if getattr(t, "id", "") == tid), None)
+        if task is None:
+            row = (getattr(self.dl, "history", {}) or {}).get(tid)
+            if not isinstance(row, dict):
+                return {"ok": False, "msg": "任务不存在（不在队列也不在历史里）"}
+            try:
+                task = downloader.DownloadTask.from_dict(row)
+            except Exception as e:
+                return {"ok": False, "msg": "历史记录无法还原为任务: %s" % str(e)[:120]}
+        if getattr(task, "status", "") != downloader.ST_DONE:
+            return {"ok": False, "msg": "只有已完成的任务可以重跑收尾（当前 %s）" % task.status}
+        dest = os.path.join(task.dest_dir or "", task.filename or "")
+        if not task.dest_dir or not os.path.isfile(dest):
+            return {"ok": False, "msg": "模型文件不存在，无法重跑收尾: %s" % dest}
+        if isinstance(stages, list) and stages:
+            bad = [s for s in stages if s not in _POST_STAGES]
+            if bad:
+                return {"ok": False, "msg": "未知 stage: %s" % ", ".join(map(str, bad)),
+                        "hint": "可用: " + "|".join(_POST_STAGES)}
+        if not (((task.info or {}).get("meta") or {}).get("info")):
+            return {"ok": False,
+                    "msg": "任务缺少 C 站元数据（meta.info），收尾无从重跑",
+                    "hint": "先用 library/op {op:'verify'} 按哈希补全元数据，或重新下载该版本"}
+        task._metadata_started = True
+        threading.Thread(target=self._handle_dl_done, args=(task,),
+                         kwargs={"stages": stages, "repair": True}, daemon=True).start()
+        return {"ok": True, "started": True, "task_id": tid,
+                "filename": task.filename,
+                "stages": list(stages) if stages else list(_POST_STAGES)}
 
     # ---------------- 评论/评价归档（下载完成路径：tRPC + API Key，不经浏览器） ----------------
     @staticmethod
@@ -1364,7 +1471,25 @@ class Api:
         self.dl.cfg = self.cfg
         if self.cfg["max_concurrent_downloads"] > previous.get("max_concurrent_downloads",3):
             self.dl._ensure_workers()
+        # 配置版本号：前端每秒轮询的轻量 flags 里带上它，变了才去拉全量配置。
+        # 没有它，通过桥/自动化改的配置要等页面刷新才生效（实测：后端已关掉「下载完成询问
+        # 移动」，前端 6 秒后仍按旧值弹窗）。
+        self._cfg_rev = int(getattr(self, "_cfg_rev", 0)) + 1
         return ok
+
+    def get_ui_flags(self):
+        """前端轮询用的小载荷：配置版本号 + 界面判定真正需要的那几个键。
+
+        只回这几项是刻意的：`get_config` 是全量配置（含长列表），每秒拉一次太贵；
+        这里只回答「配置变没变、弹窗该不该出现」。
+        """
+        return {
+            "cfg_rev": int(getattr(self, "_cfg_rev", 0)),
+            "ask_move_after_download": bool(self.cfg.get("ask_move_after_download", True)),
+            "download_target_dir": self.cfg.get("download_target_dir") or "",
+            "multi_file_download": self.cfg.get("multi_file_download") or "ask",
+            "route_by_type": bool(self.cfg.get("route_by_type")),
+        }
 
     def _resolve_model_path(self, path):
         if not isinstance(path,str) or not path.strip():return ""
@@ -1622,6 +1747,8 @@ class Api:
                     "versionName": (t.info or {}).get("versionName", ""),
                     # 收尾（元数据/封面/视频/旧版清理）失败留痕：列表要能提示「下完了但库不完整」
                     "postprocess_errors": list((t.info or {}).get("postprocess_errors") or []),
+                    "postprocess": (t.info or {}).get("postprocess"),
+                    "postprocess_repair": (t.info or {}).get("postprocess_repair"),
                     "created_at": t.created_at, "finished_at": t.finished_at,
                 })
             return out

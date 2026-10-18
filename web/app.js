@@ -1087,8 +1087,35 @@ if ($("#mmDedupe")) $("#mmDedupe").addEventListener("click", mmDedupeFlow);
 
 // ================= 下载管理 =================
 let dlDragging=false;
+// 配置版本号轮询：后端（包括 AI / 自动化接口）改了配置后，前端不必等刷新页面才生效。
+// 每 2 拍问一次轻量 get_ui_flags：版本号变了拉全量 get_config；无论如何都用 flags 里的
+// 几个判定键覆盖 state.cfg —— 这样「页面刚加载、首次轮询之前改了配置」的竞态也能收敛。
+let _cfgRev=null,_cfgTick=0;
+async function pollCfgRev() {
+  if (++_cfgTick % 2 !== 0) return;
+  try {
+    const flags = await api.call("get_ui_flags");
+    if (!flags || typeof flags.cfg_rev !== "number") return;
+    if (_cfgRev !== null && flags.cfg_rev !== _cfgRev) {
+      _cfgRev = flags.cfg_rev;
+      state.cfg = await api.call("get_config");
+      const settingsPage = $("#page-settings");
+      const dirty = typeof settingsHaveChanges === "function" && settingsHaveChanges();
+      if (settingsPage && settingsPage.classList.contains("active") && !dirty
+          && typeof buildSettingsForm === "function") buildSettingsForm();
+    } else if (_cfgRev === null) {
+      _cfgRev = flags.cfg_rev;
+    }
+    if (!state.cfg) return;          // 全量配置还没加载：下个周期再覆盖
+    state.cfg.ask_move_after_download = flags.ask_move_after_download;
+    state.cfg.download_target_dir = flags.download_target_dir;
+    state.cfg.multi_file_download = flags.multi_file_download;
+    state.cfg.route_by_type = flags.route_by_type;
+  } catch (_) { /* 桥未就绪：下个周期再试 */ }
+}
 async function dlRefresh() {
   if(dlDragging)return;
+  pollCfgRev();
   try {
     const tasks = await api.call("get_tasks");
     state.dlTasks = tasks || [];

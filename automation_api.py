@@ -24,6 +24,8 @@ from urllib.parse import parse_qs
 
 MAX_WAIT_S = 1800
 DEFAULT_WAIT_S = 300
+# 传输结束后的收尾预算：sidecar/封面/视频都在 done 之后写，verify 必须等它（见 _wait_postprocess）
+POST_WAIT_S = 30.0
 TASK_TERMINAL = ("done", "error", "canceled")
 SIDECAR_SUFFIXES = (".civitai.info", ".json", "_评论.txt")
 # 封面：图片封面由桌面端写 <stem>.preview.png；封面是视频时桌面端写不出 png，
@@ -163,12 +165,19 @@ def _find_task(api, task_id):
     return None
 
 
-def _verify_dir(path, filename, expected_sha256="", do_hash=False):
-    """校验落点：文件存在/大小/哈希 + 附属文件清单（只读，不移动任何东西）"""
-    out = {"ok": False, "dir": path or "", "filename": filename or "",
+def _verify_dir(path, filename, expected_sha256="", do_hash=False, expect=None):
+    """校验落点：文件存在/大小/哈希 + 附属文件清单（只读，不移动任何东西）。
+
+    `ok` 只回答「这个模型文件本身可用」；`bundle_ok` 才回答「配置要求写的附属文件都齐了」。
+    分开的原因（实测踩到）：没配 API Key 时评论文件本就不会写、metadata_format=civitai 时
+    不会写 .json，把它们算进 `ok` 会让每一次 verify 都假失败，AI 只能靠猜。
+    `expect` 是调用方按当前配置/任务算出的「应当存在」的后缀列表。
+    """
+    expected_missing = []
+    out = {"ok": False, "bundle_ok": False, "dir": path or "", "filename": filename or "",
            "exists": False, "size": 0, "expected_sha256": expected_sha256 or "",
            "sha256": "", "sha256_ok": None, "preview": "",
-           "sidecars": {"found": [], "missing": []},
+           "sidecars": {"found": [], "missing": [], "expected_missing": expected_missing},
            "artifacts": {"found": [], "missing": []},
            "images": {"exists": False, "count": 0}}
     if not path or not os.path.isdir(path):
@@ -200,6 +209,7 @@ def _verify_dir(path, filename, expected_sha256="", do_hash=False):
             (out["sidecars"]["found"] if key in names else out["sidecars"]["missing"]).append(key)
         out["preview"] = next((stem + s for s in PREVIEW_SUFFIXES if stem + s in names), "")
         out["sidecars"]["missing"] += [] if out["preview"] else [stem + ".preview.png|.mp4"]
+        expected_missing.extend(stem + s for s in (expect or []) if stem + s not in names)
         img_dir = stem + ".images"
         out["images"]["exists"] = img_dir in names and os.path.isdir(os.path.join(path, img_dir))
         if out["images"]["exists"]:
@@ -214,9 +224,28 @@ def _verify_dir(path, filename, expected_sha256="", do_hash=False):
         else:
             out["artifacts"]["missing"].append(name)
 
-    out["ok"] = bool(out["exists"] and not out["sidecars"]["missing"]
-                     and (out["sha256_ok"] is not False))
+    out["ok"] = bool(out["exists"] and out["size"] > 0 and (out["sha256_ok"] is not False))
+    out["bundle_ok"] = bool(out["ok"] and not expected_missing)
     return out
+
+
+def _expect_sidecars(api):
+    """按当前配置算「应当存在」的 sidecar 后缀。
+
+    只列配置真的会让它写出来的：`archive_comments` 有 Key 才有评论文件；
+    `metadata_format=civitai` 不写 .json。把这些算成缺失就是假失败。
+    """
+    cfg = getattr(api, "cfg", None) or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    expect = []
+    if cfg.get("gen_metadata", True):
+        expect.append(".civitai.info")
+        if str(cfg.get("metadata_format") or "sd").strip().lower() in ("sd", "both"):
+            expect.append(".json")
+    if cfg.get("archive_comments", True) and str(cfg.get("api_key") or "").strip():
+        expect.append("_评论.txt")
+    return expect
 
 
 # ---------------------------------------------------------------- 各端点
@@ -240,6 +269,10 @@ def _manifest(api, ctx):
             {"method": "POST", "path": "/api/automation/tasks",
              "params": {"action": "pause|resume|retry|start|remove|archive", "ids": "[str]", "all": "bool"},
              "desc": "批量任务控制，逐项返回结果"},
+            {"method": "POST", "path": "/api/automation/tasks/repair",
+             "params": {"task_id": "str", "stages": "[metadata|comments|cover|video|replace_old]?",
+                        "wait": "0|1", "timeout": "s"},
+             "desc": "重跑下载收尾（幂等），默认阻塞到完成并回报 postprocess_errors"},
             {"method": "GET", "path": "/api/automation/events",
              "params": {"since": "int", "limit": "int"},
              "desc": "本层调用事件流（自检：请求到没到、多久、什么状态）"},
@@ -262,7 +295,8 @@ def _manifest(api, ctx):
              "desc": "提交下载（默认 caps=[bundle] 以启用分流），支持批量，可阻塞到终态并顺带校验"},
             {"method": "GET", "path": "/api/automation/verify",
              "params": {"task_id": "str?", "path": "str?", "hash": "0|1"},
-             "desc": "校验模型文件/哈希/附属文件（视频封面也算封面）"},
+             "desc": "校验模型文件/哈希/附属文件（视频封面也算封面）；ok=模型文件本身可用，"
+                     "bundle_ok=配置要求写的附属文件齐全，sidecars.expected_missing 列出缺哪些"},
             {"method": "GET", "path": "/api/automation/config", "desc": "全量配置（密钥打码）+ 数据目录"},
             {"method": "POST", "path": "/api/automation/config", "params": {"config": "object"},
              "desc": "白名单配置写入"},
@@ -405,11 +439,50 @@ def _tasks_action(api, ctx, body):
     return 200, {"ok": all(r.get("ok") for r in results) if results else False, "results": results}
 
 
-def _resolve_target(civ, body, allow_first_version=True):
+_API_CACHE = {}
+_API_CACHE_TTL = 30.0
+_API_CACHE_MAX = 64
+
+
+def _cached_call(civ, kind, ident, fetch):
+    """短缓存 get_model / get_model_version（30s）。
+
+    为什么需要：单次请求经代理到镜像站实测 3.4~18s（首次含 TLS 建连），而 plan→resolve→download
+    常常在几秒内问同一个版本。缓存只存成功结果、30 秒过期、上限 64 条；失败一律不缓存。
+    """
+    key = (getattr(civ, "api_base", ""), kind, str(ident))
+    now = time.time()
+    hit = _API_CACHE.get(key)
+    if hit and now - hit[0] < _API_CACHE_TTL:
+        return hit[1]
+    value = fetch()
+    if len(_API_CACHE) >= _API_CACHE_MAX:
+        for k, v in list(_API_CACHE.items()):
+            if now - v[0] >= _API_CACHE_TTL:
+                _API_CACHE.pop(k, None)
+        if len(_API_CACHE) >= _API_CACHE_MAX:
+            _API_CACHE.clear()
+    _API_CACHE[key] = (now, value)
+    return value
+
+
+def _filter_files(files, file_id):
+    """按 file_id 过滤；不存在时返回 (None, 错误说明)"""
+    if file_id is None:
+        return files, ""
+    picked = [f for f in files if str(f.get("id")) == str(file_id)]
+    return (picked, "") if picked else (None, "指定文件不属于这个版本")
+
+
+def _resolve_target(civ, body, allow_first_version=True, need_versions=False):
     """url 或 model_id(+version_id) → (model_id, version_id, version, model, files, error)
 
     只读：不下载、不建目录。url 里的 modelVersionId 优先，其次显式 version_id，
     最后才退回该模型的第一个版本（allow_first_version=False 时直接报错）。
+
+    `need_versions=True` 才额外拉一次模型详情（要列全部版本时）。
+    `/v1/model-versions/<id>` 自带 `model{name,type}`，只做命名/分流的话它就是全部所需，
+    以前无条件再拉一次 `/v1/models/<id>`，白白多花一次网络往返（实测 2.3s）。
     """
     b = body or {}
     url = str(b.get("url") or "").strip()
@@ -425,39 +498,36 @@ def _resolve_target(civ, body, allow_first_version=True):
         if not version_id:
             if model_id is None:
                 return None, None, None, None, [], "URL 里没有版本信息，也没有给 model_id"
-            versions = (civ.get_model(model_id) or {}).get("modelVersions") or []
+            versions = (_cached_call(civ, "model", model_id,
+                                     lambda: civ.get_model(model_id)) or {}).get("modelVersions") or []
             if not versions:
                 return None, None, None, None, [], "模型没有可用版本"
             if not allow_first_version:
                 return None, None, None, None, [], "必须指定 version_id"
             version_id = versions[0]["id"]
-        version = civ.get_model_version(version_id)
+        version = _cached_call(civ, "version", version_id,
+                               lambda: civ.get_model_version(version_id))
         if model_id is None:
             mid = version.get("modelId")
             if mid is not None and str(mid).strip().isdigit():
                 model_id = str(mid).strip()
-        model = civ.get_model(model_id) if model_id is not None else {}
+        embedded = version.get("model") if isinstance(version.get("model"), dict) else {}
+        if (not need_versions and model_id is not None
+                and embedded.get("name") and embedded.get("type")):
+            model = {"id": model_id, "name": embedded["name"], "type": embedded["type"]}
+        else:
+            model = (_cached_call(civ, "model", model_id, lambda: civ.get_model(model_id))
+                     if model_id is not None else {})
         return model_id, version_id, version, model, civ.model_files(version), ""
     except Exception as e:
         return None, None, None, None, [], "解析失败: %s" % str(e)[:200]
 
 
-def _plan(api, ctx, body):
-    """干跑：不写盘、不入队。probe=1 才做 safetensors 头嗅探（两次 Range 网络请求）。"""
+def _plan_payload(api, body, model_id, version_id, version, model, files):
+    """纯计算：文件命名 / 分流决策 / 落点 / 是否已存在或在队列。不写盘、不入队、不发请求
+    （probe=1 时才会为了 safetensors 头做两次 Range，这由调用方决定是否开启）。"""
     import model_naming
     import model_routing
-
-    civ = getattr(api, "api", None)
-    if civ is None:
-        return 500, {"ok": False, "msg": "API 未就绪"}
-    model_id, version_id, version, model, files, err = _resolve_target(civ, body)
-    if err:
-        return 400, {"ok": False, "msg": err}
-    file_id = (body or {}).get("file_id")
-    if file_id is not None:
-        files = [f for f in files if str(f.get("id")) == str(file_id)]
-        if not files:
-            return 400, {"ok": False, "msg": "指定文件不属于这个版本"}
 
     root = str((api.cfg or {}).get("comfyui_models_root") or "").strip()
     route_on = bool((api.cfg or {}).get("route_by_type"))
@@ -501,7 +571,7 @@ def _plan(api, ctx, body):
         lib = api.library_check(version_id)
     except Exception:
         lib = {}
-    return 200, _apply_fields({
+    return _apply_fields({
         "ok": True, "url": str((body or {}).get("url") or ""),
         "model": {"id": model_id, "name": model.get("name"), "type": model.get("type")},
         "version": {"id": version_id, "name": version.get("name"),
@@ -511,6 +581,51 @@ def _plan(api, ctx, body):
         "library_paths": list((lib or {}).get("paths") or []),
         "files": items,
     }, _fields_from(None, body), "files")
+
+
+def _plan(api, ctx, body):
+    """干跑：不写盘、不入队。probe=1 才做 safetensors 头嗅探（两次 Range 网络请求）。"""
+    civ = getattr(api, "api", None)
+    if civ is None:
+        return _fail(500, "API 未就绪", "确认桌面端已启动（GET /api/health）")
+    model_id, version_id, version, model, files, err = _resolve_target(civ, body)
+    if err:
+        return _fail(400, err, "URL 需形如 /models/<id>?modelVersionId=<id>，或直接传 model_id/version_id")
+    files, ferr = _filter_files(files, (body or {}).get("file_id"))
+    if ferr:
+        return _fail(400, ferr, "先用 POST /api/automation/resolve 看该版本有哪些 file_id")
+    return 200, _plan_payload(api, body, model_id, version_id, version, model, files)
+
+
+def _wait_postprocess(api, tasks, timeout=POST_WAIT_S):
+    """等已完成任务的收尾（元数据/评论/封面/视频）跑完。
+
+    status=done 只代表传输结束：收尾在独立线程里继续写 sidecar。以前 download(wait=1,verify=1)
+    立刻 verify，拿到 sidecars.missing 就把一次成功下载判成失败（实测 9.1MB 模型复现）。
+    返回额外等待秒数；旧任务没有 postprocess 标记时最多多等 2s，不做无谓等待。
+    """
+    ids = {t.get("id") for t in tasks if t.get("status") == "done" and t.get("id")}
+    if not ids:
+        return 0.0
+    t0 = time.time()
+    missing_since = {}
+    while True:
+        now = time.time()
+        pending = set()
+        for t in _tasks_raw(api):
+            if t.get("id") not in ids:
+                continue
+            pp = t.get("postprocess")
+            if isinstance(pp, dict) and pp.get("done") is True:
+                continue
+            if not isinstance(pp, dict):
+                # 没有标记的历史任务：2s 内没出现就认定不会再有，别白等满超时
+                if now - missing_since.setdefault(t.get("id"), now) > 2.0:
+                    continue
+            pending.add(t.get("id"))
+        if not pending or now - t0 >= timeout:
+            return round(now - t0, 1)
+        time.sleep(0.25)
 
 
 def _wait_new_tasks(api, before_ids, timeout):
@@ -594,13 +709,21 @@ def _download(api, ctx, body):
     tasks, waited, timed_out = [], 0.0, False
     if wait and expect_task:
         tasks, waited, timed_out = _wait_new_tasks(api, before, timeout)
+        if want_verify and not timed_out:
+            # 传输完成 ≠ 收尾完成；不等它，verify 会读到一个还没写 sidecar 的目录
+            extra = _wait_postprocess(api, tasks)
+            if extra:
+                waited = round(waited + extra, 1)
+                fresh = {t.get("id"): t for t in _tasks_raw(api)}
+                tasks = [fresh.get(t.get("id"), t) for t in tasks]   # 保留提交顺序
+    expect = _expect_sidecars(api)
     for idx, task in enumerate(tasks):
         if idx < len(items):
             items[idx]["task"] = task
             if task.get("status") == "done" and want_verify:
                 items[idx]["verify"] = _verify_dir(
                     task.get("routed_dir") or task.get("dest_dir") or "",
-                    task.get("filename") or "", "", False)
+                    task.get("filename") or "", "", False, expect)
                 if not items[idx]["verify"].get("ok"):
                     items[idx]["ok"] = False
 
@@ -617,6 +740,9 @@ def _download(api, ctx, body):
         if r.get("verify") is not None:
             out["verify"] = r["verify"]
             out["ok"] = bool(out["ok"] and r["verify"].get("ok"))
+            if not r["verify"].get("bundle_ok"):
+                out["hint"] = ("模型文件可用，但配置要求写出的附属文件不全（收尾可能未完成）："
+                               "可 POST /api/automation/tasks/repair {task_id} 重跑收尾")
         return 200, out
 
     return 200, {"ok": all(i.get("ok") for i in items) if items else False,
@@ -628,6 +754,7 @@ def _verify(api, ctx, query):
     task_id = (query.get("task_id", [""])[0] or "").strip()
     path = (query.get("path", [""])[0] or "").strip()
     do_hash = str(query.get("hash", ["0"])[0]).lower() in ("1", "true", "yes")
+    expect = _expect_sidecars(api)
     if task_id:
         task = _find_task(api, task_id)
         if not task:
@@ -635,7 +762,7 @@ def _verify(api, ctx, query):
         dest = task.get("routed_dir") or task.get("dest_dir") or ""
         info = (task.get("info") or {}) if isinstance(task.get("info"), dict) else {}
         expected = info.get("expected_sha256") or task.get("expected_sha256") or ""
-        return 200, _verify_dir(dest, task.get("filename") or "", expected, do_hash)
+        return 200, _verify_dir(dest, task.get("filename") or "", expected, do_hash, expect)
     if path:
         if os.path.isdir(path):
             # 目录形态：自动挑最大的权重文件当本体（多文件版本取主文件，体积最大最稳）
@@ -647,8 +774,8 @@ def _verify(api, ctx, query):
             except OSError:
                 weights = []
             weights.sort(reverse=True)
-            return 200, _verify_dir(path, weights[0][1] if weights else "", "", do_hash)
-        return 200, _verify_dir(os.path.dirname(path), os.path.basename(path), "", do_hash)
+            return 200, _verify_dir(path, weights[0][1] if weights else "", "", do_hash, expect)
+        return 200, _verify_dir(os.path.dirname(path), os.path.basename(path), "", do_hash, expect)
     return 400, {"ok": False, "msg": "需要 task_id 或 path"}
 
 
@@ -983,25 +1110,29 @@ def _resolve(api, ctx, body):
     """只读解析：url 或 model_id → 模型、全部版本、选定版本的文件、落点、库内状态。
 
     比 /plan 多一层「版本清单」，AI 可以先挑版本再决定下哪个，不用先下载再后悔。
+    与 /plan 共用同一次解析（版本 + 模型各一次请求，30 秒内还会命中缓存），
+    不再像早期实现那样「调一遍 plan 再拉一次模型」。
     """
     civ = getattr(api, "api", None)
     if civ is None:
-        return 500, {"ok": False, "msg": "API 未就绪"}
-    status, plan = _plan(api, ctx, body)
-    if status != 200:
-        return status, plan
-    model_id = (plan.get("model") or {}).get("id")
+        return _fail(500, "API 未就绪", "确认桌面端已启动（GET /api/health）")
+    model_id, version_id, version, model, files, err = _resolve_target(civ, body, need_versions=True)
+    if err:
+        return _fail(400, err, "URL 需形如 /models/<id>?modelVersionId=<id>，或直接传 model_id/version_id")
+    files, ferr = _filter_files(files, (body or {}).get("file_id"))
+    if ferr:
+        return _fail(400, ferr, "先用 POST /api/automation/resolve 看该版本有哪些 file_id")
+    plan = _plan_payload(api, body, model_id, version_id, version, model, files)
     versions = []
     try:
-        model = civ.get_model(model_id) if model_id is not None else {}
         for v in (model.get("modelVersions") or []):
-            files = v.get("files") or []
+            vfiles = v.get("files") or []
             versions.append({
                 "id": v.get("id"), "name": v.get("name"),
                 "base_model": v.get("baseModel"),
                 "published_at": v.get("publishedAt"),
-                "file_count": len(files),
-                "primary_size_kb": next((f.get("sizeKB") for f in files if f.get("primary")), None),
+                "file_count": len(vfiles),
+                "primary_size_kb": next((f.get("sizeKB") for f in vfiles if f.get("primary")), None),
             })
     except Exception as e:
         plan["versions_error"] = str(e)[:120]
@@ -1483,6 +1614,52 @@ def _storage_migrate(api, ctx, body):
     return (200 if r.get("ok") else 400), r
 
 
+_REPAIR_STAGES = ("metadata", "comments", "cover", "video", "replace_old")
+
+
+def _task_repair(api, ctx, body):
+    """按 task_id 重跑下载收尾（可只跑失败的 stage），默认阻塞到完成。
+
+    这是「收尾失败」的唯一收口：以前 AI 只能 verify / images/download / cover 分头补，
+    既不知道补全没有，也没有一次做完的入口。
+    """
+    b = body or {}
+    tid = str(b.get("task_id") or "").strip()
+    if not tid:
+        return _fail(400, "task_id 不能为空", "从 GET /api/automation/tasks?fields=id,status,postprocess_errors 取")
+    stages = b.get("stages")
+    if stages is not None and not isinstance(stages, list):
+        return _fail(400, "stages 必须是数组", "可选: " + "|".join(_REPAIR_STAGES))
+    try:
+        r = _jsonish(api.repair_download_postprocess(tid, stages)) or {}
+    except Exception as e:
+        return _fail(500, "重跑失败: %s" % str(e)[:200], "看 GET /api/automation/logs?source=error")
+    if not isinstance(r, dict):
+        r = {"ok": True, "raw": r}
+    if not r.get("ok"):
+        return _fail(400, r.get("msg") or "重跑未开始", r.get("hint") or "看 GET /api/automation/tasks")
+    wait = str(b.get("wait", "1")).lower() not in ("0", "false", "no")
+    timeout = _int(b.get("timeout", 180), 180, 1, MAX_WAIT_S)
+    if not wait:
+        return 202, {**r, "hint": "用 GET /api/automation/tasks?ids=%s&fields=id,postprocess_repair 轮询" % tid}
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        row = _find_task(api, tid)
+        marker = (row or {}).get("postprocess_repair") or {}
+        if marker.get("done"):
+            return 200, {"ok": True, "finished": True, "task_id": tid,
+                         "stages": marker.get("stages") or [],
+                         "waited_s": round(time.time() - t0, 1), "timed_out": False,
+                         "postprocess_errors": (row or {}).get("postprocess_errors") or []}
+        time.sleep(0.3)
+    row = _find_task(api, tid)
+    return 200, {"ok": True, "finished": False, "timed_out": True, "task_id": tid,
+                 "stages": ((row or {}).get("postprocess_repair") or {}).get("stages") or [],
+                 "waited_s": round(time.time() - t0, 1),
+                 "postprocess_errors": (row or {}).get("postprocess_errors") or [],
+                 "hint": "仍在跑（视频可能较大）：再查一次或加大 timeout"}
+
+
 # ---------------------------------------------------------------- 分发
 
 def dispatch(path, method, query, body, api, ctx):
@@ -1540,6 +1717,8 @@ def dispatch(path, method, query, body, api, ctx):
             return _batch(api, ctx, body)
         if path == "/api/automation/tasks":
             return _tasks_action(api, ctx, body)
+        if path == "/api/automation/tasks/repair":
+            return _task_repair(api, ctx, body)
         if path == "/api/automation/plan":
             return _plan(api, ctx, body)
         if path == "/api/automation/resolve":
