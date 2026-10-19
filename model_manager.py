@@ -16,7 +16,10 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 INFO_EXTS = {".json", ".txt", ".yaml", ".yml", ".md", ".html"}
 
 # 附属文件（随模型改名/移动）统一列表
+# 注意 "_评论.txt" 是完整后缀而不是扩展名：下载收尾把它写成 "<主干>_评论.txt"，
+# 只列 ".txt" 覆盖不到，改名/整理后评论会留在旧名前缀下。
 _SIDE_EXTS = (
+    "_评论.txt",
     ".info.json", ".civitai.info", ".json", ".txt", ".yaml", ".yml", ".md", ".html",
     ".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".preview.gif",
     ".cover.jpg", ".cover.png", ".cover.jpeg", ".cover.webp",
