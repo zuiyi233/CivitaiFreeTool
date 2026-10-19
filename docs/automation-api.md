@@ -141,6 +141,83 @@ AI 复现示例图时不用再手撸元数据解析。没有 info 时给 `hint` 
 该文件/目录的附属文件清单（`.civitai.info`/`.json`/`.preview.png`/`_评论.txt`/`.images`/
 扩展产物）。文件不存在返回 404。
 
+### 资源库（ComfyUI output 媒体库）
+
+把 ComfyUI 输出目录里的图片/视频当成可检索、可打标、可回收的媒体库。底层即 `webui.py` 的
+`lib_*` 方法；筛选字段、行形状、分面与写操作语义的完整定义见
+[`media-library-contract.md`](media-library-contract.md) **§5.2**。
+
+#### `GET /api/automation/gallery`
+参数：`filter`（JSON 对象字符串，默认 `{}`）、`limit`（默认 50，合法 1–500，越界 400）、
+`offset`（默认 0，>=0）、`with_facets=0|1`（默认 0）、`fields`。
+
+`filter` 的字段（`kind`/`starred`/`q`/`checkpoints`/`loras`/`dirs`/`tag_ids`/`sort`/
+`group_by` 等）见 media-library-contract §5.2。**查询参数会覆盖 filter 里的
+`limit`/`offset`/`with_facets`**；`root_ids` 由底层按配置的媒体根强制注入，filter 里写也越不了权。
+`with_facets=1` 才返回 `facets`，底层给 `None` 时归一成 `{}`。
+
+```bash
+curl -G "http://127.0.0.1:47531/api/automation/gallery" \
+  --data-urlencode 'filter={"kind":"image","starred":true,"sort":"time_desc"}' \
+  --data-urlencode 'limit=20' --data-urlencode 'offset=0' --data-urlencode 'with_facets=1'
+```
+
+返回 `{ok,count,total,offset,limit,items,facets?}`。`fields` 只裁剪 `items`，
+`count`/`total`/`offset`/`limit` 等元信息永远保留。filter 不是 JSON 对象 → 400 + `hint`。
+
+#### `GET /api/automation/gallery/item`
+参数：`id`（正整数，来自列表 `items[].id`）、`fields`（详情字段用 `item.width` 这种路径）。
+返回 `{ok,id,item}`。条目不存在或底层 `ok:false` → 404 + `hint`「先 GET /gallery 取 id」。
+
+```bash
+curl "http://127.0.0.1:47531/api/automation/gallery/item?id=12&fields=id,item.filename,item.width"
+```
+
+#### `GET /api/automation/gallery/tags`
+返回 `{ok,count,tags}`，标签形状为 `{id,name,color,parent_id,count}`（§5.2）。
+`fields` 裁剪 `tags` 列表项，例如 `fields=id,name`。
+
+#### `POST /api/automation/gallery/op`
+统一写入口，`op` 取 `star` / `tag-add` / `tag-remove` / `tag-save` / `tag-delete` / `delete`，
+未知值 400 并列出合法值。`ids` 与 `tag_ids` 必须是正整数 JSON 数组，服务端去重，
+单次 1–500（与前端分片一致）。
+
+```json
+{"op": "star", "ids": [1, 2], "on": true}
+{"op": "tag-add", "ids": [1, 2], "tag_ids": [3]}
+{"op": "tag-remove", "ids": [1], "tag_ids": [3]}
+{"op": "tag-save", "id": 0, "name": "精选", "color": "#888", "parent_id": -1}
+{"op": "tag-delete", "id": 3}
+{"op": "delete", "ids": [1, 2], "confirm": true}
+```
+
+- `star` 返回 `{ok,op,count,requested}`：`count` 是底层实际更新数，`requested` 是去重后的 id 数。
+- `tag-add` / `tag-remove` 原样返回底层结果（`count`/`tags`）并补 `op`。
+- `tag-save`：`id=0` 新建，`parent_id=-1` 无父；`name` 为空 → 400 + `hint`。
+- `tag-delete`：`{id}` 必填，返回底层 `{ok,removed}`。
+- `delete` **必须 `confirm:true`**（缺失/假值 → 400 + `hint`）；逐条调用底层删除，
+  返回 `{ok,op:"delete",deleted,failed,results:[{id,ok,msg}]}`——`ok` 表示是否全部成功，
+  单条失败不会中断整批。删除是**系统回收站语义**（Windows 回收站 / 其它平台 trash），
+  且**只回收媒体文件本体，绝不连带同名 `.json` 等 sidecar**：ComfyUI 的 `.json` 被同批
+  图片/视频共享，连删会毁掉另一件的元数据（该保护在底层 `lib_delete`，本层不复制逻辑）。
+
+#### `GET /api/automation/gallery/scan`
+返回 `{ok,state}`。`state` 是轻量的扫描进度
+（`running`/`phase`/`done`/`total`/`msg`/`roots`/`errors`，不含行数据），形状见 §5.2 的
+`lib_scan_state`。
+
+#### `POST /api/automation/gallery/scan`
+参数：`wait=0|1`（默认 0）、`timeout`（秒，默认 300，夹在 1–1800）。
+
+```json
+{"wait": true, "timeout": 300}
+```
+
+调用 `lib_scan()` 后返回 `{ok,started,msg,state,waited_s,timed_out}`。`wait=1` 时每 0.25s
+轮询 `lib_scan_state()`，直到 `running=false` 或超时。**已在扫描中时 `started:false`**
+（`msg` 说明原因），`wait=1` 仍会继续等本轮结束——调用方要的是「扫完没有」，不是「谁启动的」。
+`timed_out=true` 不是失败，按需再查 `GET /gallery/scan`。
+
 ### `POST /api/automation/search`
 C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site_domain`）。
 

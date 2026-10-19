@@ -35,6 +35,10 @@ PREVIEW_SUFFIXES = (".preview.png", ".preview.jpg", ".preview.webp",
                     ".mp4", ".webm")
 ARCHIVE_ARTIFACTS = ("评论.txt", "example.json")
 
+# 资源库（ComfyUI output 媒体库）写操作白名单 + 单次批量上限（与前端分片一致）
+GALLERY_OPS = ("star", "tag-add", "tag-remove", "tag-save", "tag-delete", "delete")
+GALLERY_BATCH_MAX = 500
+
 # 本层调用事件（AI 自检：我的请求到底到没到、耗时多少、返回了什么状态）
 _EVENTS = deque(maxlen=200)
 _EVENT_SEQ = 0
@@ -64,6 +68,17 @@ def _int(value, default, low, high):
     except Exception:
         return default
     return max(low, min(high, n))
+
+
+def _truthy(value, default=False):
+    """布尔参数归一：兼容 true/1/yes 与字符串写法（"false" 不能因为非空就算真）"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _tasks_raw(api):
@@ -327,6 +342,28 @@ def _manifest(api, ctx):
              "desc": "模型管理动作（校验/查重/汉化/生成 json/检查更新/更新/封面…）可等待完成"},
             {"method": "GET", "path": "/api/automation/library/op", "params": {"op": "str"},
              "desc": "上述后台动作的进度"},
+            {"method": "GET", "path": "/api/automation/gallery",
+             "params": {"filter": "JSON 对象字符串（media-library-contract §5.2）",
+                        "limit": "1-500（默认 50）", "offset": ">=0（默认 0）",
+                        "with_facets": "0|1（默认 0）", "fields": "csv"},
+             "desc": "资源库（ComfyUI output 媒体库）列表：筛选/分页/分面；"
+                     "filter 里的 limit/offset/with_facets 会被查询参数覆盖"},
+            {"method": "GET", "path": "/api/automation/gallery/item",
+             "params": {"id": "int", "fields": "csv"},
+             "desc": "资源库条目详情（id 来自 /gallery 的 items[].id）"},
+            {"method": "GET", "path": "/api/automation/gallery/tags", "params": {"fields": "csv"},
+             "desc": "资源库标签列表"},
+            {"method": "POST", "path": "/api/automation/gallery/op",
+             "params": {"op": "|".join(GALLERY_OPS), "ids": "[int]?", "on": "bool?",
+                        "tag_ids": "[int]?", "id": "int?", "name": "str?", "color": "str?",
+                        "parent_id": "int?", "confirm": "true（delete 必填）"},
+             "desc": "资源库写操作：收藏/标签/删除；ids 与 tag_ids 单次 1-500；"
+                     "delete 需 confirm:true，只把媒体本体移入回收站，不连带 sidecar"},
+            {"method": "GET", "path": "/api/automation/gallery/scan",
+             "desc": "资源库扫描进度（轻量，不含行数据）"},
+            {"method": "POST", "path": "/api/automation/gallery/scan",
+             "params": {"wait": "0|1（默认 0）", "timeout": "1-1800s（默认 300）"},
+             "desc": "触发资源库扫描；wait=1 轮询到 running=false 或超时"},
             {"method": "POST", "path": "/api/automation/images/download",
              "params": {"path": "str", "wait": "0|1", "timeout": "s"},
              "desc": "批量下载示例图到 <名>.images/（异步启动，可等待）"},
@@ -905,6 +942,315 @@ def _library_scan(api, ctx, body):
         time.sleep(0.25)
     return 200, {"ok": True, "started": started, "scan": api.get_scan_state(),
                  "waited_s": round(time.time() - t0, 1), "timed_out": True}
+
+
+# ---------------------------------------------------------------- 资源库（ComfyUI output 媒体库）
+# 底层能力在 webui.py 的 lib_* 方法；筛选字段、行形状与分面见
+# docs/media-library-contract.md §5.2。本层只做参数校验、调用与结果整形，
+# 不复制筛选/扫描/回收站逻辑（尤其 delete 的 sidecar 保护由 lib_delete 保证）。
+
+def _gallery_batch_ids(value, name="ids"):
+    """ids / tag_ids 闸门：JSON 数组、正整数、去重、单次 1..500。"""
+    if not isinstance(value, list):
+        return None, "%s 必须是正整数 JSON 数组" % name
+    ids = []
+    for x in value:
+        if isinstance(x, bool):
+            return None, "%s 里必须都是正整数" % name
+        if isinstance(x, int):
+            n = x
+        elif isinstance(x, float) and x.is_integer():
+            n = int(x)
+        elif isinstance(x, str):
+            try:
+                n = int(x.strip())
+            except ValueError:
+                return None, "%s 里必须都是正整数" % name
+        else:
+            return None, "%s 里必须都是正整数" % name
+        if n <= 0:
+            return None, "%s 里必须都是正整数" % name
+        if n not in ids:
+            ids.append(n)
+    if not ids:
+        return None, "%s 不能为空" % name
+    if len(ids) > GALLERY_BATCH_MAX:
+        return None, "%s 单次最多 %d 项，请分片提交" % (name, GALLERY_BATCH_MAX)
+    return ids, ""
+
+
+def _gallery_list(api, ctx, query):
+    """资源库列表：filter 是 JSON 对象字符串；limit/offset/with_facets 查询参数优先。
+
+    `lib_list` 返回 JSON 字符串，且会在服务端把 root_ids 覆盖成配置的媒体根，
+    所以 filter 里写 root_ids 也越不了权。facets 只在 with_facets=1 时返回，
+    底层给 None 时归一成 {}（前端跳过重算时就是 None）。
+    """
+    raw = (query.get("filter", ["{}"])[0] or "{}").strip() or "{}"
+    try:
+        flt = json.loads(raw)
+    except Exception as e:
+        return _fail(400, "filter 不是合法 JSON: %s" % str(e)[:120],
+                     'filter 是 JSON 对象字符串（字段见 docs/media-library-contract.md §5.2），'
+                     '例如 {"kind":"image","starred":true,"q":"1girl"}')
+    if not isinstance(flt, dict):
+        return _fail(400, "filter 必须是 JSON 对象",
+                     '例如 {"kind":"image","limit":20}；数组/标量不是合法筛选条件')
+    try:
+        limit = int((query.get("limit", ["50"])[0] or "50").strip())
+    except (TypeError, ValueError):
+        return _fail(400, "limit 必须是整数", "limit 合法范围 1..500（默认 50）")
+    if not 1 <= limit <= 500:
+        return _fail(400, "limit 必须在 1..500 之间（收到 %d）" % limit,
+                     "limit 合法范围 1..500（默认 50）；翻页用 offset")
+    try:
+        offset = int((query.get("offset", ["0"])[0] or "0").strip())
+    except (TypeError, ValueError):
+        return _fail(400, "offset 必须是整数", "offset 必须 >= 0（默认 0）")
+    if offset < 0:
+        return _fail(400, "offset 必须 >= 0（收到 %d）" % offset, "offset 从 0 开始")
+    with_facets = _truthy(query.get("with_facets", ["0"])[0])
+    fn = getattr(api, "lib_list", None)
+    if not callable(fn):
+        return _fail(501, "当前版本不支持资源库", "升级桌面端后重试（需要 webui.py 的 lib_list）")
+    flt.update({"limit": limit, "offset": offset, "with_facets": 1 if with_facets else 0})
+    try:
+        data = _jsonish(fn(json.dumps(flt, ensure_ascii=False)))
+    except Exception as e:
+        return _fail(500, "读取资源库失败: %s" % str(e)[:200],
+                     "看 GET /api/automation/logs?source=error")
+    if not isinstance(data, dict):
+        return _fail(500, "资源库返回格式异常", "升级桌面端后重试")
+    if not data.get("ok", True):
+        return _fail(400, data.get("msg") or "筛选参数无效",
+                     "筛选字段见 docs/media-library-contract.md §5.2")
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    got_offset, got_limit = data.get("offset"), data.get("limit")
+    out = {"ok": True, "count": len(items), "total": int(data.get("total") or 0),
+           "offset": int(got_offset if got_offset is not None else offset),
+           "limit": int(got_limit if got_limit is not None else limit),
+           "items": items}
+    if with_facets:
+        facets = data.get("facets")
+        out["facets"] = facets if isinstance(facets, dict) else {}
+    return 200, _apply_fields(out, _fields_from(query), "items")
+
+
+def _gallery_item(api, ctx, query):
+    raw = (query.get("id", [""])[0] or "").strip()
+    try:
+        item_id = int(raw)
+    except (TypeError, ValueError):
+        return _fail(400, "id 必须是正整数", "id 来自 GET /api/automation/gallery 的 items[].id")
+    if item_id <= 0:
+        return _fail(400, "id 必须是正整数（收到 %d）" % item_id,
+                     "id 来自 GET /api/automation/gallery 的 items[].id")
+    fn = getattr(api, "lib_detail", None)
+    if not callable(fn):
+        return _fail(501, "当前版本不支持资源库详情", "升级桌面端后重试（需要 webui.py 的 lib_detail）")
+    try:
+        item = _jsonish(fn(item_id))
+    except Exception as e:
+        return _fail(500, "读取条目失败: %s" % str(e)[:200],
+                     "看 GET /api/automation/logs?source=error")
+    if not isinstance(item, dict) or not item.get("ok"):
+        msg = item.get("msg") if isinstance(item, dict) else "条目不存在"
+        return _fail(404, msg or "条目不存在",
+                     "先 GET /api/automation/gallery 取 id（items[].id），再查详情")
+    return 200, _apply_fields({"ok": True, "id": item_id, "item": item}, _fields_from(query))
+
+
+def _gallery_tags(api, ctx, query):
+    fn = getattr(api, "lib_tags", None)
+    if not callable(fn):
+        return _fail(501, "当前版本不支持资源库标签", "升级桌面端后重试（需要 webui.py 的 lib_tags）")
+    try:
+        data = _jsonish(fn())
+    except Exception as e:
+        return _fail(500, "读取标签失败: %s" % str(e)[:200],
+                     "看 GET /api/automation/logs?source=error")
+    if isinstance(data, dict) and data.get("ok") is False:
+        return _fail(400, data.get("msg") or "读取标签失败", "升级桌面端后重试")
+    tags = data if isinstance(data, list) else []
+    return 200, _apply_fields({"ok": True, "count": len(tags), "tags": tags},
+                              _fields_from(query), "tags")
+
+
+def _gallery_op(api, ctx, body):
+    """资源库写操作统一入口：star / tag-add / tag-remove / tag-save / tag-delete / delete。
+
+    returns 200 with per-item results for delete even when some fail: 单条失败绝不能
+    中断整批，否则 AI 拿不到「哪些成功、哪些要重试」。delete 只把媒体本体移入回收站，
+    不连带同名 .json（由 lib_delete 保证，这里不复制该逻辑）。
+    """
+    b = body or {}
+    op = str(b.get("op") or "").strip().lower()
+    if op not in GALLERY_OPS:
+        return _fail(400, "op 必须是 %s 之一" % "|".join(GALLERY_OPS),
+                     '例如 {"op":"star","ids":[1,2]} 或 {"op":"delete","ids":[1],"confirm":true}')
+
+    if op == "tag-save":
+        name = str(b.get("name") or "").strip()
+        if not name:
+            return _fail(400, "name 不能为空",
+                         '{"op":"tag-save","id":0,"name":"精选","color":"#888"}（id=0 新建）')
+        try:
+            tag_id = int(b.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            return _fail(400, "id 必须是整数（0=新建）", "新建标签传 id:0 或不传")
+        if tag_id < 0:
+            return _fail(400, "id 必须 >= 0（0=新建）", "新建标签传 id:0 或不传")
+        try:
+            parent_id = int(b.get("parent_id") if b.get("parent_id") is not None else -1)
+        except (TypeError, ValueError):
+            return _fail(400, "parent_id 必须是整数（-1=无父）", "无父标签传 parent_id:-1 或不传")
+        fn = getattr(api, "lib_tag_save", None)
+        if not callable(fn):
+            return _fail(501, "当前版本不支持标签保存", "升级桌面端后重试（需要 lib_tag_save）")
+        try:
+            r = _jsonish(fn(tag_id, name, str(b.get("color") or ""), parent_id))
+        except Exception as e:
+            return _fail(500, "保存标签失败: %s" % str(e)[:200],
+                         "看 GET /api/automation/logs?source=error")
+        r = r if isinstance(r, dict) else {"ok": False, "msg": "返回格式异常"}
+        return (200 if r.get("ok") else 400), r
+
+    if op == "tag-delete":
+        try:
+            tag_id = int(b.get("id"))
+        except (TypeError, ValueError):
+            return _fail(400, "tag-delete 需要正整数 id", '{"op":"tag-delete","id":3}')
+        if tag_id <= 0:
+            return _fail(400, "id 必须是正整数", '{"op":"tag-delete","id":3}')
+        fn = getattr(api, "lib_tag_delete", None)
+        if not callable(fn):
+            return _fail(501, "当前版本不支持标签删除", "升级桌面端后重试（需要 lib_tag_delete）")
+        try:
+            r = _jsonish(fn(tag_id))
+        except Exception as e:
+            return _fail(500, "删除标签失败: %s" % str(e)[:200],
+                         "看 GET /api/automation/logs?source=error")
+        r = r if isinstance(r, dict) else {"ok": False, "msg": "返回格式异常"}
+        return (200 if r.get("ok") else 400), r
+
+    ids, err = _gallery_batch_ids(b.get("ids"), "ids")
+    if err:
+        return _fail(400, err, "ids 是资源库条目 id 的正整数数组（单次 1..500）")
+
+    if op == "star":
+        on = _truthy(b.get("on"), True)
+        fn = getattr(api, "lib_set_star_batch", None)
+        if not callable(fn):
+            return _fail(501, "当前版本不支持收藏", "升级桌面端后重试（需要 lib_set_star_batch）")
+        try:
+            r = _jsonish(fn(json.dumps(ids), on)) or {}
+        except Exception as e:
+            return _fail(500, "收藏失败: %s" % str(e)[:200], "看 GET /api/automation/logs?source=error")
+        if not isinstance(r, dict):
+            r = {"ok": False, "msg": "返回格式异常"}
+        out = {"ok": bool(r.get("ok")), "op": op,
+               "count": int(r.get("count") or 0), "requested": len(ids)}
+        if not out["ok"] and r.get("msg"):
+            out["msg"] = str(r.get("msg"))
+        return (200 if out["ok"] else 400), out
+
+    if op in ("tag-add", "tag-remove"):
+        tag_ids, err = _gallery_batch_ids(b.get("tag_ids"), "tag_ids")
+        if err:
+            return _fail(400, err, "tag_ids 是标签 id 的正整数数组（单次 1..500）")
+        fn = getattr(api, "lib_tag_add_batch" if op == "tag-add" else "lib_tag_remove_batch", None)
+        if not callable(fn):
+            return _fail(501, "当前版本不支持标签批量操作", "升级桌面端后重试")
+        try:
+            r = _jsonish(fn(json.dumps(ids), json.dumps(tag_ids)))
+        except Exception as e:
+            return _fail(500, "标签操作失败: %s" % str(e)[:200],
+                         "看 GET /api/automation/logs?source=error")
+        out = dict(r) if isinstance(r, dict) else {"ok": False, "msg": "返回格式异常"}
+        out["op"] = op
+        return (200 if out.get("ok") else 400), out
+
+    # delete：回收站语义，必须 confirm:true；逐条调用，单条失败不中断整批
+    if not _truthy(b.get("confirm")):
+        return _fail(400, "delete 会把媒体文件移入回收站，必须显式传 confirm:true",
+                     "先 GET /api/automation/gallery 确认 ids，再带 confirm:true 执行；"
+                     "只回收媒体本体，不连带同名 .json 等 sidecar")
+    fn = getattr(api, "lib_delete", None)
+    if not callable(fn):
+        return _fail(501, "当前版本不支持删除", "升级桌面端后重试（需要 webui.py 的 lib_delete）")
+    results, deleted = [], 0
+    for item_id in ids:
+        try:
+            r = _jsonish(fn(item_id)) or {}
+        except Exception as e:
+            r = {"ok": False, "msg": "删除失败: %s" % str(e)[:200]}
+        if not isinstance(r, dict):
+            r = {"ok": bool(r), "msg": ""}
+        ok = bool(r.get("ok"))
+        deleted += 1 if ok else 0
+        results.append({"id": item_id, "ok": ok,
+                        "msg": str(r.get("msg") or ("已移入回收站" if ok else "删除失败"))})
+    return 200, {"ok": deleted == len(results), "op": op, "deleted": deleted,
+                 "failed": len(results) - deleted, "results": results}
+
+
+def _gallery_scan_state(api, ctx):
+    fn = getattr(api, "lib_scan_state", None)
+    if not callable(fn):
+        return _fail(501, "当前版本不支持资源库扫描", "升级桌面端后重试（需要 lib_scan_state）")
+    try:
+        state = _jsonish(fn())
+    except Exception as e:
+        return _fail(500, "读取扫描状态失败: %s" % str(e)[:200],
+                     "看 GET /api/automation/logs?source=error")
+    return 200, {"ok": True, "state": state if isinstance(state, dict) else {}}
+
+
+def _gallery_scan(api, ctx, body):
+    """触发资源库扫描；wait=1 时轮询到 running=false 或超时。
+
+    已在进行中时 lib_scan 如实返回 started:false（msg 说明原因），但 wait=1 仍继续
+    等本轮结束——AI 想要的是「扫完没有」，不是「这次是不是我启动的」。
+    """
+    b = body or {}
+    wait = _truthy(b.get("wait"), False)
+    timeout = _int(b.get("timeout", DEFAULT_WAIT_S), DEFAULT_WAIT_S, 1, MAX_WAIT_S)
+    start_fn = getattr(api, "lib_scan", None)
+    state_fn = getattr(api, "lib_scan_state", None)
+    if not callable(start_fn) or not callable(state_fn):
+        return _fail(501, "当前版本不支持资源库扫描", "升级桌面端后重试（需要 lib_scan/lib_scan_state）")
+    try:
+        started = _jsonish(start_fn()) or {}
+    except Exception as e:
+        return _fail(500, "启动扫描失败: %s" % str(e)[:200],
+                     "看 GET /api/automation/logs?source=error")
+    if not isinstance(started, dict):
+        started = {"started": bool(started), "msg": ""}
+
+    t0 = time.time()
+    state, timed_out = {}, False
+    if wait:
+        while True:
+            try:
+                st = _jsonish(state_fn())
+            except Exception:
+                st = {}
+            state = st if isinstance(st, dict) else {}
+            if not state.get("running"):
+                break
+            if time.time() - t0 >= timeout:
+                timed_out = True
+                break
+            time.sleep(0.25)
+    else:
+        try:
+            st = _jsonish(state_fn())
+        except Exception:
+            st = {}
+        state = st if isinstance(st, dict) else {}
+    return 200, {"ok": True, "started": bool(started.get("started")),
+                 "msg": str(started.get("msg") or ""), "state": state,
+                 "waited_s": round(time.time() - t0, 1), "timed_out": timed_out}
 
 
 def _system_proxy():
@@ -1775,6 +2121,14 @@ def dispatch(path, method, query, body, api, ctx):
             return _library(api, ctx, q)
         if path == "/api/automation/library/op":
             return _library_op_state(api, ctx, q)
+        if path == "/api/automation/gallery":
+            return _gallery_list(api, ctx, q)
+        if path == "/api/automation/gallery/item":
+            return _gallery_item(api, ctx, q)
+        if path == "/api/automation/gallery/tags":
+            return _gallery_tags(api, ctx, q)
+        if path == "/api/automation/gallery/scan":
+            return _gallery_scan_state(api, ctx)
         if path == "/api/automation/images/state":
             return _images_state(api, ctx, q)
         if path == "/api/automation/storage":
@@ -1812,6 +2166,10 @@ def dispatch(path, method, query, body, api, ctx):
             return _library_scan(api, ctx, body)
         if path == "/api/automation/library/op":
             return _library_op(api, ctx, body)
+        if path == "/api/automation/gallery/op":
+            return _gallery_op(api, ctx, body)
+        if path == "/api/automation/gallery/scan":
+            return _gallery_scan(api, ctx, body)
         if path == "/api/automation/images/download":
             return _images_download(api, ctx, body)
         if path == "/api/automation/workflow/analyze":

@@ -972,5 +972,311 @@ class PostprocessWaitTest(unittest.TestCase):
         self.assertEqual(automation_api._expect_sidecars(self.api), [])
 
 
+class GalleryFakeApi(FakeApi):
+    """资源库（ComfyUI output 媒体库）桩：lib_* 全部离线，且记录收到的参数。"""
+
+    def __init__(self, tmp):
+        super().__init__(tmp)
+        self.lib_calls = []
+        self.gallery_items = [
+            {"id": 1, "filename": "a.png", "kind": "image", "starred": False, "tags": []},
+            {"id": 2, "filename": "b.mp4", "kind": "video", "starred": True,
+             "tags": [{"id": 3, "name": "精选"}]},
+            {"id": 3, "filename": "c.png", "kind": "image", "starred": False, "tags": []},
+        ]
+        self.gallery_facets = {"kinds": {"image": 2, "video": 1}, "starred": 1, "total": 3}
+        self.scan_states = []
+        self.scan_result = {"started": True, "msg": ""}
+        self.deletable = {1, 2}
+
+    def lib_list(self, flt_json):
+        flt = json.loads(flt_json)
+        self.lib_calls.append(("lib_list", flt))
+        offset = int(flt.get("offset") or 0)
+        limit = int(flt.get("limit") or 50)
+        return json.dumps({"ok": True, "items": self.gallery_items[offset:offset + limit],
+                           "total": len(self.gallery_items), "offset": offset, "limit": limit,
+                           "facets": self.gallery_facets}, ensure_ascii=False)
+
+    def lib_detail(self, item_id):
+        self.lib_calls.append(("lib_detail", item_id))
+        row = next((r for r in self.gallery_items if r["id"] == item_id), None)
+        if row is None:
+            return json.dumps({"ok": False, "msg": "条目不存在"}, ensure_ascii=False)
+        return json.dumps(dict({"ok": True, "width": 1024, "height": 1024}, **row),
+                          ensure_ascii=False)
+
+    def lib_tags(self):
+        self.lib_calls.append(("lib_tags",))
+        return json.dumps([{"id": 3, "name": "精选", "color": "#888",
+                            "parent_id": None, "count": 2}], ensure_ascii=False)
+
+    def lib_set_star_batch(self, ids_json, on):
+        ids = json.loads(ids_json)
+        self.lib_calls.append(("lib_set_star_batch", ids, on))
+        return {"ok": True, "count": len(ids)}
+
+    def lib_tag_add_batch(self, ids_json, tag_ids_json):
+        ids, tag_ids = json.loads(ids_json), json.loads(tag_ids_json)
+        self.lib_calls.append(("lib_tag_add_batch", ids, tag_ids))
+        return {"ok": True, "count": len(ids), "tags": {str(i): tag_ids for i in ids}}
+
+    def lib_tag_remove_batch(self, ids_json, tag_ids_json):
+        ids, tag_ids = json.loads(ids_json), json.loads(tag_ids_json)
+        self.lib_calls.append(("lib_tag_remove_batch", ids, tag_ids))
+        return {"ok": True, "count": len(ids), "tags": {}}
+
+    def lib_tag_save(self, tag_id, name, color, parent_id=-1):
+        self.lib_calls.append(("lib_tag_save", tag_id, name, color, parent_id))
+        if not name:
+            return {"ok": False, "id": 0, "msg": "标签名不能为空"}
+        return {"ok": True, "id": 7, "msg": ""}
+
+    def lib_tag_delete(self, tag_id):
+        self.lib_calls.append(("lib_tag_delete", tag_id))
+        return {"ok": True, "removed": 1}
+
+    def lib_delete(self, item_id):
+        self.lib_calls.append(("lib_delete", item_id))
+        if item_id in self.deletable:
+            return {"ok": True, "msg": "已移入回收站"}
+        return {"ok": False, "msg": "文件不存在"}
+
+    def lib_scan(self):
+        self.lib_calls.append(("lib_scan",))
+        return dict(self.scan_result)
+
+    def lib_scan_state(self):
+        self.lib_calls.append(("lib_scan_state",))
+        if self.scan_states:
+            return self.scan_states.pop(0)
+        return {"running": False, "phase": "done", "done": 1, "total": 1,
+                "msg": "扫描完成", "roots": [], "errors": []}
+
+
+class GalleryApiTest(unittest.TestCase):
+    """资源库 6 个端点：列表/详情/标签/写操作/删除/扫描（全部走 dispatch）。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.api = GalleryFakeApi(__import__("pathlib").Path(self.tmpdir.name))
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def call(self, path, method="GET", query=None, body=None):
+        return automation_api.dispatch(path, method, query or {}, body, self.api, ctx(self.api))
+
+    def test_manifest_lists_all_six_gallery_endpoints(self):
+        status, body = self.call("/api/automation")
+        self.assertEqual(status, 200)
+        routes = {(e["method"], e["path"]) for e in body["endpoints"]}
+        for route in (("GET", "/api/automation/gallery"),
+                      ("GET", "/api/automation/gallery/item"),
+                      ("GET", "/api/automation/gallery/tags"),
+                      ("POST", "/api/automation/gallery/op"),
+                      ("GET", "/api/automation/gallery/scan"),
+                      ("POST", "/api/automation/gallery/scan")):
+            self.assertIn(route, routes, route)
+
+    def test_gallery_list_overrides_paging_and_trims_fields(self):
+        status, body = self.call("/api/automation/gallery", query={
+            "filter": ['{"kind":"image","starred":true,"limit":999,"offset":7}'],
+            "limit": ["2"], "offset": ["1"], "with_facets": ["1"],
+            "fields": ["id,filename"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["total"], 3)
+        self.assertEqual(body["offset"], 1)
+        self.assertEqual(body["limit"], 2)
+        self.assertEqual([row["id"] for row in body["items"]], [2, 3])
+        self.assertEqual(set(body["items"][0]), {"id", "filename"})
+        self.assertEqual(body["facets"]["starred"], 1)
+        name, flt = self.api.lib_calls[-1]
+        self.assertEqual(name, "lib_list")
+        self.assertEqual(flt["limit"], 2)
+        self.assertEqual(flt["offset"], 1)
+        self.assertEqual(flt["with_facets"], 1)
+        self.assertEqual(flt["kind"], "image")
+        self.assertTrue(flt["starred"])
+
+    def test_gallery_list_facets_none_becomes_empty_dict(self):
+        self.api.gallery_facets = None
+        status, body = self.call("/api/automation/gallery", query={"with_facets": ["1"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["facets"], {})
+
+    def test_gallery_list_rejects_bad_filter_and_paging(self):
+        status, body = self.call("/api/automation/gallery", query={"filter": ["{bad"]})
+        self.assertEqual(status, 400)
+        self.assertIn("hint", body)
+        status, body = self.call("/api/automation/gallery", query={"filter": ["[1,2]"]})
+        self.assertEqual(status, 400)
+        self.assertIn("JSON 对象", body["msg"])
+        for query in ({"limit": ["501"]}, {"limit": ["0"]}, {"offset": ["-1"]},
+                      {"limit": ["abc"]}):
+            status, body = self.call("/api/automation/gallery", query=query)
+            self.assertEqual(status, 400, query)
+            self.assertIn("hint", body, query)
+
+    def test_gallery_item_found_and_missing(self):
+        status, body = self.call("/api/automation/gallery/item",
+                                 query={"id": ["2"], "fields": ["id,item.filename"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], 2)
+        self.assertEqual(body["item"]["filename"], "b.mp4")
+        self.assertNotIn("kind", body["item"])
+        self.assertEqual(self.api.lib_calls[-1], ("lib_detail", 2))
+
+        status, body = self.call("/api/automation/gallery/item", query={"id": ["999"]})
+        self.assertEqual(status, 404, body)
+        self.assertIn("gallery", body["hint"])
+        for bad in ("0", "-2", "abc", ""):
+            status, _body = self.call("/api/automation/gallery/item", query={"id": [bad]})
+            self.assertEqual(status, 400, bad)
+
+    def test_gallery_tags_shape_and_fields(self):
+        status, body = self.call("/api/automation/gallery/tags",
+                                 query={"fields": ["id,name"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(set(body["tags"][0]), {"id", "name"})
+        self.assertEqual(body["tags"][0]["name"], "精选")
+
+    def test_gallery_star_dedupes_and_reports_requested(self):
+        status, body = self.call("/api/automation/gallery/op", "POST",
+                                 body={"op": "star", "ids": [2, 1, 2]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {"ok": True, "op": "star", "count": 2, "requested": 2})
+        self.assertEqual(self.api.lib_calls[-1], ("lib_set_star_batch", [2, 1], True))
+
+        status, body = self.call("/api/automation/gallery/op", "POST",
+                                 body={"op": "star", "ids": [1], "on": False})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.api.lib_calls[-1], ("lib_set_star_batch", [1], False))
+
+    def test_gallery_tag_add_and_remove_keep_bottom_shape(self):
+        status, body = self.call("/api/automation/gallery/op", "POST",
+                                 body={"op": "tag-add", "ids": [1, 2], "tag_ids": [3, 3]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["op"], "tag-add")
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["tags"], {"1": [3], "2": [3]})
+        self.assertEqual(self.api.lib_calls[-1], ("lib_tag_add_batch", [1, 2], [3]))
+
+        status, body = self.call("/api/automation/gallery/op", "POST",
+                                 body={"op": "tag-remove", "ids": [1], "tag_ids": [3]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["op"], "tag-remove")
+        self.assertEqual(self.api.lib_calls[-1], ("lib_tag_remove_batch", [1], [3]))
+
+    def test_gallery_tag_save_and_delete(self):
+        status, body = self.call("/api/automation/gallery/op", "POST",
+                                 body={"op": "tag-save", "name": "精选", "color": "#888"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], 7)
+        self.assertEqual(self.api.lib_calls[-1], ("lib_tag_save", 0, "精选", "#888", -1))
+
+        status, body = self.call("/api/automation/gallery/op", "POST",
+                                 body={"op": "tag-save", "name": "   "})
+        self.assertEqual(status, 400)
+        self.assertIn("hint", body)
+
+        status, body = self.call("/api/automation/gallery/op", "POST",
+                                 body={"op": "tag-delete", "id": 3})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["removed"], 1)
+        self.assertEqual(self.api.lib_calls[-1], ("lib_tag_delete", 3))
+
+    def test_gallery_op_rejects_unknown_and_bad_ids(self):
+        status, body = self.call("/api/automation/gallery/op", "POST", body={"op": "explode"})
+        self.assertEqual(status, 400)
+        for op in automation_api.GALLERY_OPS:
+            self.assertIn(op, body["msg"])
+        for bad in ({"op": "star", "ids": "1"}, {"op": "star", "ids": []},
+                    {"op": "star", "ids": [0]}, {"op": "star", "ids": ["x"]},
+                    {"op": "tag-add", "ids": [1], "tag_ids": []},
+                    {"op": "star", "ids": list(range(1, 502))}):
+            status, body = self.call("/api/automation/gallery/op", "POST", body=bad)
+            self.assertEqual(status, 400, bad)
+            self.assertIn("hint", body, bad)
+
+    def test_gallery_delete_requires_confirm_and_aggregates_results(self):
+        for body in ({"op": "delete", "ids": [1]},
+                     {"op": "delete", "ids": [1], "confirm": False},
+                     {"op": "delete", "ids": [1], "confirm": "false"}):
+            status, out = self.call("/api/automation/gallery/op", "POST", body=body)
+            self.assertEqual(status, 400, body)
+            self.assertIn("confirm", out["msg"])
+            self.assertIn("sidecar", out["hint"])
+        self.assertFalse([c for c in self.api.lib_calls if c[0] == "lib_delete"],
+                         "未确认时绝不能调用 lib_delete")
+
+        status, out = self.call("/api/automation/gallery/op", "POST",
+                                body={"op": "delete", "ids": [1, 2, 999], "confirm": True})
+        self.assertEqual(status, 200, out)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["op"], "delete")
+        self.assertEqual(out["deleted"], 2)
+        self.assertEqual(out["failed"], 1)
+        self.assertEqual([r["id"] for r in out["results"]], [1, 2, 999])
+        self.assertEqual([r["ok"] for r in out["results"]], [True, True, False])
+        self.assertTrue(out["results"][2]["msg"])
+        self.assertEqual([c for c in self.api.lib_calls if c[0] == "lib_delete"],
+                         [("lib_delete", 1), ("lib_delete", 2), ("lib_delete", 999)])
+
+    def test_gallery_scan_waits_until_running_false(self):
+        self.api.scan_states = [
+            {"running": True, "phase": "walk", "done": 0, "total": 3,
+             "msg": "", "roots": [], "errors": []},
+            {"running": False, "phase": "done", "done": 3, "total": 3,
+             "msg": "扫描完成", "roots": [], "errors": []},
+        ]
+        status, body = self.call("/api/automation/gallery/scan", "POST",
+                                 body={"wait": True, "timeout": 5})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["started"])
+        self.assertFalse(body["timed_out"])
+        self.assertEqual(body["state"]["done"], 3)
+        self.assertFalse(body["state"]["running"])
+        self.assertIn(("lib_scan",), self.api.lib_calls)
+        self.assertGreaterEqual(
+            len([c for c in self.api.lib_calls if c[0] == "lib_scan_state"]), 2)
+
+    def test_gallery_scan_already_running_still_waits(self):
+        self.api.scan_result = {"started": False, "msg": "资源库扫描已在进行"}
+        self.api.scan_states = [
+            {"running": True, "phase": "parse", "done": 1, "total": 2,
+             "msg": "", "roots": [], "errors": []},
+            {"running": False, "phase": "done", "done": 2, "total": 2,
+             "msg": "扫描完成", "roots": [], "errors": []},
+        ]
+        status, body = self.call("/api/automation/gallery/scan", "POST",
+                                 body={"wait": 1, "timeout": 5})
+        self.assertEqual(status, 200, body)
+        self.assertFalse(body["started"])
+        self.assertEqual(body["msg"], "资源库扫描已在进行")
+        self.assertFalse(body["state"]["running"])
+        self.assertFalse(body["timed_out"])
+
+    def test_gallery_scan_state_endpoint(self):
+        self.api.scan_states = [{"running": True, "phase": "walk", "done": 0, "total": 9,
+                                 "msg": "", "roots": [], "errors": []}]
+        status, body = self.call("/api/automation/gallery/scan")
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["state"]["running"])
+        self.assertEqual(body["state"]["total"], 9)
+
+    def test_gallery_scan_without_wait_returns_current_state(self):
+        status, body = self.call("/api/automation/gallery/scan", "POST",
+                                 body={"wait": False, "timeout": 0})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["started"])
+        self.assertFalse(body["timed_out"])
+        self.assertIn("state", body)
+        self.assertEqual(self.api.lib_calls[0], ("lib_scan",))
+
+
 if __name__ == "__main__":
     unittest.main()

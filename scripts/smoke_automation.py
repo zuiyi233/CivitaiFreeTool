@@ -112,6 +112,14 @@ def main():
 
     st, lib = http(B, "/api/automation/library?limit=3")
     check("library", st == 200 and isinstance(lib.get("rows"), list))
+    st, gal = http(B, "/api/automation/gallery?limit=2")
+    check("gallery", st == 200 and isinstance(gal.get("items"), list) and "count" in gal)
+    st, gtags = http(B, "/api/automation/gallery/tags")
+    check("gallery-tags", st == 200 and isinstance(gtags.get("tags"), list))
+    st, gscan = http(B, "/api/automation/gallery/scan")
+    check("gallery-scan-state", st == 200 and "running" in (gscan.get("state") or {}))
+    st, gitem = http(B, "/api/automation/gallery/item?id=999999999")
+    check("gallery-item-404", st == 404 and gitem.get("hint"), gitem)
     row = (lib.get("rows") or [{}])[0]
     if row.get("path") and os.path.isfile(row["path"]):
         st, detail = http(B, "/api/automation/model?path=" + urllib.parse.quote(row["path"]))
@@ -147,6 +155,8 @@ def main():
     check("workflow-404", st == 404, wf)
     st, mm = http(B, "/api/automation/library/op", "POST", {"op": "nope"})
     check("library-op-400", st == 400, mm)
+    st, gop = http(B, "/api/automation/gallery/op", "POST", {"op": "nope", "ids": [1]})
+    check("gallery-op-400", st == 400 and gop.get("hint"), gop)
     st, mv = http(B, "/api/automation/move", "POST", {"path": "Z:/nope.safetensors"})
     check("move-400", st == 400 and mv.get("hint"), mv)
     st, rn = http(B, "/api/automation/rename", "POST", {})
