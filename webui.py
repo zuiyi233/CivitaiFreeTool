@@ -14,7 +14,7 @@ import urllib.parse
 
 import webview
 
-APP_VERSION = "2.6.31"
+APP_VERSION = "2.6.32"
 
 from functools import wraps
 

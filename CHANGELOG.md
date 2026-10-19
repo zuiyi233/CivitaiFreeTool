@@ -1,4 +1,4 @@
-# CivitaiFreeTool 更新日志（v1.5.1 → v2.6.31）
+# CivitaiFreeTool 更新日志（v1.5.1 → v2.6.32）
 
 ## 🌐 局域网无头服务器资产接入（本 fork 新增）
 
@@ -15,6 +15,41 @@
 - 仅限局域网使用，不要把 445 端口暴露到公网；建议账号密码登录而非免密 guest
 
 ---
+
+## v2.6.32：AI 自动化面 + 已下载不再白传 + 资源库自动化
+
+这一版把「AI / 脚本驱动这个工具」从只能点界面变成一套可自描述的 HTTP 面：先落 **28 个自动化端点**（发现 `/schema`、干跑 `/plan`、执行 `/download`、观测 `/state` `/tasks` `/events` `/history` `/logs`、运维 `/library/op` `/images/*` `/workflow/analyze`、排障 `/connectivity` `/prompts` `/verify` 等），随后沿真实调用卡点继续扩面，并修掉几个会让「下载成功」变成假象的链路缺陷。
+
+### AI 自动化接口
+1. **一次 HTTP 跑一组调用**：`POST /api/automation/batch` 最多 50 条本层调用，逐条带 `http_status`，batch 本身恒 200，`stop_on_error` 可控——AI 不必为一组查询开多次往返。
+2. **字段投影**：列表/详情端点支持 `fields=`（含 `info.routed_dir` 这类点号路径），实测 `/library?limit=200` 载荷 56.6KB → 38.3KB（-32%）。
+3. **文件与目录**：`POST /move` 移动模型 / 任务落点 / 历史记录（只接受已存在的绝对目录，不代建）；`POST /rename` 单文件与批量改名（preview 只算不改）；`GET /fs` 只读目录浏览（列盘符与一层目录，不读文件内容），补上「AI 拿不到 pick_dir 结果、无法选择任意落点」的缺口。
+4. **运维与修复**：`POST /storage/migrate`（必须 `confirm:true`）、`POST /tasks/repair`（按 stage 重跑收尾，带完成信号）、`POST /history` 清理指定记录（`remove` / `clear` / `preview`，只删记录与历史缓存，**绝不删模型文件**；预览不落盘，未知 id 进 `missing` 不报错）。`library/op` 扩到 organize / rename-c / rename-preview / translate-descs / cleanup（cleanup 与 dedupe-delete 要求 `confirm:true`）。
+5. **错误统一 `{ok:false,msg,hint}`**：hint 直接给下一步动作（例如 400 时提示先 `POST /resolve` 看有哪些 `file_id`），AI 不用猜该重试还是改参数。
+
+### 可靠性与修复（用户能直接感觉到）
+1. **已存在的模型不再白传**：`POST /download` 发现目标文件已在时返回 `{skipped:"exists", task:null}` 并给 `force:true` 的 hint，实测 5.8s 返回、0 传输、不建任务；此前对已下载模型会老实再传一遍（实测 284MB），覆盖同名文件、拖慢队列，界面上还看不出来。
+2. **收尾未完成不再假失败**：`status=done` 只代表传输结束，收尾线程还在写 sidecar。任务行新增 `postprocess{done,stages,finished_at}`，`download(wait=1,verify=1)` 在 verify 前等它（30s 预算），9.1MB 模型的「下载成功却判失败」不再复现；收尾失败也不再 `except: pass`，元数据/封面/视频/旧版清理的失败写 error.log 并挂到 `postprocess_errors`，下载页状态列显示「收尾未完成」。
+3. **verify 不再把「配置不要求写的文件」算成缺失**：`ok` 只看文件本身是否可用，`bundle_ok` 看配置要求的附属文件是否齐全，`sidecars.expected_missing` 列出缺哪些；没配 API Key 时评论文件本就不会写、`metadata_format=civitai` 不写 `.json`，不再因此判失败。
+4. **外部改配置 1s 内生效**：`save_config` 递增 `cfg_rev`，前端每 2 个周期轮询 `get_ui_flags` 并应用门禁字段（实测 1.0s，此前永不生效）。
+5. **视频扩展名跟随源**：不再一律写成 `.mp4`，`.avi` / `.webm` / `.mkv` 存真扩展名；同时修 `_images_fill_targets` 的 `have_video` 分支可能指向不存在文件。
+6. **`.part` 清理漏判**：`_cleanup_removed_part` 的引用判断只看还可能写的任务（pending / downloading / paused）。此前一个已完成任务占着同一目标路径也算「仍被引用」，对已存在模型重复下载后移除任务，实测 191MB 的 `.part` 被永久保留。`.part` 改名失败也不再假报 DONE：退避重试 4 次，仍失败转 ERROR 并说明完整内容在 `.part`。
+7. **镜像站与扩展链路**：公开 API、下载链接、历史记录与图片页链接跟随 `site_domain`（此前硬编码 `civitai.com`，只有镜像站可达时整条超时）；扩展离屏文档只有 `chrome.runtime`，content 消息改由 background 代发并加 ping/ready 握手，归档不再卡在「准备归档」；`plan` 不再无条件多拉一次 `/v1/models`（实测 2.3s），版本响应自带 `model{name,type}`。
+
+### 本版新增（并行交付）
+- **`_评论.txt` 跟随 `rename_to_civitai` 改名**：v2.6.31 的已知边界（按 C 站名改名后评论文件留在旧名前缀下）已修，sidecar 名单补上该后缀，改名与回退一并处理。
+- **资源库自动化面**：`GET /api/automation/gallery`、`GET /api/automation/gallery/item`、`GET /api/automation/gallery/tags`、`POST /api/automation/gallery/op`（收藏 / 加摘标签 / 删除）、`GET/POST /api/automation/gallery/scan`。删除走系统回收站，且只回收媒体本体、不连带 sidecar（与界面「删除只回收媒体本体」同口径）。
+
+### 升级注意
+- 只替换 EXE，配置 / 任务 / 历史 / 模型 / 缓存都保留。浏览器扩展本版无功能改动，但 2.6.31 之后已从 2.2.0 升到 **2.3.0**（固定扩展 ID）：2.2.0 及更早的用户需一次性「移除旧条目 → 加载新目录」，之后每次只需「重新加载」；已在 2.3.0 的用户无需重装。
+
+### 测试基线与已知边界
+- 发布前实测（隔离目录直接运行打包后的 v2.6.32 EXE）：pytest **1168 passed / 7 skipped / 401 subtests**；`smoke_automation` **42/42**（含 gallery 五项）；`ai_flow_audit` **12 步、阻塞项 0**（1.6s）；`ai_ui_audit` **6/6**（外部改配置后前端 1.03s 生效）。
+- **评论正文仍需已登录标签页**：API Key 对评论计数一律返回 0，纯桌面端只保证评价；「登录会话能拿到非空评论正文」仍未实测证实。
+- **评价最多 250 条**（5 页 × 50），超出时文件里写明「站点共 N 条，本次只保存前 250 条」。
+- **不做历史回填**：只有新完成的下载才生成评论文件；`/history` 清理也只删记录与历史缓存，不动模型。
+- **自动化端点仅本机信任**：面向本机 AI / 脚本，不额外做鉴权，不要暴露到公网。
+- `/download` 的 `skipped=exists` 预判只看单条 `url` / `model_id`；`urls` / `file_ids` 批量与关闭分流时不预判（算不出落点），行为同旧版。
 
 ## v2.6.31：扩展↔桌面端这条链路修通，评价/评论回到归档里
 
