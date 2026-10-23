@@ -321,6 +321,8 @@ CivitaiFreeToolCLI.exe call cft_view_gallery --args '{"ids":[1,2]}' --save-conte
 - 退出码：0 成功 / 2 用法 / 3 app 未运行 / 4 参数 / 5 未找到 / 6 需确认 / 7 限流 / 8 超时 / 9 版本。
 - `events` 默认跟随并断线重连；`--max N` 或 `--idle-timeout S` 收口；`--json` 是 NDJSON。
 - 需要图片时 `--save-content DIR` 落盘，stdout 不喷 base64。
+- 值里带空格时**别用 `--arg`**（`--arg sort=Most Downloaded` 会被 shell 拆成两个参数，CLI 直接报
+  未知参数）；改用 `--args '{"query":"detailer","sort":"Most Downloaded"}'`。数组/对象同理。
 
 ### 9.2 webhook（先得到用户同意）
 
@@ -350,4 +352,36 @@ curl -s -X POST http://127.0.0.1:47531/api/automation/webhooks \
 - 重试 4 次（1s/5s/15s），不跟随 3xx；队列满/应用退出会丢事件，`stats.dropped` 如实记录。
 - **不要**把 `webhook_secret` 写进回答/日志/仓库；不要在用户未明确同意时设
   `webhook_allow_remote=true`；不要把 webhook 当成可靠队列（需要重放用 SSE）。
+
+### 9.3 验证「下载完成 → webhook」真的通了
+
+`{"action":"test"}` 只证明签名与连通，不证明下载器真的把 `task.*` 推进了队列。
+要拿这条链路的证据，用自带脚本跑一次真实下载（默认只连回环、只动临时目录，不开浏览器）：
+
+```bash
+python scripts/verify_webhook_delivery.py \
+  --model-url "https://civitai.red/models/178167" \
+  --dest-dir .\.tools\hook-check\downloads --timeout-s 900 --json
+```
+
+脚本会：起一个本机接收端 → 用 `POST /api/automation/config` 临时打开 webhook（`webhook_events:["all"]`）
+→ 调 `cft_download_model {wait,verify,timeout_s}` → 等投递队列清空 → 逐条校验
+`X-CFT-Signature` 与 `X-CFT-Timestamp` 偏差 → **按原值还原全部 webhook 与落点配置**并归档本次任务。
+
+判据（2026-10-24 对打包 2.8.0 实例的实测）：
+
+```text
+events = {task.created: 1, task.updated: 3, task.finished: 1, api.call: 2}
+signature_all_valid = true, header_body_consistent = true, max_clock_skew_s = 0.7
+download = {ok: true, status: done, waited_s: 16.3, verify.bundle_ok: true}
+落盘 57,417,531B，本机 SHA-256 与 C 站公布值逐位一致
+```
+
+- 只给 `--probe-only`（或不带 `--model-url`）时判据换成「收到 `webhook.test` 且签名有效」，
+  不再要求 `task.*`。
+- `verify.sha256_ok` 可能是 `null`：按路径复验时不重算哈希，完整性结论以任务记录的
+  `verification_status=verified` + `expected_sha256` 为准（`GET /api/automation/history?detail=1` 可查）。
+- 事件默认组不含 `api.call`；`webhook_events:["all"]` 会把它也推出去，验证时用 `"all"` 是为了
+  确认高频事件也不会堵队列，正式接入建议只写 `["task","file_choice","ui","scan","config","app"]`。
+- 这个脚本会真实占用一次下载配额与磁盘，跑前确认目标模型与临时目录；它不删除已下载文件。
 

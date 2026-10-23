@@ -93,6 +93,7 @@ description: "Control the local CivitaiFreeTool desktop app via MCP; search, dow
 | 端到端调用序列与预期结果 | [references/recipes.md](references/recipes.md) |
 | OpenAPI 导入、每工具别名、SSE 订阅与重连 | [references/recipes.md](references/recipes.md) §8 |
 | CLI 子命令/退出码、webhook 配置/签名/测试 | [references/recipes.md](references/recipes.md) §9；[docs/ai-cli-webhook.md](../../docs/ai-cli-webhook.md) |
+| 证明真实下载把 `task.*` 推到了 webhook | [references/recipes.md](references/recipes.md) §9.3 + `scripts/verify_webhook_delivery.py` |
 | 视觉工具、delivery、contact sheet、视频首帧 | [references/vision.md](references/vision.md) |
 | 本机边界、token、破坏性确认、路径越界 | [references/safety.md](references/safety.md) |
 | 连通性/代理/DNS 诊断脚本 | [scripts/cft_doctor.py](scripts/cft_doctor.py) |

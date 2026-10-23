@@ -312,7 +312,7 @@ curl -s -X POST http://127.0.0.1:47531/api/automation/webhooks \
 | webhook 单元 | URL/密钥/事件名校验；userinfo/fragment/非 http 拒绝；公网默认拒绝、显式允许；HMAC 正确；过滤；队列满丢弃；重定向不跟随；日志/状态脱敏 |
 | webhook 集成 | 本机接收端 500→500→200 重试成功；400 不重试；`test` 合成事件头/签名/body schema；关闭后不再投递 |
 | CLI 单元 | 本机 fake bridge：参数类型、`--args` 合并、工具别名、错误退出码、app 不在线、SSE `--max`、NDJSON、batch、doctor |
-| 真机 | 源码桥：CLI `call cft_capabilities`、`events --max 1`、webhook `test` 收到并通过 HMAC 校验；打包：CLI EXE 对打包 Web EXE 重复上述链路 |
+| 真机 | 源码桥：CLI `call cft_capabilities`、`events --max 1`、webhook `test` 收到并通过 HMAC 校验；打包：CLI EXE 对打包 Web EXE 重复上述链路；**另加一次真实下载**，确认接收端真收到 `task.created/updated/finished`（见 §5.2） |
 | 文档 | 本文与 `ai-integration.md` / `automation-api.md` / `README` / Skill recipes 同步；未验证项明确标注 |
 
 ### 5.1 本轮真机验收（2026-10-24，复核修复后重跑）
@@ -333,9 +333,27 @@ curl -s -X POST http://127.0.0.1:47531/api/automation/webhooks \
   运行的 47531 实例；没有替换/停止用户的 47531 实例。隔离副本与构建产物是临时验证物，不随仓库发布。
 - `CivitaiFreeToolCLI.exe` 为 PyInstaller onefile（约 8.8MB），分别对源码桥与打包 Web EXE 跑过
   `doctor` / `call` / `events`。
-- **未制造**真实下载/多文件待选来触发 `task.*` / `file_choice.*` webhook；这两类由事件总线
-  单测与 `webhook.test` 探针覆盖，不声称已做真机下载推送。
 - Dify/n8n 等第三方平台仍不做导入验收；本机接收端只验证传输契约（头、签名、状态码、重试）。
+
+### 5.2 `task.*` 真实下载链路（2026-10-24，v2.8.0）
+
+`webhook.test` 只证明签名与连通。这一轮补上「下载器 → EventHub → webhook → 接收端」的真机证据，
+用 `scripts/verify_webhook_delivery.py`（跑法与判据见 Skill recipes §9.3）：
+
+| 项 | 结果 |
+| --- | --- |
+| 被测产物 | `dist/CivitaiFreeToolWeb.exe`（FileVersion 2.8.0）+ 同目录 `CivitaiFreeToolCLI.exe` |
+| 运行方式 | EXE 拷到 `.tools/rel2800/`，`LOCALAPPDATA` 指向隔离目录、`--browser` + `CFT_NO_BROWSER_OPEN=1`，`tray_icon=false`、`exit_when_page_closed=false`；**全程不打开、不结束任何浏览器** |
+| 网络面 | 47531 空闲（用户实例未运行）后由该实例独占；收尾只按记录的 PID 结束自己的 4 个进程，端口随后复查为 closed |
+| 下载 | `cft_download_model {url,wait,verify,timeout_s}` → `ok=true`、`status=done`、`waited_s=16.3`、落盘 57,417,531B；本机独立算得的 SHA-256 与 C 站公布值 `A1342CB2…FE15753D` 逐位一致 |
+| 收到的事件 | `task.created` ×1、`task.updated` ×3、`task.finished` ×1（另有 `api.call` ×2，因为验证时故意用 `webhook_events:["all"]`） |
+| 签名 | 7/7 条 `X-CFT-Signature` 校验通过；头里的 `X-CFT-Event` 与 body 的 `type` 一致；最大时钟偏差 0.7s |
+| 收尾 | 脚本按原值还原 webhook 与落点配置、归档本次任务；`.tools/rel2800/`（含复制过去的 `user_config.json`）整目录删除 |
+
+- 仍未证实：`file_choice.*` 的多文件待选推送（要造一次真实的多文件选择），以及
+  Dify/n8n 等第三方接收端的导入；这两项继续只由事件总线单测覆盖，不宣称已真机验证。
+- 观测到的一个口径（不是缺陷）：`verify` 里 `sha256_ok=null` 表示按路径复验时不重算哈希，
+  完整性结论以任务记录的 `verification_status=verified` + `expected_sha256` 为准。
 
 ## 6. 非目标（本阶段不做）
 

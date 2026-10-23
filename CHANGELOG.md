@@ -25,7 +25,9 @@
    `x-cft-transports`；`/api/automation` 清单与 `/schema` 增加 webhook 端点/配置键说明。
 5. **打包与文档**：便携 ZIP 增加 `CivitaiFreeToolCLI.exe`（不新增顶层发布资产）；
    `docs/ai-cli-webhook.md` 记录完整契约；新增 `tests/test_webhook.py`、`tests/test_ai_cli.py`，
-   `tests/test_automation_sse.py` 增加 sink 生命周期用例。第三方平台（Dify/n8n 等）仍不做
+   `tests/test_automation_sse.py` 增加 sink 生命周期用例。`scripts/verify_webhook_delivery.py`
+   用一次真实下载证明 `task.created/updated/finished` 确实推到接收端并逐条校验 HMAC
+   （判据与结果见 `docs/ai-cli-webhook.md` §5.2、recipes §9.3）。第三方平台（Dify/n8n 等）仍不做
    虚假导入验收，按文档步骤由有环境的用户验证。
 6. **CLI 输出编码**：非 TTY（管道/重定向）时 stdout/stderr 强制 UTF-8。Windows 默认按 ANSI 代码页
    写出，脚本与 Agent 捕获到的中文错误会变成乱码；交互式控制台行为不变。
