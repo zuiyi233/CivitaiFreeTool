@@ -7,13 +7,15 @@
 //   不传参时行为与脚本完全一致。新增 idbGetAll / idbClear 两个小助手
 //   （供 history.all / importJson 全量读写，逻辑与上同风格）。
 // 约束：顶层不触碰 indexedDB/chrome（只在函数体内使用 indexedDB）。
+// 约束：顶层声明只能用 var/function —— 这个文件会被注入图片/帖子页，扩展重载后后台会把
+//       同一批文件再注一遍到同一个隔离世界，重复声明 const 会抛 SyntaxError 让整批失效。
 globalThis.CFT = globalThis.CFT || {};
 
-const IDB_DB_NAME = 'civitai_archive_db';
-const IDB_STORE = 'kv';
+var IDB_DB_NAME = 'civitai_archive_db';
+var IDB_STORE = 'kv';
 
 // [v1.6.0] 连接复用（OPT-05）：避免每次读写都重新 open（按 库名@store 缓存）
-const _idbPromises = new Map(); // cacheKey -> Promise<IDBDatabase>
+var _idbPromises = new Map(); // cacheKey -> Promise<IDBDatabase>
 function _cacheKey(dbName, storeName) { return String(dbName) + '@' + String(storeName); }
 function _resolveDbTarget(dbName, storeName, opts) {
     const o = opts || {};

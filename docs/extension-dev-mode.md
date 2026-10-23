@@ -50,7 +50,9 @@ python scripts/dev_extension.py --source firefox-extension --loaded <临时载�
 
 ## 必须知道的限制
 
-- **内容脚本改动仍需刷新页面**：浏览器不会把新的 content script 注入已打开页面。
+- **内容脚本改动也不用刷新页面（Chrome 2.7.0 起）**：重载后后台先 `ping` 探测每个已匹配页面里还有没有接收者，
+  确认没了才用 `scripting` 把 manifest 自己声明的那几个文件注回去（只 `files`，不执行任意代码，不注站外）。
+  浏览器本身确实不会自动重注入，这一步是扩展自己补的；Firefox 侧没有内容脚本，不适用。
 - 重载最迟等一次心跳（≤60s）；想立刻生效就切一下标签页，或在扩展页点一次「重新加载」。
 - Firefox 的临时附加组件在浏览器重启后仍要手动临时载入一次（签名策略）。
 - 桌面端必须是含 `/api/ext/dev/*` 的 2.7.0+；旧版会 404，`watch` 会如实报失败。
@@ -71,7 +73,7 @@ python scripts/dev_extension.py --source firefox-extension --loaded <临时载�
 | `reload` 返回 404 | 桌面端是旧版；升级到含 dev 接口的 2.7.0+ |
 | 请求成功但扩展没重载 | 等一次心跳（≤60s）或切标签页；确认浏览器里加载的是 `.tools/.../CivitaiFreeTool-ChromeExtension` 这个路径 |
 | 扩展 ID 变了 | 检查 manifest `key` 是否被删；`link` 不改 manifest |
-| 页面脚本还是旧逻辑 | content script 不热注入；刷新页面 |
+| 页面脚本还是旧逻辑 | 注回只发生在扩展重载/更新时；页面里脚本还有回音就不重复注入（防两个胶囊），此时仍是旧逻辑 → 刷新该页面 |
 | storage 里 `cftDevReloadSeenV1` 太大 | 正常；它只保存最后一次已处理的时间戳 |
 
 ## English summary

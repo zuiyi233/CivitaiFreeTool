@@ -2,6 +2,7 @@
 if (typeof importScripts === 'function') {
   importScripts('tabs-common.js');
   importScripts('lib/tab-index.js');
+  importScripts('lib/model-status.js');
 }
 const ext = typeof browser !== 'undefined' ? browser : chrome;
 const BRIDGE = 'http://127.0.0.1:47531';
@@ -70,13 +71,180 @@ async function maybeDevReload(data) {
   try { ext.runtime.reload(); } catch (_) {}
 }
 
+// ---- 免点击自动显示下载状态（与 Chrome 版共用同一份 lib/model-status.js） ----
+// 缺了这一步，状态只有"打开小窗"才会填：用户看到的就是"徽章是空的、必须点图标"。
+// Firefox 版不注入网页（manifest 里没有 content_scripts，也不申请 scripting），
+// 所以这里只做到逐标签徽章；页面胶囊在 Firefox 确实做不到，README 里如实写明。
+const MS = (globalThis.CFT && globalThis.CFT.modelStatus) || null;
+const STATUS_KEY = MS ? MS.CACHE_KEY : 'cftModelStatusV1';
+const STATUS_HEARTBEAT_ALARM = 'cft-status-heartbeat';
+const STATUS_TAB_LIMIT = 60;   // 一次最多查这么多标签；桥侧上限 500，这里先按实际用量收口
+let _statusRefreshInFlight = null;
+
+function ensureStatusAlarm() {
+  if (!ext.alarms) return;
+  try { ext.alarms.create(STATUS_HEARTBEAT_ALARM, {periodInMinutes: 2}); } catch (_) {}
+}
+
+function collectOpenModelTabs() {
+  if (!MS) return Promise.resolve([]);
+  return ext.tabs.query({}).then((tabs) => {
+    const out = [];
+    for (const tab of tabs || []) {
+      if (!tab || tab.discarded || !Number.isFinite(Number(tab.id))) continue;
+      const link = CftTabs.modelLink(tab.url || '');
+      if (!link || !link.id) continue;
+      out.push({
+        tabId: tab.id,
+        modelId: link.id,
+        versionId: link.version || '',
+        key: MS.keyOf(link.id, link.version || ''),
+        // 发清洗过的链接，不发标签页原始 URL：原始地址里可能带着 token 之类的追踪参数
+        url: link.url || '',
+      });
+      if (out.length >= STATUS_TAB_LIMIT) break;
+    }
+    return out;
+  }).catch(() => []);
+}
+
+async function readStatusCache() {
+  if (!MS) return null;
+  try {
+    const raw = await ext.storage.local.get(STATUS_KEY);
+    return MS.sanitizeCache(raw ? raw[STATUS_KEY] : null);
+  } catch (_) { return MS.sanitizeCache(null); }
+}
+
+// 本机桥失败要区分「没开 CFT」和「CFT 太旧没有这个端点」：两者动作不同。
+// 请求体只有模型/版本 ID 与清洗过的页面 URL，没有 Cookie、没有 API Key、没有正文。
+async function queryBridgeStatus(items) {
+  let r;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, 6000);
+    try {
+      const res = await fetch(BRIDGE + '/api/model/status', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          items: items.map((i) => ({model_id: i.modelId, version_id: i.versionId, url: i.url})),
+          include_updates: true,
+        }),
+        signal: ctrl.signal,
+      });
+      r = {httpOk: res.ok, status: res.status, data: await res.json().catch(() => ({}) )};
+    } finally { clearTimeout(timer); }
+  } catch (_) {
+    return MS.offlineResponse(items, { error: '未连接 CFT' });
+  }
+  if (r.httpOk && r.data && r.data.ok) return MS.normalizeResponse(r.data, { items });
+  if (r.status === 404) {
+    return MS.offlineResponse(items, {
+      offline: false,
+      error: '桌面端版本过旧，不支持下载状态查询（需 CFT 2.7.0 及以上）',
+      reason: '桌面端版本过旧，不支持下载状态查询（需 CFT 2.7.0 及以上）',
+    });
+  }
+  return MS.offlineResponse(items, { error: (r.data && (r.data.msg || r.data.error)) || ('HTTP ' + r.status) });
+}
+
+// 与 Chrome 版同一条口径：桥没开着（或桌面端太旧）时，离线占位不盖掉上次已知状态，
+// 徽章继续显示缓存里那一版结论，只额外带上「离线」说明。
+function entryForItem(it, result, cache) {
+  const key = MS.keyOf(it.modelId, it.versionId) || it.key;
+  const fresh = (result && result.byKey && (result.byKey[key] || result.byKey[it.key])) || null;
+  const cached = MS.getEntry(cache, it.modelId, it.versionId);
+  const degraded = !result || result.ok === false || result.offline === true;
+  if (cached && degraded && fresh) return Object.assign({}, cached, {offline: true});
+  return fresh || cached || null;
+}
+
+async function applyBadge(tabId, entry, offline) {
+  if (!MS || !Number.isFinite(Number(tabId))) return;
+  const lab = entry ? MS.labelOf(entry, {offline: offline === true || entry.offline === true}) : null;
+  try {
+    await ext.action.setBadgeText({tabId, text: lab ? lab.badge : ''});
+    if (lab) await ext.action.setBadgeBackgroundColor({tabId, color: lab.color});
+    // Firefox 才有 setBadgeTitle：徽章悬浮说明只挂在对应标签上，不改全局按钮文案
+    if (lab && ext.action.setBadgeTitle) {
+      await ext.action.setBadgeTitle({tabId, title: lab.label + (lab.detail ? ' · ' + lab.detail : '') + '\n' + lab.title});
+    }
+  } catch (_) { /* 标签已关 / 该宿主不支持逐标签徽章：跳过，不影响其它标签 */ }
+}
+
+// 启动、更新、心跳、标签页抖动常常挤在同几秒里：同一批标签只打一次桥（与 Chrome 同一个窗口）。
+const STATUS_DEDUPE_MS = 1500;
+const _statusInflight = new Map();
+function queryStatusOnce(items) {
+  const sig = items.map((i) => i.key + ':' + i.modelId + ':' + i.versionId).sort().join('|');
+  const now = Date.now();
+  const hit = _statusInflight.get(sig);
+  if (hit && now - hit.at < STATUS_DEDUPE_MS) return hit.promise;
+  const promise = queryBridgeStatus(items).finally(() => {
+    setTimeout(() => {
+      const cur = _statusInflight.get(sig);
+      if (cur && cur.promise === promise) _statusInflight.delete(sig);
+    }, STATUS_DEDUPE_MS);
+  });
+  _statusInflight.set(sig, {at: now, promise});
+  return promise;
+}
+
+function refreshOpenTabsStatus(reason) {
+  if (!MS) return Promise.resolve({ ok: false, count: 0, reason: reason || '', error: '状态模块未加载' });
+  if (_statusRefreshInFlight) return _statusRefreshInFlight;
+  return collectOpenModelTabs().then((items) => {
+    if (!items.length) return { ok: true, count: 0, reason: reason || '' };
+    const run = readStatusCache().then((cache) => queryStatusOnce(items).then((result) => {
+      const offline = !!(result && result.offline);
+      return Promise.all(items.map((it) => applyBadge(it.tabId, entryForItem(it, result, cache), offline)))
+        .then(() => ({ ok: true, count: items.length, reason: reason || '' }));
+    }));
+    _statusRefreshInFlight = run.catch(() => ({ ok: false, count: items.length, reason: reason || '' }))
+      .then((out) => { _statusRefreshInFlight = null; return out; });
+    return _statusRefreshInFlight;
+  });
+}
+
+// 新开的模型页不必等下一次心跳才有徽章：先用缓存里那一版结论点上，不打网络。
+// 缓存里没有就保持空徽章（"没查过"不等于"未下载"），心跳会把它补上。
+function applyCachedBadge(tabId, url) {
+  if (!MS || !Number.isFinite(Number(tabId))) return Promise.resolve();
+  const link = CftTabs.modelLink(url || '');
+  if (!link || !link.id) return Promise.resolve();
+  return readStatusCache().then((cache) => applyBadge(tabId, MS.getEntry(cache, link.id, link.version || '')))
+    .catch(() => {});
+}
+
+// SW/事件页每次醒来都把心跳登记好，并判断"这是不是一次冷启动"。
+// 只挂在 onInstalled/onStartup 上不够：chrome.runtime.reload()（开发态重载就是它）之后
+// 浏览器不一定再把 onInstalled 交给新的后台，只等事件把它唤醒——那条链不跑，徽章就一直空着。
+const BOOT_WAKE_KEY = 'cftBootWakeAtV1';
+const BOOT_WAKE_MIN_MS = 90 * 1000;   // 90 秒内的重复唤醒不补整轮
+function bootWake() {
+  if (!MS) return Promise.resolve({ok: false, reason: 'boot', error: '状态模块未加载'});
+  ensureStatusAlarm();
+  const probeAlarm = ext.alarms && typeof ext.alarms.getAll === 'function'
+    ? ext.alarms.getAll().then((all) => (all || []).some((a) => a && a.name === STATUS_HEARTBEAT_ALARM)).catch(() => true)
+    : Promise.resolve(true);
+  return Promise.all([probeAlarm, ext.storage.local.get(BOOT_WAKE_KEY)]).then(([hasAlarm, saved]) => {
+    const now = Date.now();
+    const last = Number(saved && saved[BOOT_WAKE_KEY]) || 0;
+    if (hasAlarm && now - last < BOOT_WAKE_MIN_MS) return {ok: true, skipped: true};
+    try { ext.storage.local.set({[BOOT_WAKE_KEY]: now}); } catch (_) { /* 写不进去也要继续补 */ }
+    return refreshOpenTabsStatus('boot');
+  }).catch(() => ({ok: false}));
+}
+
 function ensureTabIndexAlarm() {
   if (!ext.alarms) return;
   try { ext.alarms.create(TAB_INDEX_ALARM, {periodInMinutes: 1}); } catch (_) {}
 }
 if (ext.alarms && ext.alarms.onAlarm) {
   ext.alarms.onAlarm.addListener((alarm) => {
-    if (alarm && alarm.name === TAB_INDEX_ALARM) void pushTabIndex();
+    if (!alarm) return;
+    if (alarm.name === TAB_INDEX_ALARM) void pushTabIndex();
+    else if (alarm.name === STATUS_HEARTBEAT_ALARM) void refreshOpenTabsStatus('heartbeat');
   });
 }
 const STORE = 'lastBatch';
@@ -156,6 +324,7 @@ ext.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   scheduleTabIndexPush(TAB_INDEX_DEBOUNCE_MS);
   if (changeInfo.url !== undefined || changeInfo.status === 'complete') {
     void rememberVisit(tab || {id:tabId, url:changeInfo.url, title:''});
+    void applyCachedBadge(tabId, (tab && tab.url) || changeInfo.url || '');
   }
 });
 for (const name of ['onCreated', 'onActivated', 'onMoved', 'onAttached', 'onDetached']) {
@@ -164,15 +333,20 @@ for (const name of ['onCreated', 'onActivated', 'onMoved', 'onAttached', 'onDeta
 ext.tabs.onRemoved.addListener(() => scheduleTabIndexPush(300));
 ensureTabIndexAlarm();
 scheduleTabIndexPush(1200);
+void bootWake();
 ext.runtime.onStartup.addListener(() => {
   void rememberOpenTabs();
   ensureTabIndexAlarm();
   scheduleTabIndexPush(800);
+  ensureStatusAlarm();
+  void refreshOpenTabsStatus('startup');
 });
 ext.runtime.onInstalled.addListener(() => {
   void rememberOpenTabs();
   ensureTabIndexAlarm();
   scheduleTabIndexPush(800);
+  ensureStatusAlarm();
+  void refreshOpenTabsStatus('installed');
 });
 
 async function post(url) {

@@ -17,6 +17,7 @@ const loadIn = (ctx, rel) => loadScript(path.join(root, rel), ctx, new Set());
 
 function worker(initial) {
   const stored = clone(initial || {});
+  if (stored.cftBootWakeAtV1 === undefined) stored.cftBootWakeAtV1 = Date.now();
   const senders = {};
   const actionCalls = [];
   const fetchCalls = [];
@@ -66,6 +67,9 @@ function worker(initial) {
     alarms: mkNs('alarms', {
       create: async (name, info) => { alarmCalls.push(['create', name, clone(info || {})]); },
       clear: async (name) => { alarmCalls.push(['clear', name]); },
+      // 这些世界代表"扩展已经跑着"的稳态：状态心跳早就在册，冷启动补回刚做过。
+      // 冷启动那一路由 tests/test_extension_batch.cjs 专门钉，别在这里污染徽章与请求计数。
+      getAll: async () => [{ name: 'cftTabIndex' }, { name: 'cft-status-heartbeat' }],
     }),
     notifications: mkNs('notifications', {
       create: async (id, opts) => {

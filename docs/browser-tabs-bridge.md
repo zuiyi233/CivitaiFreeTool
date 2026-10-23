@@ -129,7 +129,8 @@ Civitai 模型页，并把找到的页面交给现有下载自动化工具。
 - `GET /api/ext/dev/state`：返回 `reload_at / pushed_at / pending / extension`，不包含任何 URL。
 - 扩展在下一次索引上报的响应里看到 `dev_reload_at` 后 `runtime.reload()`；已见时间戳存
   `storage.local`，不会因心跳循环重载。
-- 完整用法与限制（内容脚本仍需刷新页面）见 [extension-dev-mode.md](extension-dev-mode.md)。
+- 完整用法与限制见 [extension-dev-mode.md](extension-dev-mode.md)（Chrome 2.7.0 起，扩展重载后由后台 `ping`
+  探测再把自家内容脚本注回已匹配页面，不再必须手动刷新；Firefox 侧没有内容脚本）。
 
 ## 安全边界
 

@@ -548,6 +548,178 @@ function popupWorld(opt = {}) {
   ph.document.hidden = true; ph.document.fire('visibilitychange');
   ok('Firefox 任务行「打开目录」：直连 /api/reveal，路径来自 CFT 任务落点');
 
+  // ============ 3.7 后台免点击：逐标签徽章自己点亮（Firefox 只有徽章这一层） ============
+  // 用户报的问题在 Firefox 上是同一个：不点图标就看不见"这页到底下没下过"。
+  // 这里跑的是真 background.js（importScripts 由测试按真语义逐个执行），钉四件事：
+  //   1) 启动/更新与心跳都会自己批量查一遍已打开的模型页，并把徽章点到对应标签上；
+  //   2) 请求体只有模型/版本 ID 与清洗过的 URL，休眠标签与站外页一条都不发；
+  //   3) 桥没开着时徽章继续显示上次已知状态（不是塌成"?"），并说明离线；
+  //   4) 全程不碰 scripting / 不给页面发消息 —— Firefox 的页面胶囊确实做不到，不伪造。
+  function bgWorld(opt = {}) {
+    const stored = opt.stored || {};
+    const man = JSON.parse(read('firefox-extension/manifest.json').toString('utf8'));
+    const world = {
+      stored, requests: [], badges: [], colors: [], titles: [], alarmsCreated: [],
+      reloads: [], senders: {}, tabs: opt.tabs || [], scriptHits: 0, tabMsgSends: 0,
+    };
+    const send = (name) => (world.senders[name] = world.senders[name] || []);
+    const ns = (name, over = {}) => {
+      const t = Object.assign({}, over);
+      return new Proxy(t, {
+        get(o, k) {
+          const key = String(k);
+          if (key === 'scripting') { world.scriptHits++; return undefined; }
+          if (key in o) return o[key];
+          if (/^on[A-Z]/.test(key)) {
+            const list = send(name + '.' + key);
+            o[key] = { addListener: (f) => list.push(f), removeListener: () => {} };
+            return o[key];
+          }
+          o[key] = () => Promise.resolve(undefined);
+          return o[key];
+        },
+        set(o, k, v) { o[k] = v; return true; },
+      });
+    };
+    const ext = {
+      runtime: ns('runtime', {
+        id: 'test-id', getURL: (p) => 'moz-extension://test-id/' + p,
+        getManifest: () => Object.assign({}, man), reload: () => world.reloads.push(Date.now()),
+        sendMessage: async (m) => ({ ok: true, job: null }),
+      }),
+      storage: ns('storage', { local: {
+        get: async (k) => { const out = {}; if (k && stored[k] !== undefined) out[k] = clone(stored[k]); return out; },
+        set: async (v) => { Object.assign(stored, clone(v)); return true; },
+        remove: async (k) => { delete stored[k]; return true; },
+      } }),
+      tabs: ns('tabs', {
+        query: async () => world.tabs.map(clone),
+        sendMessage: async () => { world.tabMsgSends++; return {}; },
+      }),
+      action: ns('action', {
+        setBadgeText: async (o) => { world.badges.push(o); },
+        setBadgeBackgroundColor: async (o) => { world.colors.push(o); },
+        setBadgeTitle: async (o) => { world.titles.push(o); },
+      }),
+      alarms: ns('alarms', { create: (name, info) => { world.alarmsCreated.push([name, info]); } }),
+      contextMenus: ns('contextMenus'),
+    };
+    const answer = (u, o) => {
+      const url = String(u);
+      if (url.indexOf('127.0.0.1:47531') < 0) throw new Error('Firefox 后台只该连本机桥：' + url);
+      if (opt.bridgeOnline === false) throw new Error('Failed to fetch');
+      const p = new URL(url).pathname;
+      if (p === '/api/ext/tabs') return { ok: true };
+      if (p === '/api/model/status') {
+        const req = JSON.parse((o && o.body) || '{}');
+        return { ok: true, generated_at: Math.floor(Date.now() / 1000),
+          library: { ready: true, scanning: false, count: 3 },
+          updates: { checked_at: Math.floor(Date.now() / 1000), count: 1 },
+          items: (req.items || []).map((it) => Object.assign({ model_id: it.model_id, version_id: it.version_id },
+            (opt.modelStatus || {})[String(it.version_id)] || (opt.modelStatus || {})[String(it.model_id)]
+              || { state: 'unknown', reason: '测试里没给这个版本配置状态' })) };
+      }
+      return { ok: false, status: 404 };
+    };
+    const ctx = vm.createContext({
+      browser: ext, chrome: ext, URL, URLSearchParams, AbortController, setTimeout, clearTimeout,
+      setInterval: vmSetInterval, clearInterval, queueMicrotask, console, TextEncoder, TextDecoder,
+      structuredClone: clone, Promise, Date, Math, JSON,
+      fetch: async (u, o) => {
+        world.requests.push({ url: String(u), body: o && o.body ? JSON.parse(o.body) : null });
+        const body = answer(u, o);
+        return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+      },
+      // 真 importScripts 的语义：同一份全局作用域里按顺序执行脚本正文
+      importScripts: (...files) => { for (const f of files) vm.runInContext(read('firefox-extension/' + f).toString('utf8'), ctx, { filename: 'firefox-extension/' + f }); },
+    });
+    vm.runInContext(read('firefox-extension/background.js').toString('utf8'), ctx, { filename: 'firefox-extension/background.js' });
+    world.ctx = ctx;
+    world.fire = async (name, ...args) => { for (const f of (world.senders[name] || [])) await f(...args); };
+    world.badgeOf = (tabId) => { const h = world.badges.filter((b) => b.tabId === tabId).pop(); return h ? h.text : null; };
+    world.statusReqs = () => world.requests.filter((r) => r.url.includes('/api/model/status'));
+    return world;
+  }
+  const BTABS = [
+    { id: 11, url: 'https://civitai.red/models/101/a?modelVersionId=1001&token=SECRET' },
+    { id: 13, url: 'https://civitai.com/models/202?modelVersionId=2002' },
+    { id: 14, url: 'https://civitai.red/models/303', discarded: true },
+    { id: 15, url: 'https://github.com/x/y' },
+    { id: 19, url: 'https://civitai.com/models/404?modelVersionId=4004' },
+  ];
+  const BSTATUS = {
+    '1001': { state: 'downloaded', matched: 'version', version_matched: true,
+      local: { source: 'library', path: 'D:\\models\\alpha.safetensors', version_id: 1001, version_name: 'v1', model_name: 'Alpha LoRA', exists: true } },
+    '2002': { state: 'update_available', matched: 'version', version_matched: true,
+      local: { version_id: 2002, version_name: 'v1', model_name: 'Beta Checkpoint', exists: true },
+      update: { has_update: true, behind: 1, latest_version: 2099, latest_name: 'v2' } },
+    '4004': { state: 'not_downloaded', history: { file_exists: false } },
+  };
+  const bg = bgWorld({ tabs: BTABS, modelStatus: BSTATUS });
+  await bg.fire('runtime.onStartup');
+  for (let i = 0; i < 200 && !bg.statusReqs().length; i++) await sleep(10);
+  const bgReq = bg.statusReqs()[0];
+  assert(bgReq, '启动时后台要自己查一轮下载状态，不需要用户点图标');
+  same(bgReq.body.items.map((i) => i.version_id), ['1001', '2002', '4004'],
+    '只发未休眠的 C 站模型页：休眠的 303 与站外页一条都不发');
+  same(Object.keys(bgReq.body.items[0]).sort(), ['model_id', 'url', 'version_id'], '请求体只有模型/版本 ID 与页面 URL');
+  assert.equal(bgReq.body.include_updates, true);
+  assert(bgReq.body.items.every((i) => !/token=|SECRET/.test(JSON.stringify(i))), 'token 不进请求体');
+  for (let i = 0; i < 200 && !bg.badges.length; i++) await sleep(10);
+  assert.equal(bg.badgeOf(11), '✓', '已下载 → 该标签徽章 ✓：' + JSON.stringify(bg.badges));
+  assert.equal(bg.badgeOf(13), '↑', '有更新 → ↑');
+  assert.equal(bg.badgeOf(19), '↓', '未下载 → ↓');
+  assert.equal(bg.badges.some((b) => b.tabId === 14 || b.tabId === 15), false, '休眠标签与站外页不该被点徽章');
+  assert(bg.colors.some((c) => c.tabId === 11), '徽章颜色按状态给');
+  assert(bg.titles.some((t) => t.tabId === 11 && /已下载/.test(t.title)), '悬浮说明要说清状态：' + JSON.stringify(bg.titles));
+  assert(bg.alarmsCreated.some((a) => a[0] === 'cft-status-heartbeat' && a[1].periodInMinutes === 2), '2 分钟状态心跳已登记');
+  assert(bg.alarmsCreated.some((a) => a[0] === 'cftTabIndex' && a[1].periodInMinutes === 1), '索引心跳照旧');
+  assert.equal(bg.scriptHits, 0, 'Firefox 后台不得碰 scripting');
+  assert.equal(bg.tabMsgSends, 0, 'Firefox 后台不给网页发消息（没有 content script 接收者）');
+  assert.equal(bg.requests.every((r) => /^http:\/\/127\.0\.0\.1:47531/.test(r.url)), true, '后台只连本机桥');
+  const bgFired = bg.requests.length;
+  await bg.fire('runtime.onInstalled');
+  await sleep(80);
+  assert.equal(bg.requests.length, bgFired, '刚查过就不重复打一轮');
+  // 心跳走同一条批量路径；要等出去重窗口（1.5s），否则合并成同一轮才是对的
+  await sleep(1600);
+  await bg.fire('alarms.onAlarm', { name: 'cft-status-heartbeat' });
+  for (let i = 0; i < 300 && bg.statusReqs().length < 2; i++) await sleep(10);
+  assert.equal(bg.statusReqs().length >= 2, true, '心跳再查一轮');
+  ok('Firefox 免点击：启动/更新/心跳都让后台自己批量查状态并点亮逐标签徽章（跳过休眠与站外页，不碰 scripting）');
+
+  // 桥没开着：徽章继续显示上次已知状态并标离线，绝不塌成"?"或"未下载"
+  const bgOff = bgWorld({ tabs: BTABS, stored: sw.stored, bridgeOnline: false });
+  await bgOff.fire('runtime.onStartup');
+  for (let i = 0; i < 200 && !bgOff.badges.length; i++) await sleep(10);
+  assert.equal(bgOff.statusReqs().length, 1, '离线也要试一次（才知道是真没连上）');
+  assert.equal(bgOff.badgeOf(11), '✓', 'CFT 没开着时徽章要留住上次已知的"已下载"：' + JSON.stringify(bgOff.badges));
+  assert(bgOff.titles.some((t) => t.tabId === 11 && /未连接|离线|缓存/.test(t.title)),
+    '悬浮说明要讲清这是缓存：' + JSON.stringify(bgOff.titles));
+  ok('CFT 离线：后台不把已知状态降级成"未知"，徽章仍是 ✓ 且说明是上次缓存');
+
+  // 新开的模型页先按缓存点徽章（不打网络），不等下一次心跳
+  const bgNav = bgWorld({ tabs: [BTABS[0]], stored: sw.stored, modelStatus: BSTATUS });
+  for (let i = 0; i < 200 && !bgNav.badges.length; i++) await sleep(10);
+  const navReqs = bgNav.statusReqs().length;      // 冷启动那一轮允许打过一次
+  await bgNav.fire('tabs.onUpdated', 11, { status: 'complete' }, BTABS[0]);
+  for (let i = 0; i < 200 && bgNav.badges.filter((b) => b.tabId === 11).length < 2; i++) await sleep(10);
+  assert.equal(bgNav.badgeOf(11), '✓', '导航即按缓存点亮徽章');
+  assert.equal(bgNav.statusReqs().length, navReqs, '这一步只读缓存，不再打桥');
+  ok('新标签页秒出缓存徽章（零额外请求），心跳再确认真状态');
+
+  // 上限：80 个模型页也只发 60 条（桥侧上限 500，这里按实际用量收口）
+  const many = [];
+  for (let i = 0; i < 80; i++) many.push({ id: 100 + i, url: 'https://civitai.com/models/' + (500 + i) });
+  const bgCap = bgWorld({ tabs: many, modelStatus: {} });
+  await bgCap.fire('runtime.onStartup');
+  for (let i = 0; i < 200 && !bgCap.statusReqs().length; i++) await sleep(10);
+  assert.equal(bgCap.statusReqs()[0].body.items.length, 60, '一轮最多 60 个标签');
+  ok('批量查询有上限，开一堆标签页不会把本机桥打爆');
+
+  // Firefox 侧的"做不到"必须是真的做不到：代码里既没有注入也没有页面消息通道
+  assert(!/scripting\.|executeScript|insertCSS/.test(stripComments(bgJs)), 'Firefox 后台不得出现注入 API');
+
   // ============ 4. 任务区：精确发送 + CFT 侧状态 + 跨窗口恢复 ============
   // speed/downloaded/total 一律字节口径（与 downloader.DownloadTask 一致）
   w.rpc.tasks = [

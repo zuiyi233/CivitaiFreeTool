@@ -287,9 +287,19 @@ function queryStatusOnce(items, force) {
   _statusInflight.set(sig, { at: now, promise });
   return promise;
 }
-async function applyBadge(tabId, entry) {
+// 桥没开着（或桌面端太旧）时，离线占位不该盖掉上次已知状态：徽章与胶囊继续显示缓存里
+// 那一版结论，只额外打「离线」标记——把"没查到"说成"未下载/未知"是这套口径最不能犯的错。
+function entryForItem(it, result, cache) {
+  const key = MS.keyOf(it.modelId, it.versionId) || it.key;
+  const fresh = (result && result.byKey && (result.byKey[key] || result.byKey[it.key])) || null;
+  const cached = MS.getEntry(cache, it.modelId, it.versionId);
+  const degraded = !result || result.ok === false || result.offline === true;
+  if (cached && degraded && fresh) return Object.assign({}, cached, { offline: true });
+  return fresh || cached || null;
+}
+async function applyBadge(tabId, entry, offline) {
   if (_statusBatchRunning || !Number.isFinite(Number(tabId))) return;
-  const lab = entry ? MS.labelOf(entry) : null;
+  const lab = entry ? MS.labelOf(entry, { offline: offline === true || entry.offline === true }) : null;
   try {
     await ext.action.setBadgeText({ tabId, text: lab ? lab.badge : '' });
     if (lab) await ext.action.setBadgeBackgroundColor({ tabId, color: lab.color });
@@ -304,10 +314,10 @@ async function applyBadgesForItems(items, result, cache) {
   for (const it of items) {
     const tid = Number(it.tabId);
     if (!Number.isFinite(tid) || byTab.has(tid)) continue;
-    const entry = (result.byKey && result.byKey[it.key]) || MS.getEntry(cache, it.modelId, it.versionId);
-    byTab.set(tid, entry || null);
+    byTab.set(tid, entryForItem(it, result, cache));
   }
-  await Promise.all(Array.from(byTab.entries()).map(([tid, entry]) => applyBadge(tid, entry)));
+  const offline = !!(result && result.offline);
+  await Promise.all(Array.from(byTab.entries()).map(([tid, entry]) => applyBadge(tid, entry, offline)));
 }
 // popup 批量刷新后把状态推给页面胶囊：页面不用再多打一轮本机桥
 async function pushStatusToTabs(items, result, cache) {
@@ -315,9 +325,7 @@ async function pushStatusToTabs(items, result, cache) {
   for (const it of items) {
     const tid = Number(it.tabId);
     if (!Number.isFinite(tid) || byTab.has(tid)) continue;
-    const key = MS.keyOf(it.modelId, it.versionId);
-    const entry = (result.byKey && (result.byKey[key] || result.byKey[it.key]))
-      || MS.getEntry(cache, it.modelId, it.versionId);
+    const entry = entryForItem(it, result, cache);
     if (entry) byTab.set(tid, entry);
   }
   await Promise.all(Array.from(byTab.entries()).map(async ([tabId, entry]) => {
@@ -355,6 +363,152 @@ function scheduleStatusBadges(delayMs) {
     void reapplyStatusBadges();
   }, Math.max(50, Number(delayMs) || 300));
 }
+
+// 免点击自动显示：后台自己把已打开的模型页查一遍，点亮徽章并把状态推给页面。
+// 缺了这一步就只有"打开弹层"才会填缓存，用户看到的正是"页面没状态、必须点图标"。
+const STATUS_HEARTBEAT_ALARM = 'cft-status-heartbeat';
+const STATUS_TAB_LIMIT = 60;   // 一次最多查这么多标签；桥侧上限 500，这里先按实际用量收口
+let _statusRefreshInFlight = null;
+
+function ensureStatusAlarm() {
+  if (!ext.alarms) return;
+  try { ext.alarms.create(STATUS_HEARTBEAT_ALARM, { periodInMinutes: 2 }); } catch (_) {}
+}
+
+function collectOpenModelTabs() {
+  return ext.tabs.query({}).then((tabs) => {
+    const out = [];
+    for (const tab of tabs || []) {
+      if (!tab || tab.discarded || !Number.isFinite(Number(tab.id))) continue;
+      const link = CftTabs.modelLink(tab.url || '');
+      if (!link || !link.id) continue;
+      out.push({
+        tabId: tab.id,
+        modelId: link.id,
+        versionId: link.version || '',
+        key: MS.keyOf(link.id, link.version || ''),
+        // 发清洗过的链接，不发标签页原始 URL：原始地址里可能带着 token 之类的追踪参数
+        url: link.url || '',
+      });
+      if (out.length >= STATUS_TAB_LIMIT) break;
+    }
+    return out;
+  }).catch(() => []);
+}
+
+function refreshOpenTabsStatus(reason) {
+  if (_statusRefreshInFlight) return _statusRefreshInFlight;
+  return collectOpenModelTabs().then((items) => {
+    if (!items.length) return { ok: true, count: 0, reason: reason || '' };
+    const run = readStatusCache().then((cache) => queryStatusOnce(items).then((result) => {
+      const filled = { ok: true, count: items.length, reason: reason || '' };
+      return Promise.all([
+        applyBadgesForItems(items, result, cache),
+        pushStatusToTabs(items, result, cache),
+      ]).then(() => filled);
+    }));
+    _statusRefreshInFlight = run.catch(() => ({ ok: false, count: items.length, reason: reason || '' }))
+      .then((out) => { _statusRefreshInFlight = null; return out; });
+    return _statusRefreshInFlight;
+  });
+}
+
+// 注入面收得很紧：只用 chrome.scripting 把 manifest 自己声明过的文件注回已匹配的 C 站页面，
+// 不注入任意代码、不注入站外页面、不碰休眠标签（它们唤醒时走正常声明式注入）。
+function contentScriptSpecs() {
+  let manifest = null;
+  try { manifest = ext.runtime.getManifest(); } catch (_) { return []; }
+  return (manifest && manifest.content_scripts || []).map((cs) => ({
+    matches: (cs && cs.matches) || [],
+    js: (cs && cs.js) || [],
+    css: (cs && cs.css) || [],
+  }));
+}
+
+function urlMatchesPattern(pattern, url) {
+  const source = String(pattern || '').replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  if (!source) return false;
+  try { return new RegExp('^' + source + '$').test(String(url || '')); } catch (_) { return false; }
+}
+
+function matchSpecFor(specs, url) {
+  for (const spec of specs) {
+    if (!spec.js.length) continue;
+    for (const pattern of spec.matches) {
+      if (urlMatchesPattern(pattern, url)) return spec;
+    }
+  }
+  return null;
+}
+
+// 先探一下页面里有没有接收者：有就不重复注入，没有才补
+function hasContentScript(tabId) {
+  return ext.tabs.sendMessage(tabId, { __cft: true, to: 'content', type: 'ping' })
+    .then(() => true)
+    .catch(() => false);
+}
+
+function reinjectContentScripts() {
+  if (!ext.scripting || typeof ext.scripting.executeScript !== 'function') {
+    return Promise.resolve({ ok: false, reason: 'no-scripting-api', injected: 0, skipped: 0, failed: 0 });
+  }
+  const specs = contentScriptSpecs();
+  return ext.tabs.query({}).then((tabs) => {
+    let injected = 0, skipped = 0, failed = 0;
+    const chain = [];
+    for (const tab of tabs || []) {
+      if (!tab || tab.discarded || !Number.isFinite(Number(tab.id)) || !tab.url) continue;
+      const spec = matchSpecFor(specs, tab.url);
+      if (!spec) continue;
+      const tabId = tab.id;
+      chain.push(hasContentScript(tabId).then((alive) => {
+        if (alive) { skipped += 1; return null; }
+        return ext.scripting.executeScript({ target: { tabId }, files: spec.js })
+          .then(() => {
+            if (spec.css.length && ext.scripting.insertCSS) {
+              return ext.scripting.insertCSS({ target: { tabId }, files: spec.css });
+            }
+            return null;
+          })
+          .then(() => { injected += 1; })
+          .catch(() => { failed += 1; });
+      }));
+    }
+    return Promise.all(chain).then(() => ({ ok: true, injected, skipped, failed }));
+  }).catch(() => ({ ok: false, reason: 'query-failed', injected: 0, skipped: 0, failed: 0 }));
+}
+
+// 重载/更新后：先把脚本补回已有页面，再查一遍状态；两步都失败也不影响用户手动刷新。
+// 与 bootWake 的分工：这里不设短时去重——重复一轮只是"再 ping 一次"（页面已有脚本会被跳过），
+// 状态查询另有 1.5 秒合并窗口；而"重复唤醒白打桥"由 bootWake 的闹钟/时间戳判据挡住。
+function wakeOpenTabs(reason) {
+  return reinjectContentScripts()
+    .then(() => refreshOpenTabsStatus(reason))
+    .catch(() => ({ ok: false, reason }));
+}
+
+// SW 每次醒来都把状态心跳登记好，并且判断"这是不是一次冷启动"。
+// 为什么要在模块级做：chrome.runtime.reload()（开发态重载就是它）之后 Chrome 不一定
+// 再把 onInstalled 交给新的 SW，只等事件把 SW 唤醒；只挂在 onInstalled/onStartup 上的话，
+// "重载后补回脚本"这条链就永远不会跑——正是用户看到的"必须刷新页面"。
+const BOOT_WAKE_KEY = 'cftBootWakeAtV1';
+const BOOT_WAKE_MIN_MS = 90 * 1000;   // 90 秒内的重复唤醒不补整轮
+function bootWake() {
+  ensureStatusAlarm();
+  const probeAlarm = ext.alarms && typeof ext.alarms.getAll === 'function'
+    ? ext.alarms.getAll().then((all) => (all || []).some((a) => a && a.name === STATUS_HEARTBEAT_ALARM))
+      .catch(() => true)
+    : Promise.resolve(true);
+  return Promise.all([probeAlarm, ext.storage.local.get(BOOT_WAKE_KEY)]).then(([hasAlarm, saved]) => {
+    const now = Date.now();
+    const last = Number(saved && saved[BOOT_WAKE_KEY]) || 0;
+    // 心跳没了＝刚被重载/更新过（Chrome 会清掉闹钟）；时间戳过期＝浏览器重启后第一次醒
+    if (hasAlarm && now - last < BOOT_WAKE_MIN_MS) return { ok: true, skipped: true };
+    try { ext.storage.local.set({ [BOOT_WAKE_KEY]: now }); } catch (_) { /* 写不进去也要继续补 */ }
+    return wakeOpenTabs('boot');
+  }).catch(() => ({ ok: false }));
+}
+
 function idsFromUrl(url, pageUrl) {
   const link = CftTabs.modelLink(pageUrl || url || '');
   let modelId = link ? link.id : '';
@@ -701,6 +855,7 @@ if (ext.alarms && ext.alarms.onAlarm) {
     if (!alarm) return;
     if (alarm.name === TASK_WATCH_ALARM) void watchTasks();
     else if (alarm.name === TAB_INDEX_ALARM) void pushTabIndex();
+    else if (alarm.name === STATUS_HEARTBEAT_ALARM) void refreshOpenTabsStatus('heartbeat');
   });
 }
 
@@ -708,7 +863,10 @@ if (ext.alarms && ext.alarms.onAlarm) {
 ext.runtime.onInstalled.addListener(() => {
   ext.contextMenus.removeAll(() => ext.contextMenus.create({ id: 'cft-dl', title: '发送到 CivitaiFreeTool', contexts: ['page', 'link'] }));
   ensureTabIndexAlarm();
+  ensureStatusAlarm();
   scheduleTabIndexPush(800);
+  // 安装/更新/重载都会杀掉旧 content script：先补回脚本，再免点击查一遍状态
+  void wakeOpenTabs('installed');
 });
 // 标签页跳转：记录页面历史（仅 C 站模型页）；徽章只从缓存补/清，不发网络
 ext.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -737,11 +895,14 @@ for (const name of ['onCreated', 'onActivated', 'onMoved', 'onAttached', 'onDeta
 ext.tabs.onRemoved.addListener(() => scheduleTabIndexPush(300));
 ensureTabIndexAlarm();
 scheduleTabIndexPush(1200);
+void bootWake();
 ext.runtime.onStartup.addListener(() => {
   scheduleStatusBadges(500);
   void rememberOpenTabs();
   ensureTabIndexAlarm();
+  ensureStatusAlarm();
   scheduleTabIndexPush(800);
+  void wakeOpenTabs('startup');
   // 上次关浏览器时还有未落地的提交：恢复后台守望
   void (async () => {
     const raw = await readJson('cftExtTasks', null);

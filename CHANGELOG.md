@@ -57,7 +57,7 @@
 13. **扩展开发态免打包**：新增 `scripts/dev_extension.py link/watch/reload/restore`。`link` 把
     `.tools/` 下已加载副本换成指向源码的 junction（先备份；`manifest.key` 不变，扩展 ID 与存储
     不变）；改动后桥置 `dev_reload_at`，扩展在下一次索引上报时 `runtime.reload()`，已见时间戳
-    存 storage 防循环。内容脚本改动仍需刷新页面。见 `docs/extension-dev-mode.md`。
+    存 storage 防循环。内容脚本改动当时仍需刷新页面（第 17 条已把它补上）。见 `docs/extension-dev-mode.md`。
 14. **端到端真机验证后修掉的三处**（都是"测试全绿但真机用不了"那类，见 `docs/releases/v2.7.0.md`）：
     - `plan`/`resolve` 里每个文件的 `download_url` 恒为空：`_plan_payload` 引用了不存在的局部名 `civ`，
       `NameError` 被 `try` 吞成 `download_url_error: "name 'civ' is not defined"`，AI 只看到空 URL。
@@ -76,8 +76,23 @@
     `verification_status`、收尾错误清单等），并且超预算时按时间序从**最旧**开始丢，附
     `oldest_dropped_ids`、`count` 仍是总数；`fields=["*"]` 或自选 `fields=["id","status"]` 仍可要全量
     （`fields` 是数组，写字符串会被 schema 直接拒掉）。
+17. **扩展状态免点击自动显示**（Chrome 2.7.0 / Firefox 1.8.0）：以前"页面没胶囊、图标没徽章，必须点开
+    弹层才看得见"。根因三条——徽章只从缓存补而没人去查、MV3 重载把已开标签页的内容脚本一起杀掉、
+    心跳只推标签页索引。现在后台自己按启动 / 安装更新 / 2 分钟心跳批量查一轮已打开的模型页
+    （一轮 ≤60 个标签，跳过休眠与站外页，同一批 1.5 秒内不重复请求），点亮逐标签徽章并把状态推给页面；
+    Chrome 侧先 `ping` 探测、确认接收者没了才用 `scripting` 把 manifest 自己声明的文件注回去（只允许
+    `files`，不执行任意代码、不注到站外），重载后不必再刷新页面。Firefox 不申请 `scripting`，只镜像
+    不需要注入的那一半：同一套批量查询 + 逐标签徽章，新开的页先按缓存点亮（零网络请求）。
+    口径同时收紧：状态请求发**清洗过的 URL**（原始标签页地址可能带 `token=`），桥没连上时徽章留住
+    上次已知状态并标「离线」，不塌成 `?`/`↓`；「没有徽章＝还没判定过」与 `?`（问过没结论）分开。
+    真机又挖出两条只有真 Chrome 才暴露的问题：① `runtime.reload()` 之后浏览器不保证把 `onInstalled`
+    交给新的 service worker，唤醒因此也挂到模块级 `bootWake()`（状态心跳闹钟缺失、或 90 秒内没补过才补
+    一轮；空闲重启安静跳过）；② `executeScript({files})` 注进的是**同一个隔离世界**，被注入文件顶层的
+    `const` 第二次声明直接抛 `SyntaxError`、整批脚本静默失效（`lib/util.js` 的 `_utf8Len`），已改成顶层
+    `var`，并加上"manifest 注入清单里不许有顶层 const/let/class"的静态不变量与真加载重复注入回归。
+    设计见 `docs/extension-status-autoshow.md`。
 
-## 🧩 浏览器扩展：模型下载状态与工作台（Chrome 2.6.1 / Firefox 1.7.1，本 fork 新增）
+## 🧩 浏览器扩展：模型下载状态与工作台（Chrome 2.7.0 / Firefox 1.8.0，本 fork 新增）
 
 扩展不再只“把链接交给软件”，而是能回答当前打开的模型页**本机到底有没有**：
 
@@ -103,6 +118,16 @@
 2. **桌面只读索引**：`GET /api/ext/tabs?q=...` 返回索引与 `stale/age_s/counts`；只存内存、不落盘。桥侧再次校验 host/path/查询串/标题/行数，普通网页来源 403，最大 512KiB / 2000 行。
 3. **Agent 工具**：新增只读 `cft_browser_tabs`；命中后可直接 `cft_download_model`。扩展弹层的「批量标签页」UI 保持不变，桥只是给 Agent 多一条只读数据面。
 4. **开发态**：索引载荷带 `ext_version`；桥新增 `/api/ext/dev/reload` 与 `/api/ext/dev/state`，扩展只认新的 `dev_reload_at` 并自重载；`scripts/dev_extension.py` 用 junction 把已加载目录指向源码，改完不再打包导入。
+
+### 第四阶段：不用点图标也看得见（Chrome 2.7.0 / Firefox 1.8.0）
+
+用户报的是同一件事：C 站页面上看不到"这个模型本机有没有"，图标也没徽章，**必须点开弹层才看得见**。三条根因逐条对着代码确认：徽章只从缓存补而没人去查；MV3 重载把已开标签页的内容脚本一起杀掉；心跳只推标签页索引。
+
+1. **后台自己查**：`refreshOpenTabsStatus()` 按启动 / 安装更新 / 新增 `cft-status-heartbeat`（2 分钟）批量查已打开的模型页，一轮最多 60 个标签，跳过休眠与站外页，同一批 1.5 秒内合并成一次请求；结果点亮逐标签徽章并推给页面里已有的胶囊。
+2. **重载后免刷新（Chrome）**：先 `ping` 探测页面里还有没有接收者，确认没有才用 `scripting` 把 **manifest 自己声明的那几个文件**注回去（只允许 `files`，禁 `func`/`code`，不注站外，不碰休眠标签），脚本侧再加幂等守卫，注两次也只有一个胶囊。这是本次唯一新增的权限，用途写进扩展 README 的隐私一节。
+3. **Firefox 只镜像不需要注入的那一半**：不申请 `scripting`（它没有 `content_scripts`，要了也换不到功能），同一套批量查询 + 逐标签徽章，另外新开的标签页先按缓存点亮、零网络请求。页面胶囊在 Firefox 做不到就如实写"没有"，不伪造平价。
+4. **口径同时收紧**：状态请求发清洗过的 URL（原始标签页地址可能带 `token=`）；桥没连上时徽章留住上次已知状态并标「离线」，不塌成 `?`/`↓`；「没有徽章＝还没判定过」与 `?`（问过没结论）分开。设计见 `docs/extension-status-autoshow.md`。
+5. **只在全新 Chrome 才暴露的两条**：`runtime.reload()` 之后浏览器不保证把 `onInstalled` 交给新的 service worker（只等事件把它叫醒），所以唤醒也挂到模块级 `bootWake()`——状态心跳闹钟缺失或 90 秒内没补过才补一轮，空闲重启安静跳过；`executeScript({files})` 注进同一个隔离世界，被注入文件顶层的 `const` 第二次声明会抛 `SyntaxError` 让整批脚本静默失效（真凶是 `lib/util.js` 顶层的 `const _utf8Len`），改成顶层 `var` 并用两道闸钉住：manifest 注入清单不许有顶层 `const/let/class`，真加载回归里重复注入后必须仍是 1 个胶囊 + 0 条页面脚本错误。
 
 ## 🌐 局域网无头服务器资产接入（本 fork 新增）
 

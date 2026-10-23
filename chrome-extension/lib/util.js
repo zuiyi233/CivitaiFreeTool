@@ -1,6 +1,10 @@
 // CFT.util —— 纯逻辑工具函数（搬运自油猴脚本 v1.7.8，逻辑与注释原样保留）
 // 加载方式：MV3 SW / offscreen 以 module 副作用 import，content script 按序注入。
 // 约束：顶层不得触碰 document/window（函数体内按需使用，调用方保证环境）。
+// 约束：顶层声明只能用 var/function，不能用 const/let —— 这个文件会被 content script
+//       注入，而扩展重载后后台会把它**再注一遍到同一个隔离世界**（见 background.js 的
+//       reinjectContentScripts）；同一个世界里重复声明 const 直接抛 SyntaxError，
+//       整批脚本静默不执行，页面胶囊就永远回不来。
 globalThis.CFT = globalThis.CFT || {};
 
 // 清洗 URL：从可能带反引号/空格的字符串中提取并规范化为可请求的 http(s) URL
@@ -27,7 +31,7 @@ function sanitizeFilename(name) {
 // 增强（v1.6.0）：跨平台规则——保留设备名按「首段」判定（覆盖 aux.tar.gz/con.foo）、
 // `.`/`..` 兜底、NFC 归一化、去除不可见/方向控制字符、按 UTF-8 字节（非 UTF-16 码元）
 // 截断 + 字素簇安全 + 截断哈希保唯一（避免多个长名截成同一名字）。
-const _utf8Len = (function () {
+var _utf8Len = (function () {
     try { const _enc = new TextEncoder(); return (s) => _enc.encode(s).length; }
     catch (_) { return (s) => s.length; } // 极老环境退化：按码元计
 })();
@@ -179,18 +183,18 @@ function flattenPromptText(text) {
 // 实体解码，全程不解析标记、不创建元素、不执行也不请求任何东西。
 
 // 惰性文档里可能触发请求的元素 / 属性（摘掉后文本内容不变）
-const _HTML_LOADERS = 'img, iframe, embed, source, track, video, audio, object, input, link';
-const _HTML_LOAD_ATTRS = ['src', 'srcset', 'data', 'poster', 'code', 'codebase'];
+var _HTML_LOADERS = 'img, iframe, embed, source, track, video, audio, object, input, link';
+var _HTML_LOAD_ATTRS = ['src', 'srcset', 'data', 'poster', 'code', 'codebase'];
 
 // 描述文本里高频出现的命名实体（其余原样保留，绝不二次解码）
-const _NAMED_ENTITIES = {
+var _NAMED_ENTITIES = {
     nbsp: '\u00A0', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", ensp: '\u2002', emsp: '\u2003',
     thinsp: '\u2009', shy: '', ndash: '\u2013', mdash: '\u2014', lsquo: '\u2018', rsquo: '\u2019',
     ldquo: '\u201C', rdquo: '\u201D', hellip: '\u2026', middot: '\u00B7', bull: '\u2022',
     copy: '\u00A9', reg: '\u00AE', trade: '\u2122', deg: '\u00B0', times: '\u00D7', divide: '\u00F7',
     laquo: '\u00AB', raquo: '\u00BB', euro: '\u20AC', pound: '\u00A3', yen: '\u00A5', sect: '\u00A7'
 };
-const _BLOCK_TAG_NAMES = 'p|div|li|ul|ol|h[1-6]|blockquote|pre|section|article|table|tr|td|th';
+var _BLOCK_TAG_NAMES = 'p|div|li|ul|ol|h[1-6]|blockquote|pre|section|article|table|tr|td|th';
 
 // 数字引用 + 上面的命名引用；只解一次（&amp;lt; 还原成 &lt; 文本，不会变成标记）
 function _decodeHtmlEntities(text) {

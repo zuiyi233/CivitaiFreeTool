@@ -259,6 +259,8 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { parseModelLink: parseModelLink, pageKind: pageKind };
   } else {
-    init();
+    // 与 model-page.js 同一理由：重注入不该再开一套定时器与观察者
+    if (window.__cftListStatusInjected) { /* 已注入过，跳过 */ }
+    else { window.__cftListStatusInjected = true; init(); }
   }
 })();

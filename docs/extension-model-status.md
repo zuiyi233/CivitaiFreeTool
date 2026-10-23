@@ -206,6 +206,12 @@ chrome-extension/
   批量状态变为非 running 后从缓存重新挂。
 - `tabs.onUpdated`：URL 变成/离开 C 站模型页时，从缓存补/清徽章（不发网络）。
 - `runtime.onStartup`：枚举所有模型标签，从缓存补徽章。
+- **免点击（2.7.0 起）**：`runtime.onStartup` / `runtime.onInstalled` / `cft-status-heartbeat`（2 分钟）
+  三处触发 `refreshOpenTabsStatus()`，后台自己把已打开的模型页批量查一轮（一轮 ≤60 个未休眠标签，
+  同一批 1.5 秒内合并成一次请求），点亮徽章并推给页面胶囊；Firefox 1.8.0 同一套逻辑，只有徽章这一层。
+  设计见 [extension-status-autoshow.md](extension-status-autoshow.md)。
+- **降级不覆盖已知状态**：桥没连着（或桌面端太旧）时，徽章继续用缓存里那一版结论并打 `offline` 标记，
+  不塌成 `?`；只有"从来没查过"才是空徽章。状态请求发的是清洗过的 URL，不是标签页原始地址。
 - 提交成功（popup 批量发送、归档 `sendModelToSoftware`）立即写一条
   `state=downloading, download.status=pending`，让用户在 CFT 解析前就看到反馈。
 

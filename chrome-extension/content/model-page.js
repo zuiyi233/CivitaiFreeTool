@@ -800,6 +800,11 @@
       if (!msg || msg.__cft !== true || msg.to !== 'content') return; // 非本模块消息
       var payload = (msg && msg.payload) || {};
       switch (msg.type) {
+        case 'ping': {
+          // 后台重注入前的探针：有回音说明脚本还在，别再注一次
+          answer('bg', 'pong', { ok: true, injected: !!window.__cftModelPageInjected }, sendResponse);
+          return;
+        }
         case 'collectPage': {
           var data = collectPageData();
           data.cid = payload.cid;
@@ -1026,6 +1031,8 @@
       handleMessage: onRuntimeMessage
     };
   } else {
-    init();
+    // 后台可能重注入同一份脚本（扩展重载/更新后旧脚本已被杀）：只允许一个胶囊
+    if (window.__cftModelPageInjected) { /* 已注入过，跳过 */ }
+    else { window.__cftModelPageInjected = true; init(); }
   }
 })();
