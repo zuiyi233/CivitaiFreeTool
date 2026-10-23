@@ -266,17 +266,26 @@ async function refreshStorageInfo() {
     $('#storageWarning').textContent=storageInfo.warning || '';
   }catch(e){current.textContent='数据位置读取失败，请稍后重试。';}
 }
+async function askStorageConfirm(message) {
+  // 只认应用内确认框（可被 AI 一键关闭）。没有它就当作取消：
+  // 原生 confirm 会卡死整条 JS，cft_dismiss_ui 也够不到它。
+  if (typeof confirmBox !== 'function') {
+    const result=$('#storageResult');if(result)result.textContent='确认框不可用，已取消；数据位置未改动。';
+    return false;
+  }
+  return confirmBox(message);
+}
 async function migrateStorageFromSettings() {
   const directory=$('#storageNewPath').value.trim();
   if(!directory){$('#storageResult').textContent='请先选择或填写完整路径';return;}
-  if(!confirm('将软件配置、任务、历史和缓存复制到所选目录并切换？原数据保留，模型文件不移动。'))return;
+  if(!await askStorageConfirm('将软件配置、任务、历史和缓存复制到所选目录并切换？原数据保留，模型文件不移动。'))return;
   const button=$('#storageMigrate');button.disabled=true;
   document.body.classList.add('storage-busy');
   let result;
   try{
     result=await api.call('migrate_data_storage',directory,false);
     if(result?.need_confirm){
-      if(!confirm(result.msg+'\n涉及：'+(result.conflicts || []).join('、')))return;
+      if(!await askStorageConfirm(result.msg+'\n涉及：'+(result.conflicts || []).join('、')))return;
       result=await api.call('migrate_data_storage',directory,true);
     }
     $('#storageResult').textContent=result?.msg || '数据迁移没有返回结果';

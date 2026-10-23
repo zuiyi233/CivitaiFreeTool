@@ -2,12 +2,14 @@
 
 > 免费的 Civitai / HuggingFace 模型下载与本地模型管理工作台。
 
-![Version](https://img.shields.io/badge/version-2.6.32-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
+![Version](https://img.shields.io/badge/version-2.7.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-orange) ![CI](https://github.com/ADVICEsama/CivitaiFreeTool/workflows/tests/badge.svg)
 
 [下载最新版](https://github.com/ADVICEsama/CivitaiFreeTool/releases/latest) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/ADVICEsama/CivitaiFreeTool/issues) · [Linux / macOS](LINUX.md)
 
 ## 当前工作台
 
+- **浏览器扩展：模型下载状态与工作台（v2.7.0，Chrome 2.6.1 / Firefox 1.7.1）**：扩展能回答当前模型在本机是否已下载，并把浏览到下载收尾串起来。桌面端 `POST /api/model/status` 合并模型库、下载历史、活动任务与更新缓存，返回六态；Chrome 在模型页显示胶囊、逐标签工具栏徽章，在 `/models` 列表与图片/帖子页的模型卡片上直接贴 `✓/↑/…/◐/↓`，并提供 `chrome.sidePanel` 常驻侧栏。弹层提供行徽章、下载状态筛选、「只选未下载」、「下载选中项的新版」（只发最新版 URL）与「一键检查这些模型的更新」（只对模型库命中的本地路径调用 `mm_check_updates`，不自动下载）。任务落地后 Chrome 发完成通知并可「打开所在目录」，桌面 `POST /api/reveal` 只接受已登记的模型库/历史/任务路径；Firefox 任务行也能直连打开，但不伪造通知与侧栏。C 站文件 SHA256 随状态请求发送，桌面按已有哈希回退识别改名/换目录的同一文件；页面级历史单独记录「看过但未下载」，可一键清除。CFT 离线或桌面端过旧时显示上次缓存/需升级，绝不把“没查到”说成“未下载”。**开发态**：`scripts/dev_extension.py link/watch` 让已加载目录指向源码并自动重载，不再每次压缩导入（见 [扩展开发态](docs/extension-dev-mode.md)）。详见 [阶段一契约](docs/extension-model-status.md) 与 [阶段二设计](docs/extension-phase2.md)。
+- **AI 接入：MCP + OpenAPI + SSE + Skill + HTTP（v2.7.0）**：新增 `CivitaiFreeToolMCP.exe`，以 stdio / Streamable HTTP 暴露 29 个契约工具（core 19 / vision 5 / admin 5），文本模型走 `cft_describe_model`、`cft_browse_gallery`，`cft_browser_tabs` 直接搜索已打开的 C 站模型页（扩展只上报标题/URL/模型 ID/版本，不读页面内容），`cft_dismiss_ui` 一条调用关闭任何挡路弹层（确认框按取消处理，不会误确认），多模态模型直接收到 MCP image content（封面、示例图、视频首帧、contact sheet）。冻结版桌面端会自动拉起同目录侧车（47532，Bearer，桥断即退），`python scripts/mcp_setup.py --client cursor|claude --apply` 一键合并客户端配置；`cft_capabilities` 回报扩展在线/版本与 MCP 运行态。下载计划与结果带只读 `placement`（是否进类型目录、修复提示），`cft_diagnostics storage` 给出 ComfyUI 模型根候选；不自动搬文件、不新建未注册目录。不支持 MCP 的本地 Agent 可导入 `/api/automation/openapi.json`，每个工具另有 `POST /api/automation/tool/{name}`；任务、文件选择、扫描、弹层和配置变化可通过 `/api/automation/events/stream` SSE 推送，支持 `Last-Event-ID` 重放。所有接入面均只监听 `127.0.0.1`。Skill 在 `skills/civitai-free-tool/`，负责安装、recipes、安全边界与排障。完整说明见 [AI 接入契约](docs/ai-integration.md) 与 [MCP 一体化设计](docs/ai-mcp-native.md)。
 - **AI 自动化面 + 资源库自动化（v2.6.32）**：28 个 `/api/automation/*` 端点起步，扩到 batch / 字段投影 / move·rename·fs / storage/migrate / tasks/repair / history 清理；已下载模型 `skipped=exists` 不再白传，收尾未完成不再假失败，外部改配置 1s 内生效；资源库新增 gallery 自动化端点（删除走回收站、不连带 sidecar），`_评论.txt` 跟随 `rename_to_civitai` 改名。详见 [版本说明](docs/releases/v2.6.32.md)。
 - **示例图本地永久缓存 + 视频首帧（v2.6.30）**：远程缩略帧现在在软件侧留一份（`APP_DIR/detail_thumb_cache`，第二次打开直接出 `data:`、**零网络**；首屏不阻塞，未命中只回 URL 并排一次后台入盘），档位与缓存键统一到同一个数（瀑布流 460 / 详情 512，键归一成「源图 URL + 档位」），缩略图字节闸与 `image_max_mb` 解耦（那个键能设到 1MB，此前一低就整片空白）。视频示例图的首帧由程序自己出像素：`video_thumb` 走 Windows 外壳取长边 ≤640 的 JPEG，落 `<模型名>.images/image_XX.jpg`（与 `video_XX.mp4` 同序号），详情主图、瀑布流叠帧与自动轮播三处都吃它，**不再只有鼠标移过去才看得见画面**；本地没有原片时首帧自取 `width=460` 的小视频档（实测 2.3MB 而非 8.9~19MB）出帧后即删，补帧顺序改成「静帧→首帧→原片」并把下载字节实时写进状态，纯视频模型不再长时间停在「正在补齐示例图 0/N」。另修：浏览器兜底模式下 `file:///` 被 Chromium 拒载导致本地视频不播，改走同源 `/api/media`（白名单同时并入模型库根，否则换过去照样 403）；浏览器抓帧不再把「还没解出画面的纯黑画布」写成首帧占住序号（纯色图按缺口重取，实测那张 4307 字节单色图换成 1972 色的真帧）。详见 [版本说明](docs/releases/v2.6.30.md)。
 - **模型示例图加载性能（v2.6.29）**：「有些模型的图要 1 分钟甚至 5 分钟」的主因不是网络——真实库 479 条图片条目里 `type` 字段 100% 缺失，**107 条（22.3%）`.mp4` 被当静帧**（每张 1.3–2.3MB 的死缩略图，查看器更先下完 19.4MB 视频再交给 PIL 报错），判定改成「`type` 或 URL 尾缀」并收敛成一份实现，视频帧现在 0.016s / 0 字节返回明确文案；显示走 `width=1440,quality=80` 降级档（实测 1,450,825→94,168 字节，窄图不加 `width=` 防上采样，保存 / 复制仍走原图档）；磁盘缓存默认 1024→**8192MB**（全库原图约 3.3GB，预算太小必然把「看过一次」的淘汰掉）并按档位分缓存键；新增 `image_max_mb=20` / `video_max_mb=100` / `fetch_deadline_s=120`（wall-clock 总时限，两处钳制口径统一）；打开详情后按需把缺的帧补进「模型名.images」并改为**本地优先**读取（可在设置关闭，同时只 1 个任务、可取消、磁盘不足会跳过并说明）。详见 [版本说明](docs/releases/v2.6.29.md)。
@@ -203,6 +205,9 @@ python -m venv .venv
 # 构建：Spec 包含网页、原生辅助 DLL、托盘及 Tcl/Tk
 .\.venv\Scripts\python -m pip install pyinstaller
 .\.venv\Scripts\python -m PyInstaller -y CivitaiFreeToolWeb.spec
+# MCP 侧车（可选）：额外的 mcp / uvicorn / starlette 依赖
+.\.venv\Scripts\python -m pip install -r requirements-mcp.txt
+.\.venv\Scripts\python -m PyInstaller -y CivitaiFreeToolMCP.spec
 ```
 
 原生辅助代码由 Windows 自带 .NET Framework C# 编译器构建，不需要额外安装完整 Visual Studio。Linux/macOS 使用社区提供的适配，安装依赖与限制见 [LINUX.md](LINUX.md)；本轮原生窗口验证在 Windows 完成，不声称其他平台已复测。

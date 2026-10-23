@@ -179,15 +179,21 @@ function confirmBox(msg) {
       "</div>";
     document.body.appendChild(mask);
     document.body.appendChild(dlg);
+    mask.dataset.aiOverlay = "1";
     // 双击触发的第二次点击会落在刚出现的遮罩上，等于「弹窗一闪就取消」；开窗瞬间的遮罩点击忽略
     const openedAt = Date.now();
     const close = () => { mask.remove(); dlg.remove(); };
-    $("#cfCancel", dlg).addEventListener("click", () => { close(); resolve(false); });
+    const aiOff = window.CftOverlays
+      ? window.CftOverlays.register("confirm", () => { close(); resolve(false); },
+          { group: "dialogs", kind: "confirmation", title: "确认操作", el: mask })
+      : null;
+    const done = () => { if (aiOff) aiOff(); };
+    $("#cfCancel", dlg).addEventListener("click", () => { close(); done(); resolve(false); });
     mask.addEventListener("click", () => {
       if (Date.now() - openedAt < 250) return;
-      close(); resolve(false);
+      close(); done(); resolve(false);
     });
-    $("#cfOk", dlg).addEventListener("click", () => { close(); resolve(true); });
+    $("#cfOk", dlg).addEventListener("click", () => { close(); done(); resolve(true); });
   });
 }
 
@@ -209,14 +215,20 @@ function confirmBoxRaw(html, title) {
       "</div>";
     document.body.appendChild(mask);
     document.body.appendChild(dlg);
+    mask.dataset.aiOverlay = "1";
     const openedAt = Date.now();
     const close = () => { mask.remove(); dlg.remove(); };
-    $("#cfCancel", dlg).addEventListener("click", () => { close(); resolve(false); });
+    const aiOff = window.CftOverlays
+      ? window.CftOverlays.register("confirm", () => { close(); resolve(false); },
+          { group: "dialogs", kind: "confirmation", title: title || "确认操作", el: mask })
+      : null;
+    const done = () => { if (aiOff) aiOff(); };
+    $("#cfCancel", dlg).addEventListener("click", () => { close(); done(); resolve(false); });
     mask.addEventListener("click", () => {
       if (Date.now() - openedAt < 250) return;
-      close(); resolve(false);
+      close(); done(); resolve(false);
     });
-    $("#cfOk", dlg).addEventListener("click", () => { mask.remove(); resolve({ ok: true, root: dlg }); });
+    $("#cfOk", dlg).addEventListener("click", () => { done(); mask.remove(); resolve({ ok: true, root: dlg }); });
   });
 }
 
@@ -1099,9 +1111,10 @@ let dlDragging=false;
 // 配置版本号轮询：后端（包括 AI / 自动化接口）改了配置后，前端不必等刷新页面才生效。
 // 每 2 拍问一次轻量 get_ui_flags：版本号变了拉全量 get_config；无论如何都用 flags 里的
 // 几个判定键覆盖 state.cfg —— 这样「页面刚加载、首次轮询之前改了配置」的竞态也能收敛。
-let _cfgRev=null,_cfgTick=0;
+let _cfgRev=null,_cfgTick=0,_uiDismissRev=null;
 async function pollCfgRev() {
-  if (++_cfgTick % 2 !== 0) return;
+  // 首个周期立即取一次 baseline：否则「页面刚打开 + AI 立刻 dismiss」会把新 rev 当基线吞掉。
+  if (++_cfgTick % 2 !== 0 && _cfgRev !== null) return;
   try {
     const flags = await api.call("get_ui_flags");
     if (!flags || typeof flags.cfg_rev !== "number") return;
@@ -1120,6 +1133,29 @@ async function pollCfgRev() {
     state.cfg.download_target_dir = flags.download_target_dir;
     state.cfg.multi_file_download = flags.multi_file_download;
     state.cfg.route_by_type = flags.route_by_type;
+    state.cfg.onboarding_done = flags.onboarding_done;
+    state.cfg.auto_guides = flags.auto_guides;
+    // 后端（AI/MCP）要求关闭弹层：版本号一变就立即收起，不等页面刷新。
+    if (typeof flags.ui_dismiss_rev === "number") {
+      const rev = flags.ui_dismiss_rev;
+      const applyDismiss = () => {
+        const targets = Array.isArray(flags.ui_dismiss_targets) && flags.ui_dismiss_targets.length
+          ? flags.ui_dismiss_targets : ["all"];
+        if (window.CftOverlays) window.CftOverlays.dismiss(targets);
+        else dismissGuideOverlays();
+      };
+      if (_uiDismissRev === null) {
+        _uiDismissRev = rev;
+        // 首次轮询晚于 AI 调用时，不能把刚发出的命令当 baseline 吞掉；
+        // 只认 10 秒内的新命令，避免重开页面时重放很久以前的关闭目标。
+        const at = Number(flags.ui_dismiss_at || 0);
+        if (rev > 0 && at > 0 && (Date.now() / 1000 - at) < 10) applyDismiss();
+      } else if (rev !== _uiDismissRev) {
+        _uiDismissRev = rev;
+        applyDismiss();
+      }
+    }
+    applyGuideFlags(flags);
   } catch (_) { /* 桥未就绪：下个周期再试 */ }
 }
 async function dlRefresh() {
@@ -1224,7 +1260,16 @@ function maybeAskRestricted(tasks) {
     '<button class="btn" id="rkSite">浏览器打开</button></div>';
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
-  const close = () => { mask.remove(); dlg.remove(); _restrictAsking = false; };
+  mask.dataset.aiOverlay = "1";
+  let aiOff = null;
+  const close = () => {
+    if (aiOff) aiOff();
+    mask.remove(); dlg.remove(); _restrictAsking = false;
+  };
+  aiOff = window.CftOverlays
+    ? window.CftOverlays.register("restricted", close,
+        { group: "dialogs", kind: "restricted", title: "模型下载受限", el: mask })
+    : null;
   mask.addEventListener("click", close);
   $("#rkRetry").addEventListener("click", async () => {
     close();
@@ -1273,7 +1318,17 @@ function maybeAskMove(tasks) {
     "</div></div>";
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
-  const close = () => { clearTimeout(mvTimer); mask.remove(); dlg.remove(); _moveAsking = false; };
+  mask.dataset.aiOverlay = "1";
+  let aiOff = null;
+  // 关闭 = 不移动（保持下载落点），绝不替用户选目录。
+  const close = () => {
+    if (aiOff) aiOff();
+    clearTimeout(mvTimer); mask.remove(); dlg.remove(); _moveAsking = false;
+  };
+  aiOff = window.CftOverlays
+    ? window.CftOverlays.register("move_after_download", close,
+        { group: "dialogs", kind: "move_after_download", title: "下载完成：是否移动", el: mask })
+    : null;
   // 左侧显示模型缩略图（同目录 preview.png 封面；封面下载是后台任务，可能稍后才落盘，最多重试 4 次）
   let mvTries = 0;
   let mvTimer = null;
@@ -3094,9 +3149,18 @@ function infoBox(html, title) {
     '<div class="ib-body" style="font-size:calc(13px * var(--type-scale, 1));color:var(--text);line-height:1.7">' + html + "</div>" +
     '<div class="rd-actions"><button class="btn btn-primary" id="ibOk">知道了</button></div>';
   const onKey = (e) => { if (e.key === "Escape") close(); };
-  const close = () => { document.removeEventListener("keydown", onKey); mask.remove(); dlg.remove(); };
+  let aiOff = null;
+  const close = () => {
+    if (aiOff) aiOff();
+    document.removeEventListener("keydown", onKey); mask.remove(); dlg.remove();
+  };
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
+  mask.dataset.aiOverlay = "1";
+  aiOff = window.CftOverlays
+    ? window.CftOverlays.register("info", close,
+        { group: "dialogs", kind: "info", title: title || "提示", blocking: false, el: mask })
+    : null;
   document.addEventListener("keydown", onKey);
   mask.addEventListener("click", close);
   const ok = dlg.querySelector("#ibOk");
@@ -3154,7 +3218,16 @@ async function showUpdateResults(items) {
     '<button class="btn" id="updFilter">只看这些模型</button></div>';
   document.body.appendChild(dlg);
   document.body.appendChild(box);
-  const close = () => { dlg.remove(); box.remove(); };
+  dlg.dataset.aiOverlay = "1";
+  let aiOff = null;
+  const close = () => {
+    if (aiOff) aiOff();
+    dlg.remove(); box.remove();
+  };
+  aiOff = window.CftOverlays
+    ? window.CftOverlays.register("update_results", close,
+        { group: "dialogs", kind: "result", title: "检查更新结果", blocking: false, el: dlg })
+    : null;
   dlg.addEventListener("click", close);
   $("#updClose", box).addEventListener("click", close);
   $("#updFilter", box).addEventListener("click", () => {
@@ -3493,6 +3566,7 @@ async function identifyDetailModel(path){
 // 模型详情二级界面（C 站风格）
 let detailRow = null;
 let detailGeneration = 0;
+let _detailAiOff = null;
 // 详情面板全局状态（document 级图片右键委托需要访问）
 let detailImgIdx = 0;
 let detailImgLocalPath = null;
@@ -3801,6 +3875,10 @@ async function showModelDetail(path, historyId = "") {
     "</div>" +
     "</div></div>";
   $("#detailMask").style.display = "flex";
+  if (window.CftOverlays) {
+    _detailAiOff = window.CftOverlays.register("detail", closeDetail,
+      { group: "dialogs", kind: "detail", title: "模型详情", blocking: false, el: $("#detailMask") });
+  }
   if (d.cached_history) {
     panel.querySelector('.detail-title').insertAdjacentHTML('afterend', '<p class="history-model">历史信息缓存 · 本地文件已移走或不存在，仅供查看</p>');
     panel.querySelectorAll('#dEditInfo,#dRename,#dRenameC,#dCover,#dRp,#dSync,#dTranslate,#dLocalize,#dJson,#dAllImgs').forEach(button => button.disabled = true);
@@ -4242,6 +4320,7 @@ function closeDetail() {
   const dvd=$("#detailPanel video");if(dvd&&dvd.pause)dvd.pause();
   $("#detailMask").style.display = "none";
   $("#detailPanel").innerHTML = "";
+  if (_detailAiOff) { _detailAiOff(); _detailAiOff = null; }
   detailRow = null;
   if (typeof syncModelInspector === "function") syncModelInspector($("#page-models").classList.contains("active"));
 }
@@ -4363,7 +4442,16 @@ async function showAbout() {
     '<button class="btn btn-primary" id="aboutOk">知道了</button></div>';
   document.body.appendChild(mask);
   document.body.appendChild(dlg);
-  const close = () => { mask.remove(); dlg.remove(); };
+  mask.dataset.aiOverlay = "1";
+  let aiOff = null;
+  const close = () => {
+    if (aiOff) aiOff();
+    mask.remove(); dlg.remove();
+  };
+  aiOff = window.CftOverlays
+    ? window.CftOverlays.register("about", close,
+        { group: "dialogs", kind: "info", title: "关于", blocking: false, el: mask })
+    : null;
   $("#aboutOk").addEventListener("click", close);
   mask.addEventListener("click", close);
   $("#aboutGithub").addEventListener("click", () => api.call("open_url", "https://github.com/ADVICEsama/CivitaiFreeTool"));
@@ -5358,12 +5446,12 @@ $("#settingsForm").addEventListener("input", (e) => {
 
 $("#btnTestApi").addEventListener("click", async () => {
   const r = await api.call("test_api");
-  alert(r.ok ? r.msg : r.msg);
+  infoBox("<p>" + esc(r.msg || "") + "</p>", r.ok ? "API 连接正常" : "API 连接失败");
   setStatus(r.ok ? "API 正常" : "API 失败");
 });
 $("#btnTestBaidu").addEventListener("click", async () => {
   const r = await api.call("test_baidu");
-  alert(r.ok ? r.msg : r.msg);
+  infoBox("<p>" + esc(r.msg || "") + "</p>", r.ok ? "百度翻译正常" : "百度翻译失败");
 });
 $("#btnOnboarding").addEventListener("click", () => showOnboarding());
 
@@ -5423,8 +5511,8 @@ async function init() {
   setInterval(dlRefresh, 1000);
   setInterval(rpRefresh, 2000);
   setStatus("就绪");
-  // 首次使用引导（未配置 API key 时自动弹出）
-  if (!state.cfg.api_key && !state.cfg.onboarding_done) {
+  // 首次使用引导（未配置 API key 时自动弹出）；AI 可用 cft_dismiss_ui 关闭自动引导
+  if (!state.cfg.api_key && !state.cfg.onboarding_done && state.cfg.auto_guides !== false) {
     showOnboarding();
   }
 }
@@ -5453,6 +5541,44 @@ $("#obMiniClose").addEventListener("click", async () => {
   setObMini(false);
   await finishOnboarding();
 });
+// 引导类弹窗统一收起：AI 不需要人类的新手引导/教程，后端一条命令即可关闭。
+let _obAiOff = null;
+function hideOnboardingOverlay() {
+  const mask = $("#obMask");
+  if (mask && mask.style.display !== "none") {
+    mask.style.display = "none";
+    setObMini(false);
+  }
+  if (_obAiOff) { _obAiOff(); _obAiOff = null; }
+}
+function dismissGuideOverlays() {
+  hideOnboardingOverlay();
+  if (typeof closeApiKeyPrompt === "function") closeApiKeyPrompt();
+  else document.getElementById("apiKeyPrompt")?.remove();
+  if (typeof closeReverseTutorial === "function") closeReverseTutorial();
+}
+function applyGuideFlags(flags) {
+  if (!flags) return false;
+  const disabled = flags.onboarding_done === true || flags.auto_guides === false;
+  if (!disabled) return false;
+  const mask = $("#obMask");
+  if (mask && mask.style.display !== "none") dismissGuideOverlays();
+  return true;
+}
+// 浏览器自动化/控制台的一行入口；后端 MCP 工具 cft_dismiss_ui 走同一实现。
+window.cftDismissUi = async function (targets, permanent) {
+  try {
+    const picked = Array.isArray(targets) && targets.length ? targets : ["all"];
+    const r = await api.call("dismiss_ui", picked, permanent !== false);
+    if (window.CftOverlays) window.CftOverlays.dismiss(picked);
+    else dismissGuideOverlays();
+    return r;
+  } catch (e) {
+    return { ok: false, msg: String(e) };
+  }
+};
+window.cftDismissGuides = window.cftDismissUi;   // 旧名保留，行为已扩展到所有弹层
+window.addEventListener("cft:config-saved", (e) => applyGuideFlags(e.detail || {}));
 function showOnboarding() {
   if(typeof settingsHaveChanges==="function"&&settingsHaveChanges()){requestSettingsLeave(showOnboarding);return;}
   obStep = 0;obStartPage=document.querySelector(".nav-tab.active")?.dataset.page||"models";
@@ -5464,6 +5590,11 @@ function showOnboarding() {
   obMini = false;
   $("#obMask").classList.remove("mini");
   $("#obMask").style.display = "flex";
+  if (window.CftOverlays) {
+    if (_obAiOff) _obAiOff();
+    _obAiOff = window.CftOverlays.register("onboarding", hideOnboardingOverlay,
+      { group: "guides", kind: "guide", title: "新手引导", el: $("#obMask") });
+  }
   renderOnboarding();
 }
 function renderOnboarding() {
@@ -5585,7 +5716,7 @@ async function finishOnboarding() {
   buildSettingsForm();
   applyZoom(Number(state.cfg.ui_zoom) || 100);
   document.documentElement.dataset.theme = state.cfg.theme || "modern";
-  $("#obMask").style.display = "none";
+  hideOnboardingOverlay();
   switchPage(obStartPage);
   setStatus('引导已完成。可在设置里随时重新打开。');
   return true;
@@ -7232,17 +7363,24 @@ function libAddTag(name) {
   });
 }
 
-function libDeleteTag(id, name, count) {
-  if (!id) return Promise.resolve();
+async function libDeleteTag(id, name, count) {
+  if (!id) return;
   const used = count ? "它会从 " + count + " 个条目上移除。" : "它还没被用到。";
-  if (!window.confirm("删除标签「" + (name || "") + "」？" + used + "（不动文件本身）")) return Promise.resolve();
+  if (typeof confirmBox !== "function") { setStatus("确认框不可用，已取消删除标签"); return; }  // 不退回原生 confirm：那会卡死 AI
+  const ok = await confirmBox("删除标签「" + (name || "") + "」？" + used + "（不动文件本身）");
+  if (!ok) return;
   const wasFiltered = String(id) === String(libVal("libTagF"));
-  return api.call("lib_tag_delete", id).then((r) => {
+  try {
+    const r = await api.call("lib_tag_delete", id);
     if (!r || !r.ok) { setStatus((r && r.msg) || "删除标签失败"); return; }
     setStatus("已删除标签");
     if (wasFiltered) { const s = libEl("libTagF"); if (s) s.value = ""; lib.filters.tag_ids = []; }
-    return libEnsureTags().then(() => { libAfterTagChange(); if (wasFiltered) libLoad(true); });
-  }).catch(() => setStatus("删除标签失败"));
+    await libEnsureTags();
+    libAfterTagChange();
+    if (wasFiltered) libLoad(true);
+  } catch (_) {
+    setStatus("删除标签失败");
+  }
 }
 
 // ---------- 详情 ----------

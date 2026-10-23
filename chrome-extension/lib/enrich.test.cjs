@@ -269,6 +269,18 @@ function miniDoc(over) {
   assert.equal(E().projectVersionMeta({ files: [{ size: 2048 }] }, 256).totalMB, 2, 'size 小值按 KB 解释');
   ok('字段投影：类型映射 / sizeKB→MB / 缩略图重写 / 版本名录都稳定');
 
+  // C 站 files[].hashes.SHA256 → meta.sha256s / files[].sha256（桌面端哈希回退的唯一来源）
+  const SHA_A = 'a'.repeat(64), SHA_B = 'B'.repeat(64);
+  const hp = E().projectVersionMeta({ files: [
+    { id: 1, name: 'a.safetensors', sizeKB: 1024, hashes: { SHA256: SHA_A } },
+    { id: 2, name: 'b.safetensors', sizeKB: 512, hashes: { sha256: SHA_B } },
+    { id: 3, name: 'c.txt', sizeKB: 2, hashes: { SHA256: 'nope' } },
+  ] }, 256);
+  same(hp.sha256s, [SHA_A, SHA_B.toLowerCase()], 'sha256s 收全部合法哈希并小写');
+  same(hp.files.map((f) => f.sha256), [SHA_A, SHA_B.toLowerCase(), ''], '逐文件保留哈希；非法值留空');
+  same(E().projectVersionMeta({ files: [{ name: 'x' }] }, 256).sha256s, [], '没有哈希时是空数组');
+  ok('哈希投影：files[].hashes.SHA256 保留为 sha256s/files[].sha256（供富化结果直接传给状态请求）');
+
   // ---------- 4. 整批富化：并发、分块、去重、tabrows 直接消费 ----------
   if (!hasRows) { console.log('!! lib/tabrows.js 不在，跳过与 tabrows 的集成断言'); }
   if (hasRows) {

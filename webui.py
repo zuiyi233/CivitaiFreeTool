@@ -14,7 +14,7 @@ import urllib.parse
 
 import webview
 
-APP_VERSION = "2.6.32"
+APP_VERSION = "2.7.0"
 
 from functools import wraps
 
@@ -795,7 +795,13 @@ class Api:
                                             write_fn=self.archive_write,
                                             done_fn=self.archive_done,
                                             check_fn=self.library_check)
-        browser_bridge.start(version=APP_VERSION)
+        # 状态接口是后来加的：旧桥/测试替身没有这个 setter 时只关闭该端点，不影响构造
+        _set_model_status = getattr(browser_bridge, "set_model_status_handler", None)
+        if callable(_set_model_status):
+            _set_model_status(self.model_status)
+        _set_reveal = getattr(browser_bridge, "set_reveal_handler", None)
+        if callable(_set_reveal):
+            _set_reveal(self.reveal_registered_path)
         self._dl_asked_move = set()   # 本次会话已询问过移动的任务 id
         self.lock = threading.Lock()
         # 模型管理
@@ -809,6 +815,9 @@ class Api:
         self._mm_upd_state = {"running": False, "total": 0, "done": 0, "newer": 0, "other_base": 0,
                               "msg": "", "checked_at": 0, "items": {}}
         self._updates = self._load_updates()
+        # 扩展「模型下载状态」：历史 ID 回填缓存 + 自动扫描节流（见 model_status）
+        self._status_hist_meta = {}
+        self._status_scan_started_at = 0.0
         self.mm_scan_state = {"running": False, "rows": [], "msg": ""}
         self.rp_rows = []
         self._rp_launch_lock = threading.RLock()
@@ -828,8 +837,17 @@ class Api:
         _set_media_roots = getattr(browser_bridge, "set_media_roots", None)
         if callable(_set_media_roots):
             _set_media_roots(self._media_roots_for_bridge)
+        # 桥在所有端点要读的状态之后才启动：model_status 直接用 self.mm_scan_state / self._updates，
+        # 早一步开监听就会在启动瞬间给扩展回 500（而不是"还没就绪"的明确状态）。
+        browser_bridge.start(version=APP_VERSION)
         # 所有回调依赖都初始化后再恢复。重启只恢复记录，不擅自开始网络下载。
         self.dl.load_tasks(resume=False)
+        # MCP HTTP 侧车：冻结版随桌面端常驻；失败静默，不阻塞 UI/下载（源码运行不启动）。
+        try:
+            import mcp_autostart
+            mcp_autostart.maybe_start(config.INSTALL_DIR, self.cfg)
+        except Exception:
+            pass
 
     def _new_api(self):
         return civitai_api.CivitaiAPI(
@@ -1489,7 +1507,81 @@ class Api:
             "download_target_dir": self.cfg.get("download_target_dir") or "",
             "multi_file_download": self.cfg.get("multi_file_download") or "ask",
             "route_by_type": bool(self.cfg.get("route_by_type")),
+            "onboarding_done": self.cfg.get("onboarding_done") is True,
+            "auto_guides": self.cfg.get("auto_guides", True) is not False,
+            "api_key_present": bool(str(self.cfg.get("api_key") or "").strip()),
+            "ui_dismiss_rev": int(getattr(self, "_ui_dismiss_rev", 0)),
+            "ui_dismiss_at": float(getattr(self, "_ui_dismiss_at", 0) or 0),
+            "ui_dismiss_targets": list(getattr(self, "_ui_dismiss_targets", []) or []),
+            "ui_overlay_count": len(getattr(self, "_ui_overlays", []) or []),
         }
+
+    _UI_DISMISS_TARGETS = (
+        "all", "guides", "dialogs", "dialog",
+        "onboarding", "api_key", "reverse_tutorial",
+        "confirm", "file_choice", "move_after_download", "settings_unsaved",
+        "restricted", "info", "result", "detail", "media", "about", "image_viewer",
+    )
+
+    def dismiss_ui(self, targets=None, permanent=True):
+        """关闭界面弹层（AI / 浏览器脚本用）。
+
+        人对新手引导、结果窗、确认框有耐心，AI 没有；一次调用关掉所有挡路的弹层。
+        关闭确认框等于「取消」，绝不代替用户点「确定」；file_choice 关闭等于取消本次下载。
+        `permanent=True` 只在目标含 onboarding/all/guides 时写入 onboarding_done 与
+        auto_guides=false，以后不再自动弹；设置页的手动「新手引导」仍可用。
+        """
+        if isinstance(targets, str):
+            targets = [targets]
+        if not isinstance(targets, (list, tuple)) or not targets:
+            targets = ["all"]
+        picked, seen = [], set()
+        for item in targets:
+            name = str(item or "").strip()
+            if name in self._UI_DISMISS_TARGETS and name not in seen:
+                seen.add(name)
+                picked.append(name)
+        if not picked:
+            return {"ok": False, "msg": "targets 必须是 %s 之一"
+                    % "|".join(self._UI_DISMISS_TARGETS)}
+        needs_persist = bool(permanent) and any(
+            name in ("all", "guides", "onboarding") for name in picked)
+        if needs_persist:
+            if not self.save_config({"onboarding_done": True, "auto_guides": False}):
+                return {"ok": False, "msg": "保存引导状态失败"}
+        self._ui_dismiss_targets = list(picked)
+        self._ui_dismiss_at = time.time()
+        self._ui_dismiss_rev = int(getattr(self, "_ui_dismiss_rev", 0)) + 1
+        flags = self.get_ui_flags()
+        return {
+            "ok": True, "dismissed": picked, "permanent": bool(permanent),
+            "permanent_applied": needs_persist,
+            "onboarding_done": flags["onboarding_done"],
+            "auto_guides": flags["auto_guides"],
+            "ui_dismiss_rev": flags["ui_dismiss_rev"],
+            "overlays": list(getattr(self, "_ui_overlays", []) or []),
+        }
+
+    def set_ui_overlays(self, rows=None):
+        """前端登记当前可见弹层，供 AI 的 state/blockers 读取；只保留轻量字段。"""
+        clean = []
+        if isinstance(rows, list):
+            for item in rows[:24]:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()[:40]
+                if not name:
+                    continue
+                clean.append({
+                    "name": name,
+                    "group": str(item.get("group") or "")[:40],
+                    "kind": str(item.get("kind") or "")[:40],
+                    "title": str(item.get("title") or "")[:120],
+                    "blocking": bool(item.get("blocking", True)),
+                })
+        self._ui_overlays = clean
+        self._ui_overlays_at = time.time()
+        return True
 
     def _resolve_model_path(self, path):
         if not isinstance(path,str) or not path.strip():return ""
@@ -1618,6 +1710,14 @@ class Api:
         broker = getattr(self, "_file_choices", None)
         return broker.get() if broker else None
 
+    def get_download_file_choice_revision(self):
+        broker = getattr(self, "_file_choices", None)
+        return broker.revision() if broker else 0
+
+    def get_download_file_choice_transitions(self, since=0):
+        broker = getattr(self, "_file_choices", None)
+        return broker.transitions(since) if broker else []
+
     def respond_download_file_choice(self, identity, indices=None, pause=False):
         broker = getattr(self, "_file_choices", None)
         return broker.respond(identity, indices, pause) if broker else {"ok": False, "msg": "没有待选择的下载"}
@@ -1701,7 +1801,10 @@ class Api:
                             filename=fname,
                             expected_sha256=hashes.get("SHA256") or "",
                             info={"fileId": f.get("id"), "modelName": model_name,
-                                  "versionName": version.get("name", ""), "url": u, "meta": meta})
+                                  "versionName": version.get("name", ""), "url": u, "meta": meta,
+                                  # 扩展跟踪要按版本认任务：同模型重下新版时不能拿旧 done 当结果
+                                  "model_id": str(model_id or ""),
+                                  "version_id": str(version_id or "")})
                         # 按类型分流（与 _enqueue_one 同一判定）：这条是下载页主链路，漏了它分流就不生效
                         routed, route_reason, route_source = self._route_dest_dir(
                             model_obj, version, f, os.path.splitext(fname)[0])
@@ -1741,8 +1844,14 @@ class Api:
                     "routed_dir": (t.info or {}).get("routed_dir", ""),
                     "route_reason": (t.info or {}).get("route_reason", ""),
                     "hash_mismatch": t.status == downloader.ST_ERROR and "SHA256 校验失败" in t.error,
+                    # 完整性校验结果要能直接被 AI 读到：只有 hash_mismatch 分不清「校验通过」与「没校验」
+                    "expected_sha256": t.expected_sha256,
+                    "actual_sha256": t.actual_sha256,
+                    "verification_status": t.verification_status,
                     "manual_binding": download_binding.binding_matches(t),
                     "url": (t.info or {}).get("url", ""),
+                    "model_id": str((t.info or {}).get("model_id") or ""),
+                    "version_id": str((t.info or {}).get("version_id") or ""),
                     "modelName": (t.info or {}).get("modelName", ""),
                     "versionName": (t.info or {}).get("versionName", ""),
                     # 收尾（元数据/封面/视频/旧版清理）失败留痕：列表要能提示「下完了但库不完整」
@@ -1921,10 +2030,19 @@ class Api:
                 u = urllib.parse.urlsplit(candidate)
                 if u.hostname in ("civitai.com", "civitai.red") and u.path.startswith("/models/"):
                     url = urllib.parse.urlunsplit(("https", u.hostname, u.path, "", ""))
+            vid = info.get("versionId") or info.get("version_id")
+            if not vid and isinstance(info.get("version"), dict):
+                vid = info["version"].get("id")
             with self.dl._lock:
                 row = self.dl.history.get(task.id)
                 if row is not None:
-                    row.update(model_url=url, cached_info=os.path.isfile(self._history_asset(task.id, ".json")), cached_thumb=os.path.isfile(self._history_asset(task.id, ".jpg")))
+                    ids = {}
+                    if str(mid or "").isdigit():
+                        ids["model_id"] = str(mid)
+                    if str(vid or "").isdigit():
+                        ids["version_id"] = str(vid)
+                    row.update(model_url=url, cached_info=os.path.isfile(self._history_asset(task.id, ".json")),
+                               cached_thumb=os.path.isfile(self._history_asset(task.id, ".jpg")), **ids)
             self.dl.save_tasks()
         except Exception as e:
             # 历史缓存失败不会让下载失败，但会让「下载历史」缺缩略图/模型链接且无人知晓
@@ -2257,6 +2375,70 @@ class Api:
                 return {"ok": True}
             except Exception:
                 return {"ok": False, "msg": "无法打开"}
+
+    def reveal_registered_path(self, path):
+        """扩展「打开所在目录」：只接受本机已登记的文件或落点，拒绝任意路径。
+
+        白名单 = 模型库行 path、下载历史 file_path / dest_dir、活动任务 dest_dir 与
+        dest_dir/filename。归一化用 normcase(normpath(abspath))，Windows 下大小写与
+        尾分隔符不影响匹配；不解析符号链接（打开的是登记时那个位置）。
+        """
+        raw = str(path or "").strip()
+        if not raw:
+            return {"ok": False, "msg": "路径不能为空"}
+        if len(raw) > 4096:
+            return {"ok": False, "msg": "路径过长"}
+        if "\x00" in raw:
+            return {"ok": False, "msg": "路径无效"}
+        try:
+            want = os.path.normcase(os.path.normpath(os.path.abspath(raw)))
+        except Exception:
+            return {"ok": False, "msg": "路径无效"}
+        allowed = set()
+
+        def add(p):
+            if not isinstance(p, str) or not p.strip() or "\x00" in p:
+                return
+            try:
+                allowed.add(os.path.normcase(os.path.normpath(os.path.abspath(p.strip()))))
+            except Exception:
+                pass
+
+        for row in list(getattr(self, "model_rows", []) or []):
+            if isinstance(row, dict):
+                add(row.get("path"))
+        try:
+            history = self.dl.get_history()
+        except Exception:
+            history = []
+        for row in history or []:
+            if not isinstance(row, dict):
+                continue
+            add(row.get("file_path"))
+            dest, name = row.get("dest_dir") or "", row.get("filename") or ""
+            if dest:
+                add(dest)
+                if name:
+                    add(os.path.join(dest, name))
+        for task in list(getattr(getattr(self, "dl", None), "tasks", []) or []):
+            dest = getattr(task, "dest_dir", "") or ""
+            if dest:
+                add(dest)
+                name = getattr(task, "filename", "") or ""
+                if name:
+                    add(os.path.join(dest, name))
+        if want not in allowed:
+            return {"ok": False, "msg": "路径未登记，拒绝打开"}
+        target = os.path.abspath(raw)
+        if not os.path.exists(target):
+            return {"ok": False, "msg": "路径已不存在（可能已移动或删除）"}
+        result = self.open_in_folder(target)
+        if not isinstance(result, dict):
+            return {"ok": False, "msg": "打开目录失败"}
+        if result.get("ok"):
+            result = dict(result)
+            result["path"] = target
+        return result
 
     def set_download_order(self, task_ids):
         ok=self.dl.reorder_tasks(task_ids)
@@ -3737,6 +3919,496 @@ class Api:
                     if self._match_version_id(meta, vid):
                         hits.append(full)
         return hits
+
+    # ---------------- 扩展：模型下载状态（契约见 docs/extension-model-status.md） ----------------
+
+    @staticmethod
+    def _status_id(value):
+        s = str(value or "").strip()
+        return s if s.isdigit() and s != "0" else ""
+
+    @staticmethod
+    def _status_hashes(value):
+        """请求里的 SHA256 列表 → 规范的 64 位小写十六进制（去重、最多 8 个）。"""
+        out = []
+        for raw in (value if isinstance(value, list) else [])[:32]:
+            s = str(raw or "").strip().lower()
+            if re.fullmatch(r"[a-f0-9]{64}", s) and s not in out:
+                out.append(s)
+        return out[:8]
+
+    def _status_ids_from_item(self, item):
+        """请求项 → (model_id, version_id)。显式字段优先，URL 只做回退解析。"""
+        if not isinstance(item, dict):
+            return "", ""
+        mid = self._status_id(item.get("model_id") or item.get("modelId"))
+        vid = self._status_id(item.get("version_id") or item.get("versionId"))
+        url = str(item.get("url") or "")
+        if url:
+            m = re.search(r"/api/download/models/(\d+)", url)
+            if m:
+                if not vid:
+                    vid = self._status_id(m.group(1))
+            else:
+                m = re.search(r"/models/(\d+)", url)
+                if m and not mid:
+                    mid = self._status_id(m.group(1))
+                m = re.search(r"[?&]modelVersionId=(\d+)", url)
+                if m and not vid:
+                    vid = self._status_id(m.group(1))
+        return mid, vid
+
+    @classmethod
+    def _status_row_ids(cls, row):
+        """模型库扫描行 → (model_id, version_id)，兼容驼峰/下划线/嵌套 version。"""
+        info = row.get("info") if isinstance(row.get("info"), dict) else {}
+        vid = str(row.get("verId") or "")
+        if not vid:
+            vid = str(info.get("versionId") or info.get("version_id") or "")
+            if not vid and isinstance(info.get("version"), dict):
+                vid = str(info["version"].get("id") or "")
+        mid = str(row.get("modelId") or "")
+        if not mid:
+            mid = str(info.get("modelId") or info.get("model_id") or info.get("id") or "")
+        return cls._status_id(mid), cls._status_id(vid)
+
+    def _status_history_meta(self, row, task_id):
+        """历史行的 C 站身份：新行直接读列，老行从 history_assets 快照回填（按 mtime 缓存）。
+
+        历史行本来只记文件名/目录，v2.7.0 起 _record_history 写入 model_id/version_id；
+        更早的记录没有这两列，但 _cache_history_task 保存的快照里有（实测含 modelId/version.id）。
+        快照缺失时不再猜，交给模型库扫描；这里只做确定性的回填。
+        """
+        mid = self._status_id(row.get("model_id"))
+        vid = self._status_id(row.get("version_id"))
+        if mid and vid:
+            return mid, vid, {}
+        meta = {}
+        path = self._history_asset(task_id, ".json")
+        try:
+            mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            mtime = 0
+        if mtime:
+            cached = self._status_hist_meta.get(task_id)
+            if cached and cached[0] == mtime:
+                meta = cached[1]
+            else:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except Exception:
+                    meta = {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                self._status_hist_meta[task_id] = (mtime, meta)
+                if len(self._status_hist_meta) > 4000:
+                    for key in list(self._status_hist_meta)[:2000]:
+                        self._status_hist_meta.pop(key, None)
+        if not mid:
+            mid = self._status_id(meta.get("modelId") or meta.get("model_id") or meta.get("id"))
+        if not vid:
+            vid = self._status_id(meta.get("versionId") or meta.get("version_id"))
+            if not vid and isinstance(meta.get("version"), dict):
+                vid = self._status_id(meta["version"].get("id"))
+        if not mid:
+            m = re.search(r"/models/(\d+)", str(row.get("model_url") or ""))
+            if m:
+                mid = self._status_id(m.group(1))
+        return mid, vid, meta
+
+    def _status_update_view(self, rec, fallback_mid="", site_url=None):
+        """model_updates.json 的原始记录 → 扩展契约里的 update 对象（不重新联网判定）。"""
+        if not isinstance(rec, dict):
+            return None
+        mid = self._status_id(rec.get("model_id")) or fallback_mid
+        latest = self._status_id(rec.get("latest_version"))
+        latest_url = str(rec.get("url") or "")
+        has_update = rec.get("has_update") is True
+        if not latest_url and has_update and mid and latest and site_url:
+            latest_url = site_url(mid, latest)
+        newer = []
+        for it in (rec.get("newer_list") or [])[:12]:
+            if isinstance(it, dict) and str(it.get("id") or "").isdigit():
+                newer.append({"id": str(it.get("id")), "name": it.get("name") or "",
+                              "date": it.get("date") or "", "url": it.get("url") or ""})
+        return {
+            "known": True, "has_update": has_update,
+            "other_base": rec.get("other_base") is True,
+            "unknown_local": rec.get("unknown") is True,
+            "local_version": str(rec.get("local_version") or ""),
+            "local_name": str(rec.get("local_name") or ""),
+            "latest_version": latest, "latest_name": str(rec.get("latest_name") or ""),
+            "latest_url": latest_url if latest else "",
+            "behind": int(rec.get("behind") or 0),
+            "checked_at": int(rec.get("checked_at") or 0), "newer": newer,
+        }
+
+    def model_status(self, items=None, include_updates=True):
+        """扩展下载状态：合并模型库 / 下载历史 / 活动任务 / 更新缓存，只读本机数据。
+
+        不联网、不触发 Civitai API。模型库还没扫描过时最多后台触发一次 scan_models()
+        （60s 节流）；此时“没找到”一律返回 unknown，绝不把“还没读”说成“没下载”。
+        """
+        items = items if isinstance(items, list) else []
+        if len(items) > 500:
+            return {"ok": False, "msg": "一次最多查询 500 个模型"}
+        roots_status = self._model_roots_with_status()
+        scanning = bool(self.mm_scan_state.get("running"))
+        scanned = str(self.mm_scan_state.get("msg") or "").startswith("扫描完成")
+        ready = bool(self.model_rows) or scanned
+        if not ready and not scanning:
+            usable = any(r.get("status") == "ok" for r in roots_status)
+            now = time.time()
+            if usable and now - float(getattr(self, "_status_scan_started_at", 0.0) or 0.0) > 60:
+                self._status_scan_started_at = now
+                try:
+                    self.scan_models()
+                    scanning = bool(self.mm_scan_state.get("running"))
+                except Exception:
+                    pass
+        if not ready and not scanning:
+            if not roots_status:
+                miss_reason = "未配置模型目录，无法判断本地是否已下载"
+            elif not any(r.get("status") == "ok" for r in roots_status):
+                miss_reason = "模型目录不可达，无法判断本地是否已下载"
+            else:
+                miss_reason = "模型库尚未扫描，无法判断本地是否已下载"
+        elif scanning:
+            miss_reason = "模型库正在扫描（首次读取可能需要几秒）"
+        else:
+            miss_reason = "模型库已扫描完成，本机模型库、下载历史与任务队列均未找到该版本"
+
+        lib_by_ver, lib_by_model = {}, {}
+        hash_index = {}   # sha256 -> [本地命中记录]；只读侧车/历史已有哈希，不主动扫盘计算
+
+        def add_hashes(rec, values):
+            for sha in self._status_hashes(values):
+                bucket = hash_index.setdefault(sha, [])
+                if rec not in bucket:
+                    bucket.append(rec)
+
+        def file_hashes(info, local_path):
+            """只把侧车里「确实对应这个本地文件」的哈希绑到它身上。
+
+            侧车里的 files[] 是整个版本的文件列表；多文件版本里拿另一个文件的 SHA256
+            判这条路径已下载，会把 local.path 指向内容并不匹配的文件。单文件版本没有歧义；
+            多文件版本只认文件名与本地文件一致的那条（改名后的多文件宁可退 unknown）。
+            """
+            files = info.get("files") if isinstance(info, dict) else None
+            files = [f for f in files if isinstance(f, dict)] if isinstance(files, list) else []
+            base = os.path.basename(str(local_path or "")).lower()
+            out = []
+            for f in files:
+                sha = (f.get("hashes") or {}).get("SHA256")
+                if not sha:
+                    continue
+                if len(files) > 1:
+                    name = os.path.basename(str(f.get("name") or "")).lower()
+                    if not base or not name or name != base:
+                        continue
+                out.append(sha)
+            return out
+
+        for row in list(self.model_rows or []):
+            mid, vid = self._status_row_ids(row)
+            info = row.get("info") if isinstance(row.get("info"), dict) else {}
+            rec = {"source": "library", "model_id": mid, "version_id": vid,
+                   "path": row.get("path") or "", "size": row.get("size") or 0,
+                   "model_name": row.get("civitai_name") or row.get("name") or "",
+                   "version_name": row.get("ver") or "", "base_model": row.get("base") or "",
+                   "finished_at": row.get("mtime") or 0}
+            if vid:
+                lib_by_ver.setdefault(vid, []).append(rec)
+            if mid:
+                lib_by_model.setdefault(mid, []).append(rec)
+            add_hashes(rec, file_hashes(info, row.get("path")))
+
+        hist_by_ver, hist_by_model = {}, {}
+        for row in self.dl.get_history():
+            if row.get("status") != downloader.ST_DONE:
+                continue
+            tid = str(row.get("id") or "")
+            if not tid:
+                continue
+            mid, vid, meta = self._status_history_meta(row, tid)
+            ver = meta.get("version") if isinstance(meta.get("version"), dict) else {}
+            rec = {"source": "history", "model_id": mid, "version_id": vid,
+                   "file_path": row.get("file_path") or os.path.join(row.get("dest_dir", ""), row.get("filename", "")),
+                   "task_id": tid, "size": row.get("total") or 0,
+                   "model_name": row.get("modelName") or meta.get("name") or "",
+                   "version_name": row.get("versionName") or ver.get("name") or "",
+                   "base_model": meta.get("baseModel") or ver.get("baseModel") or "",
+                   "finished_at": row.get("finished_at") or row.get("updated_at") or 0}
+            if vid:
+                hist_by_ver.setdefault(vid, []).append(rec)
+            if mid:
+                hist_by_model.setdefault(mid, []).append(rec)
+            hashes = [row.get("actual_sha256"), row.get("expected_sha256")]
+            hashes.extend(file_hashes(meta, rec.get("file_path")))
+            add_hashes(rec, hashes)
+
+        active = (downloader.ST_PENDING, downloader.ST_DOWNLOADING,
+                  downloader.ST_RETRYING, downloader.ST_PAUSED)
+        task_by_ver, task_by_model = {}, {}
+        for task in list(getattr(self.dl, "tasks", []) or []):
+            if getattr(task, "status", "") not in active:
+                continue
+            ids = self._comments_source_ids(task) or ("", "")
+            mid, vid = self._status_id(ids[0]), self._status_id(ids[1])
+            if not mid or not vid:
+                url_mid, url_vid = self._status_ids_from_item({"url": getattr(task, "url", "")})
+                mid, vid = mid or url_mid, vid or url_vid
+            rec = {"task_id": getattr(task, "id", ""), "model_id": mid, "version_id": vid,
+                   "status": getattr(task, "status", ""), "progress": float(getattr(task, "progress", 0) or 0),
+                   "filename": getattr(task, "filename", ""), "dest_dir": getattr(task, "dest_dir", "")}
+            if vid:
+                task_by_ver.setdefault(vid, []).append(rec)
+            if mid:
+                task_by_model.setdefault(mid, []).append(rec)
+
+        upd_by_ver, upd_by_model, upd_by_lv, upd_count = {}, {}, {}, 0
+        if include_updates:
+            for rec in (self._updates.get("items") or {}).values():
+                if not isinstance(rec, dict):
+                    continue
+                mid = self._status_id(rec.get("model_id"))
+                lv = self._status_id(rec.get("local_version"))
+                if not mid and not lv:
+                    continue
+                upd_count += 1
+                if lv and lv not in upd_by_lv:
+                    upd_by_lv[lv] = rec       # 下载链接只有版本 ID 时兜底（版本 ID 全局唯一）
+                if mid and lv:
+                    prev = upd_by_ver.get((mid, lv))
+                    if prev is None or (rec.get("has_update") is True and prev.get("has_update") is not True):
+                        upd_by_ver[(mid, lv)] = rec
+                if mid:
+                    upd_by_model.setdefault(mid, []).append(rec)
+
+        exists_cache = {}
+        def path_exists(path):
+            p = str(path or "")
+            if not p:
+                return False
+            if p not in exists_cache:
+                try:
+                    exists_cache[p] = os.path.isfile(p)
+                except OSError:
+                    exists_cache[p] = False
+            return exists_cache[p]
+
+        def entries_exist(entries):
+            return any(path_exists(e.get("path") or e.get("file_path")) for e in entries)
+
+        def grouped_versions(entries, limit=20):
+            """同版本多文件合并成一条；优先有文件的落点。"""
+            groups, order = {}, []
+            for e in entries:
+                vid = e.get("version_id") or ""
+                key = vid or ("path:" + str(e.get("path") or e.get("file_path") or ""))
+                g = groups.get(key)
+                if g is None:
+                    g = groups[key] = {"version_id": vid, "version_name": e.get("version_name") or "",
+                                       "model_name": e.get("model_name") or "", "base_model": e.get("base_model") or "",
+                                       "source": e.get("source") or "", "paths": [], "entries": [],
+                                       "size": 0, "finished_at": 0}
+                    order.append(key)
+                p = e.get("path") or e.get("file_path") or ""
+                if p and p not in g["paths"]:
+                    g["paths"].append(p)
+                g["entries"].append(e)
+                g["size"] = max(int(g["size"] or 0), int(e.get("size") or 0))
+                g["finished_at"] = max(int(g["finished_at"] or 0), int(e.get("finished_at") or 0))
+                if not g.get("version_name") and e.get("version_name"):
+                    g["version_name"] = e.get("version_name")
+                if not g.get("model_name") and e.get("model_name"):
+                    g["model_name"] = e.get("model_name")
+                if not g.get("base_model") and e.get("base_model"):
+                    g["base_model"] = e.get("base_model")
+                if e.get("source") == "library" and not g.get("source"):
+                    g["source"] = "library"
+            out = []
+            for key in order:
+                g = groups[key]
+                g["exists"] = entries_exist(g["entries"])
+                g["path"] = g["paths"][0] if g["paths"] else ""
+                g.pop("entries", None)
+                out.append(g)
+            out.sort(key=lambda x: (0 if x.get("exists") else 1,
+                                    -int(x.get("finished_at") or 0)))
+            return out[:limit]
+
+        def local_view(group):
+            if not group:
+                return None
+            return {"source": group.get("source") or "", "version_id": group.get("version_id") or "",
+                    "version_name": group.get("version_name") or "", "model_name": group.get("model_name") or "",
+                    "base_model": group.get("base_model") or "", "path": group.get("path") or "",
+                    "paths": list(group.get("paths") or []), "file_count": len(group.get("paths") or []),
+                    "size": int(group.get("size") or 0), "exists": bool(group.get("exists"))}
+
+        results = []
+        for raw in items:
+            mid, vid = self._status_ids_from_item(raw)
+            if not mid and not vid:
+                results.append({"model_id": "", "version_id": "", "state": "unknown",
+                                "version_matched": False, "matched": "none",
+                                "local": None, "local_versions": [], "download": None,
+                                "history": None, "update": None,
+                                "reason": "缺少模型 ID"})
+                continue
+
+            lib_exact = list(lib_by_ver.get(vid, [])) if vid else []
+            hist_exact = list(hist_by_ver.get(vid, [])) if vid else []
+            all_exact = lib_exact + hist_exact
+            exact_alive = entries_exist(all_exact) if all_exact else False
+
+            lib_model = list(lib_by_model.get(mid, [])) if mid else []
+            hist_model = list(hist_by_model.get(mid, [])) if mid else []
+            model_versions = grouped_versions(lib_model + hist_model)
+            exact_group = next((g for g in model_versions if vid and g.get("version_id") == vid), None)
+
+            exact_tasks = list(task_by_ver.get(vid, [])) if vid else []
+            model_tasks = list(task_by_model.get(mid, [])) if mid else []
+
+            update_rec = None
+            if vid:
+                update_rec = upd_by_ver.get((mid, vid)) if mid else None
+                if update_rec is None:
+                    update_rec = upd_by_lv.get(vid)
+            if update_rec is None and not vid and mid:
+                recs = upd_by_model.get(mid) or []
+                update_rec = next((r for r in recs if r.get("has_update") is True), recs[0] if recs else None)
+            update = self._status_update_view(update_rec, mid, self._site_url) if include_updates else None
+
+            history_rec = next((e for e in hist_exact if path_exists(e.get("file_path"))), None)
+            history_view = None
+            if history_rec:
+                history_view = {"task_id": history_rec.get("task_id") or "",
+                                "finished_at": history_rec.get("finished_at") or 0,
+                                "file_path": history_rec.get("file_path") or "",
+                                "file_exists": True}
+            elif hist_exact:
+                history_view = {"task_id": hist_exact[0].get("task_id") or "",
+                                "finished_at": hist_exact[0].get("finished_at") or 0,
+                                "file_path": hist_exact[0].get("file_path") or "",
+                                "file_exists": False}
+
+            download = None
+            if exact_tasks:
+                t = exact_tasks[0]
+                download = {"status": t.get("status") or "", "progress": round(float(t.get("progress") or 0), 1),
+                            "task_id": t.get("task_id") or "", "filename": t.get("filename") or "",
+                            "dest_dir": t.get("dest_dir") or "", "version_matched": True,
+                            "task_count": len(exact_tasks)}
+            elif model_tasks:
+                t = model_tasks[0]
+                download = {"status": t.get("status") or "", "progress": round(float(t.get("progress") or 0), 1),
+                            "task_id": t.get("task_id") or "", "filename": t.get("filename") or "",
+                            "dest_dir": t.get("dest_dir") or "", "version_matched": False,
+                            "task_count": len(model_tasks)}
+
+            # 哈希回退：版本 ID 缺失/文件改名时，用请求里的 SHA256 认内容。只在精确版本没有命中
+            # 时启用；候选必须文件仍在，且只认侧车/历史里已有的哈希（不扫盘算哈希）。
+            req_hashes = self._status_hashes(raw.get("hashes")) if isinstance(raw, dict) else []
+            hash_hits = []
+            if req_hashes and not exact_alive:
+                seen_paths = set()
+                for sha in req_hashes:
+                    for rec in hash_index.get(sha, []):
+                        p = rec.get("path") or rec.get("file_path") or ""
+                        if not p or p in seen_paths or not path_exists(p):
+                            continue
+                        seen_paths.add(p)
+                        hash_hits.append(rec)
+                hash_hits.sort(key=lambda r: 0 if r.get("source") == "library" else 1)
+            hash_group = grouped_versions(hash_hits)[0] if hash_hits else None
+            if hash_group and history_view is None:
+                hrec = next((e for e in hash_hits if e.get("source") == "history"), None)
+                if hrec:
+                    history_view = {"task_id": hrec.get("task_id") or "",
+                                    "finished_at": hrec.get("finished_at") or 0,
+                                    "file_path": hrec.get("file_path") or "",
+                                    "file_exists": True}
+
+            exact_group = exact_group or (grouped_versions(all_exact, limit=1)[0] if all_exact else None)
+            # 精确版本只剩记录、文件已不在时，local 必须让给真正命中的哈希文件，
+            # 否则 state=downloaded 却把路径指向一个不存在的文件。
+            local_group = hash_group if (hash_group and (not exact_group or not exact_group.get("exists"))) else exact_group
+            local = local_view(local_group) if local_group else None
+            if local is None and model_versions:
+                local = local_view(model_versions[0])
+
+            if vid and exact_tasks:
+                state, matched = "downloading", "version"
+            elif vid and exact_alive:
+                state, matched = ("update_available" if update and update.get("has_update") else "downloaded"), "version"
+            elif hash_group:
+                # 内容命中：本地确实有这份文件；只有版本 ID 也一致时才把更新记录算在它头上
+                hit_vid = str(hash_group.get("version_id") or "")
+                state = "update_available" if (update and update.get("has_update")
+                                               and (not hit_vid or hit_vid == vid)) else "downloaded"
+                matched = "hash"
+            elif model_tasks:
+                # 走到这里说明活动任务不是这个版本（精确命中已在上面处理），按模型级如实报
+                state, matched = "downloading", "model"
+            elif vid and all_exact:
+                # 本地有这条版本的记录，但文件已经不在了：不能报“未下载”也不能报“已下载”
+                state, matched = "not_downloaded", "none"
+            elif model_versions:
+                state, matched = ("update_available" if update and update.get("has_update") else "downloaded"), "model"
+                if vid:
+                    state = "other_version"
+            elif not ready or scanning:
+                state, matched = "unknown", "none"
+            else:
+                state, matched = "not_downloaded", "none"
+
+            reason = ""
+            if state == "unknown":
+                reason = miss_reason
+            elif state == "other_version":
+                reason = "本机有这个模型的 %d 个其他版本，但没有请求的版本 %s" % (len(model_versions), vid)
+            elif state == "downloading" and matched == "model":
+                reason = "该模型的其他版本正在下载"
+            elif matched == "hash":
+                reason = "按 SHA256 命中本地文件（版本 ID 缺失或文件已改名）"
+            elif state == "not_downloaded":
+                if vid and all_exact:
+                    reason = "本地有该版本的记录，但文件已不在（模型库/历史路径均不可用）"
+                else:
+                    reason = miss_reason
+                    if history_view and not history_view.get("file_exists"):
+                        reason += "；下载历史里有记录，但文件已不在原路径"
+            if vid and not exact_alive and model_versions and state == "other_version" and history_view and not history_view.get("file_exists"):
+                reason += "；历史记录指向的文件已不在"
+
+            local_versions = list(model_versions)
+            if hash_group and not any(g.get("version_id") == hash_group.get("version_id") and hash_group.get("version_id")
+                                      for g in local_versions):
+                local_versions.insert(0, hash_group)
+            if exact_group and not any(g.get("version_id") == exact_group.get("version_id") and exact_group.get("version_id")
+                                       for g in local_versions):
+                local_versions.insert(0, exact_group)
+
+            results.append({
+                "model_id": mid, "version_id": vid, "state": state,
+                "version_matched": bool(vid and exact_alive),
+                "matched": matched,
+                "local": local, "local_versions": local_versions,
+                "download": download, "history": history_view,
+                "update": update, "reason": reason,
+            })
+
+        return {"ok": True, "generated_at": int(time.time()),
+                "library": {"ready": bool(ready), "scanning": scanning,
+                            "count": len(self.model_rows or []),
+                            "roots": [{"path": r.get("path") or "", "status": r.get("status") or "",
+                                       "error": r.get("error") or ""} for r in roots_status]},
+                "updates": {"checked_at": int(self._updates.get("checked_at") or 0),
+                            "available": bool(upd_count), "records": upd_count},
+                "items": results}
 
     def library_check(self, version_id):
         """模型库检查：version_id 转 str 比较；先缓存后磁盘（注释注明性能特征）"""

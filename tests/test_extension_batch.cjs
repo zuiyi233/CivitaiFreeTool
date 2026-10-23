@@ -13,8 +13,8 @@ function loadScript(file,ctx,seen){
 }
 const loadIn=(ctx,rel)=>loadScript(path.join(root,rel),ctx,new Set());
 const common=fs.readFileSync(path.join(root,'chrome-extension/tabs-common.js'),'utf8');
-function worker(saved=null,hold=null){
- const stored={lastBatch:saved},calls=[],events=[],senders={};
+function worker(saved=null,hold=null,options={}){
+ const stored={lastBatch:saved},calls=[],requests=[],events=[],senders={},reloads=[];
  // 未列出的 chrome.* 命名空间一律自动桩成"返回 Promise 的函数"，onXxx 自动收集监听器：
  // background.js 会随能力增长调用新的 API（offscreen/sidePanel/alarms…），逐条手写 mock 会让
  // 这个基座每次加功能都坏一次（它就是因此从 v2.1.0 起一直跑不起来的）。
@@ -27,6 +27,8 @@ function worker(saved=null,hold=null){
  const clone=(v)=>JSON.parse(JSON.stringify(v));
  const ext={runtime:mkNs('runtime',{id:'test-id',
    sendMessage:async(m)=>{if(m&&m.__cft===true)events.push(m);return undefined;},
+   getManifest:()=>({version:options.extVersion||'2.6.1'}),
+   reload:()=>{reloads.push(Date.now());},
    getContexts:async()=>[],getURL:(p)=>'chrome-extension://test-id/'+p,lastError:undefined}),
   storage:{local:{get:async()=>clone(stored),set:async v=>Object.assign(stored,clone(v)),remove:async k=>{delete stored[k];}}},
   action:mkNs('action'),tabs:mkNs('tabs',{query:async()=>[],
@@ -36,7 +38,9 @@ function worker(saved=null,hold=null){
  const ctx=vm.createContext({chrome:ext,URL,URLSearchParams,AbortController,setTimeout,clearTimeout,
   setInterval,clearInterval,queueMicrotask,console,TextEncoder,TextDecoder,
   structuredClone:(v)=>clone(v),crypto:{randomUUID:()=>'00000000-0000-4000-8000-000000000000'},
-  fetch:async(url,o)=>{calls.push(JSON.parse(o.body).url);if(hold)await hold;return {ok:true,json:async()=>({ok:true})};}});
+  fetch:async(url,o)=>{const body=o&&o.body?JSON.parse(o.body):{};requests.push({url:String(url),body});if(String(url).includes('/api/download'))calls.push(body.url);if(hold)await hold;
+   const payload=Object.assign({ok:true},String(url).includes('/api/ext/tabs')?(options.tabIndexData||{}):{});
+   return {ok:true,json:async()=>payload};}});
  vm.runInContext(common,ctx);loadIn(ctx,'chrome-extension/background.js');
  // MV3 语义：处理器可以（a）同步返回答复、（b）返回 Promise、（c）返回 true 之后异步 sendResponse。
  // background.js 走的是 (c)，所以三条都要接住，否则断言只会拿到 undefined。
@@ -50,7 +54,7 @@ function worker(saved=null,hold=null){
   if(ret&&typeof ret.then==='function')ret.then(finish,(e)=>finish(null));
   else if(ret!==true)finish(ret===false?null:(ret||null));});
  const listenerCount=()=>(senders['runtime.onMessage']||[]).length;
- return {ctx,calls,stored,message,events,listenerCount};
+ return {ctx,calls,requests,stored,message,events,senders,listenerCount,reloads};
 }
 const wait=async f=>{for(let i=0;i<200;i++){if(await f())return;await new Promise(r=>setTimeout(r,10));}throw Error('timeout');};
 (async()=>{
@@ -66,17 +70,44 @@ const wait=async f=>{for(let i=0;i<200;i++){if(await f())return;await new Promis
  release();await wait(()=>!running.stored.lastBatch?.running);assert.equal(running.calls.length,2);assert(running.stored.lastBatch.items.every(r=>r.status==='sent'));ok('无需 popup 存活，后台继续按顺序提交全部勾选链接');
  assert.equal((await running.message('cft-batch-start',['https://civitai.red/models/1'])).ok,false);assert((await running.message('cft-batch-clear')).ok);assert((await running.message('cft-batch-start',['https://civitai.red/models/1'])).ok);await wait(()=>!running.stored.lastBatch?.running);ok('重复发送必须显式清除记录，CFT 任务不删除');
  const interrupted=worker({id:'old',running:true,items:[{key:'a',status:'sending'},{key:'b',status:'waiting'},{key:'c',status:'sent'}]});const status=await interrupted.message('cft-batch-status');assert.equal(status.job.items[0].status,'uncertain');assert.equal(status.job.items[1].status,'failed');assert.equal(interrupted.calls.length,0);ok('浏览器重启后中断记录可见，绝不自动重试未知请求');
+ // 标签页变化 → 后台把 C 站模型页索引推到本机桥；token 与站外页不得进入载荷
+ const ti=worker();
+ const modelUrl='https://civitai.red/models/1264662/live-wallpaper-style?modelVersionId=3351608&token=SECRET';
+ ti.ctx.chrome.tabs.query=async()=>[{id:1,windowId:1,title:'Live Wallpaper Style | Civitai',url:modelUrl}];
+ const tiTab={id:1,windowId:1,title:'Live Wallpaper Style | Civitai',url:modelUrl};
+ for(const f of (ti.senders['tabs.onUpdated']||[])) f(1,{url:modelUrl},tiTab);
+ await wait(()=>ti.requests.some(r=>r.url.includes('/api/ext/tabs')&&r.body&&r.body.tabs&&r.body.tabs.length));
+ const tiReq=[...ti.requests].reverse().find(r=>r.url.includes('/api/ext/tabs')&&r.body&&r.body.tabs&&r.body.tabs.length);
+ assert.equal(tiReq.body.v,1);assert.equal(tiReq.body.source,'chrome-extension');assert.equal(tiReq.body.ext_version,'2.6.1');assert.equal(tiReq.body.tabs[0].modelId,'1264662');assert.equal(tiReq.body.tabs[0].versionId,'3351608');assert(!JSON.stringify(tiReq.body).includes('SECRET'));ok('后台在标签页变化后把模型页索引推到桥（不含 token，带扩展版本）');
+ // 开发态：桥回传新的 dev_reload_at → 扩展 runtime.reload()；同一时间戳只触发一次（storage 防循环）
+ const dr=worker(null,null,{tabIndexData:{dev_reload_at:123456}});
+ dr.ctx.chrome.tabs.query=async()=>[tiTab];
+ const fireAlarm=(w)=>{for(const f of (w.senders['alarms.onAlarm']||[])) f({name:'cftTabIndex'});};
+ fireAlarm(dr);await wait(()=>dr.reloads.length===1);
+ assert.equal(dr.stored.cftDevReloadSeenV1,123456);
+ fireAlarm(dr);await new Promise(r=>setTimeout(r,80));
+ assert.equal(dr.reloads.length,1);ok('开发态重载标记只生效一次，不会因心跳反复重载');
  // 注入面是隐私声明的一部分，必须钉住：Chrome 只允许在 C 站的 models/images/posts 注入，
  // Firefox 侧目前根本没有 content script（它没有 offscreen，能力集不同，见任务#4）。
  const cm=JSON.parse(fs.readFileSync(path.join(root,'chrome-extension/manifest.json'),'utf8'));
  const fm=JSON.parse(fs.readFileSync(path.join(root,'firefox-extension/manifest.json'),'utf8'));
  for(const [n,m] of [['chrome',cm],['firefox',fm]]){assert(m.permissions.includes('storage'),n+' 需要 storage');assert(!m.permissions.includes('scripting'),n+' 不得用 scripting');assert(!/<all_urls>/.test(JSON.stringify(m)),n+' 不得申请 <all_urls>');}
  const cs=(cm.content_scripts||[]);
- assert(cs.length>0&&cs.every(c=>c.matches.every(u=>/^https:\/\/(www\.)?civitai\.(com|red)\/(models|images|posts)\/\*$/.test(u))),
-   'Chrome 注入范围只能是 C 站 models/images/posts');
+ // /models* 含列表页（阶段二卡片徽章），/models/* 是详情页；images/posts 仍只注入详情页
+ assert(cs.length>0&&cs.every(c=>c.matches.every(u=>/^https:\/\/(www\.)?civitai\.(com|red)\/(models(\*|\/\*)|images\/\*|posts\/\*)$/.test(u))),
+   'Chrome 注入范围只能是 C 站 models 列表/详情、images、posts');
  assert(!fs.readFileSync(path.join(root,'chrome-extension/README.md'),'utf8').includes('不注入网页'),
    'Chrome README 不得再声明"不注入网页"');
  assert(!fm.content_scripts||fm.content_scripts.length===0,'Firefox 侧仍未注入网页');
+ // manifest 只是个索引：引用的文件缺一个，加载时整条 content script / 侧栏就静默失效
+ for(const f of ['sidepanel.html','sidepanel.js',...cs.flatMap(c=>[...(c.js||[]),...(c.css||[])])]){
+  assert(fs.existsSync(path.join(root,'chrome-extension',f)),'Chrome manifest 引用的文件必须存在：'+f);}
+ // MV3 扩展页面 CSP 禁止内联脚本：写内联 = 那段逻辑在真扩展里静默不执行（HTTP 测试发现不了）
+ for(const f of ['popup.html','sidepanel.html']){
+  const html=fs.readFileSync(path.join(root,'chrome-extension',f),'utf8');
+  assert(!/<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?<\/script>/i.test(html),f+' 不允许内联脚本（会被 MV3 CSP 拦截）');}
+ assert(fs.readFileSync(path.join(root,'chrome-extension/sidepanel.js'),'utf8').includes('__CFT_SIDE_PANEL__'),
+  'sidepanel.js 必须设置侧栏标记');
  assert.equal(fs.readFileSync(path.join(root,'firefox-extension/tabs-common.js'),'utf8'),common,'共享的 tabs-common 两边必须逐字节同步');
  for(const [n,dir] of [['chrome','chrome-extension'],['firefox','firefox-extension']]){
   const v=JSON.parse(fs.readFileSync(path.join(root,dir,'manifest.json'),'utf8')).version;

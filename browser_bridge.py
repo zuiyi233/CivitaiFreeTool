@@ -18,6 +18,10 @@
   · `{bundle, filename, data_b64}` 落点 = bundle 令牌登记的绝对目录，filename 必须是**纯文件名**
 - POST /api/archive/done：`{dir_name}`，尽力而为触发模型库重扫；分流后 dir_name 不再代表路径，
   因此允许空参（扩展的批量结束恒传空串），请求体带 `bundle` 时顺手释放该令牌。
+- POST /api/model/status：扩展「模型下载状态」批量查询（模型库/历史/任务/更新缓存），
+  只读本机数据、不联网；契约见 docs/extension-model-status.md。
+- POST /api/ext/tabs：扩展只读上报「打开的 C 站模型页索引」（标题/URL/模型版本 ID，仅内存）；
+  GET /api/ext/tabs 供本机 Agent 搜索；契约见 docs/browser-tabs-bridge.md。
 - POST /api/rpc：浏览器模式下的通用方法调用（前端 shim 把 window.pywebview.api.xxx 映射到这里）；
 - GET /、/app.js 等：浏览器模式下直接由本服务提供 web/ 目录里的界面文件；
 - GET /api/heartbeat：页面心跳（用于「关页面即退出」）；
@@ -29,8 +33,11 @@ import inspect
 import json
 import mimetypes
 import os
+import queue
 import re
 import secrets
+import select
+import socket
 import threading
 import time
 import urllib.parse
@@ -66,6 +73,8 @@ _archive_config_fn = None  # def config() -> dict
 _archive_write_fn = None   # def write(rel_path, data: bytes) -> str/False
 _archive_done_fn = None    # def done(dir_name) -> 任意（尽力而为）
 _archive_check_fn = None   # def check(version_id) -> dict {found, paths}
+_model_status_fn = None    # def status(items, include_updates=True) -> dict
+_reveal_fn = None          # def reveal(path) -> dict（扩展「打开所在目录」；只认桌面端已登记路径）
 # 资源库媒体流（GET /api/media）：可读根目录由 webui.Api 注入，桥层不 import webui
 _media_roots_fn = None     # def media_roots() -> [绝对根目录]
 
@@ -281,7 +290,23 @@ AUTOMATION_CONFIG_KEYS = (
     "max_concurrent_downloads", "download_timeout", "download_retry",
     "gen_metadata", "save_raw_json", "save_translated_json", "auto_translate",
     "target_env", "organize_mode", "archive_root",
+    # 首次引导：AI 不需要人类的新手引导，可直接关闭并禁止自动弹出
+    "onboarding_done", "auto_guides",
 )
+
+
+_PROXY_USERINFO_RE = re.compile(r"^(\w+://)([^/@]+):([^/@]+)@(.*)$")
+
+
+def _redact_proxy_address(value):
+    """代理地址可能写成 http://user:pass@host:port；自动化状态只保留可诊断的主机/端口。"""
+    text = str(value or "")
+    match = _PROXY_USERINFO_RE.match(text)
+    if match:
+        return "%s***:***@%s" % (match.group(1), match.group(4))
+    if "@" in text and "://" not in text:
+        return "***:***@" + text.rsplit("@", 1)[-1]
+    return text
 
 
 def automation_state():
@@ -303,23 +328,81 @@ def automation_state():
             "route_reason": info.get("route_reason") or "",
             "progress": d.get("progress"), "downloaded": d.get("downloaded"),
             "total": d.get("total"), "error": d.get("error") or "",
+            "postprocess": d.get("postprocess") if isinstance(d.get("postprocess"), dict) else None,
+            "postprocess_errors": list(d.get("postprocess_errors") or [])[:20],
         })
     try:
         pending = api.get_download_file_choice()
     except Exception:
         pending = None
+    try:
+        choice_rev = int(api.get_download_file_choice_revision())
+    except Exception:
+        choice_rev = 0
+    try:
+        choice_log = list(api.get_download_file_choice_transitions(0) or [])[-20:]
+    except Exception:
+        choice_log = []
+    config = {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS}
+    config["proxy_address"] = _redact_proxy_address(config.get("proxy_address"))
+    ui = dict(_ui_state)
+    done = cfg.get("onboarding_done") is True
+    auto_guides = cfg.get("auto_guides", True) is not False
+    has_key = bool(str(cfg.get("api_key") or "").strip())
+    ui["guides"] = {
+        "onboarding_done": done,
+        "auto_guides": auto_guides,
+        "api_key_present": has_key,
+        # 与前端 init 条件一致：没 Key、没完成、未关闭自动引导时，下次打开会弹
+        "onboarding_pending": bool(auto_guides and not done and not has_key),
+        "dismiss_rev": int(getattr(api, "_ui_dismiss_rev", 0)),
+        "dismiss_targets": list(getattr(api, "_ui_dismiss_targets", []) or []),
+        "overlays": list(getattr(api, "_ui_overlays", []) or []),
+    }
+    overlays_at = float(getattr(api, "_ui_overlays_at", 0) or 0)
+    ui["guides"]["overlays_age_s"] = round(max(0.0, time.time() - overlays_at), 1) if overlays_at else None
     return {
         "ok": True, "version": _version,
-        "config": {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS},
+        "config": config,
+        "config_rev": int(getattr(api, "_cfg_rev", 0) or 0),
         "pending_file_choice": pending,
+        "file_choice_rev": choice_rev,
+        "file_choice_transitions": choice_log,
         "tasks": tasks,
-        "ui": dict(_ui_state),
+        "ui": ui,
     }
 
 
 def rpc_methods():
     """GET /api/rpc/methods：列出 /api/rpc 可调用方法及参数名（AI 不必猜方法名）"""
     return {"ok": True, "rpc": "POST /api/rpc {method, args:[...]}", "methods": _rpc_method_list()}
+
+
+def _event_tasks_snapshot():
+    """SSE 采样用任务快照：活动任务全量（最多 100），只读，不碰磁盘。"""
+    api = _api
+    dl = getattr(api, "dl", None) if api is not None else None
+    rows = []
+    for task in list(getattr(dl, "tasks", []) or [])[:100]:
+        try:
+            row = task.to_dict()
+        except Exception:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _event_model_scan():
+    api = _api
+    fn = getattr(api, "get_scan_state", None) if api is not None else None
+    return fn() if callable(fn) else {}
+
+
+def _event_library_scan():
+    api = _api
+    fn = getattr(api, "lib_scan_state", None) if api is not None else None
+    return fn() if callable(fn) else {}
 
 
 def _rpc_method_list():
@@ -376,6 +459,8 @@ def extension_status():
             "url": _EXT_STATE["last_download_url"],
         } if last else None),
         "active_bundle_tokens": len(_bundles),
+        "tab_index": tab_index_status(),
+        "dev": _EXT_DEV.copy(),
     }
 
 
@@ -387,6 +472,26 @@ def port():
 def touch():
     global _last_seen
     _last_seen = time.time()
+
+
+def set_model_status_handler(fn):
+    """注册扩展下载状态查询入口（webui.Api.model_status）。
+
+    与归档注册同一风格：桥层不 import webui。fn(items, include_updates=True) 必须是纯读，
+    不得联网或阻塞长扫描；返回体直接透给扩展，额外包一层 {ok:true}。
+    """
+    global _model_status_fn
+    _model_status_fn = fn
+
+
+def set_reveal_handler(fn):
+    """注册「打开已登记路径」入口（webui.Api.reveal_registered_path）。
+
+    fn(path) 必须自己做白名单与归一化；桥层只做形状校验，不 import webui。
+    与 state 查询不同，这是个动作端点：未注入时一律 503，绝不猜测路径。
+    """
+    global _reveal_fn
+    _reveal_fn = fn
 
 
 def set_archive_handlers(config_fn=None, write_fn=None, done_fn=None, check_fn=None):
@@ -501,6 +606,256 @@ def is_model_url(url):
         return False
     path = m.group(2) or "/"
     return bool(_URL_PATH_RE.match(path))
+
+
+# ---- 浏览器标签页索引（扩展上报，只读，仅内存）----
+# 只收「Civitai 模型详情页」的标题/URL/ID：不读网页正文、Cookie、API Key 或非 C 站页面。
+# 契约见 docs/browser-tabs-bridge.md；索引不落盘，桌面端退出即清空。
+TAB_INDEX_VERSION = 1
+TAB_INDEX_MAX_BYTES = 512 * 1024
+TAB_INDEX_MAX_ROWS = 2000
+TAB_INDEX_MAX_INPUT_ROWS = 5000
+TAB_INDEX_STALE_S = 150.0
+
+_TAB_MODEL_PATH_RE = re.compile(r"^/models/([1-9]\d*)(?:/[^/?#]*)?$", re.I)
+_TAB_BAD_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_TAB_TITLE_SUFFIX_RE = re.compile(r"\s*\|\s*Civitai\s*$", re.I)
+_TAB_TITLE_PREFIX_RE = re.compile(r"^Civitai\s*\|\s*", re.I)
+_EXT_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$")
+
+_TAB_INDEX = {"at": 0.0, "source": "", "ext_version": "", "counts": {}, "rows": []}
+_TAB_INDEX_LOCK = threading.Lock()
+
+# 开发态重载：桌面端置 reload_at，扩展在下次索引上报的响应里看到新时间戳后 runtime.reload()。
+# 只影响「扩展何时重载」，不传页面数据、不执行任意代码；pushed_at 用于确认新代码已跑起来。
+_EXT_DEV = {"reload_at": 0.0, "pushed_at": 0.0}
+_EXT_DEV_LOCK = threading.Lock()
+
+
+def _tab_int(value, minimum=0, maximum=None):
+    if isinstance(value, bool):
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    if value < minimum:
+        return None
+    if maximum is not None and value > maximum:
+        return None
+    return value
+
+
+def _tab_clean_title(raw):
+    text = _TAB_BAD_CHARS_RE.sub(" ", str(raw or ""))
+    text = _TAB_TITLE_SUFFIX_RE.sub("", text).strip()
+    text = _TAB_TITLE_PREFIX_RE.sub("", text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:300] or "Civitai 模型"
+
+
+def _tab_clean_url(raw, model_id, version_id):
+    """只保留 C 站模型页需要的查询参数，返回 (干净 URL, 规范 modelId, versionId, fileId) 或 None。"""
+    try:
+        u = urlsplit(str(raw or "").strip())
+        port = u.port
+    except (TypeError, ValueError):
+        return None
+    if u.scheme not in ("http", "https") or port is not None:
+        return None
+    if not u.hostname or not _URL_HOST_RE.match(u.hostname):
+        return None
+    if u.username or u.password:
+        return None
+    match = _TAB_MODEL_PATH_RE.match(u.path or "")
+    if not match:
+        return None
+    path_model_id = _tab_int(match.group(1), minimum=1)
+    if path_model_id is None:
+        return None
+    if model_id is not None and model_id != path_model_id:
+        return None
+    try:
+        query = urllib.parse.parse_qs(u.query, keep_blank_values=False)
+    except ValueError:
+        return None
+    versions = query.get("modelVersionId") or []
+    files = query.get("fileId") or []
+    if len(versions) > 1 or len(files) > 1:
+        return None
+    query_version = _tab_int(versions[0], minimum=1) if versions else None
+    if versions and query_version is None:
+        return None
+    if version_id is not None and query_version is not None and version_id != query_version:
+        return None
+    version_id = version_id if version_id is not None else query_version
+    file_id = _tab_int(files[0], minimum=1) if files else None
+    if files and file_id is None:
+        return None
+    clean_query = []
+    if version_id is not None:
+        clean_query.append(("modelVersionId", str(version_id)))
+    if file_id is not None:
+        clean_query.append(("fileId", str(file_id)))
+    clean_url = urllib.parse.urlunsplit((
+        u.scheme, u.netloc.lower(), u.path,
+        urllib.parse.urlencode(clean_query), "",
+    ))
+    return clean_url, path_model_id, version_id, file_id
+
+
+def _sanitize_tab_row(row):
+    if not isinstance(row, dict):
+        return None
+    model_id = _tab_int(row.get("modelId"), minimum=1)
+    version_id = _tab_int(row.get("versionId"), minimum=1)
+    cleaned = _tab_clean_url(row.get("url"), model_id, version_id)
+    if cleaned is None:
+        return None
+    url, model_id, version_id, file_id = cleaned
+    out = {
+        "tabId": _tab_int(row.get("tabId"), minimum=0),
+        "windowId": _tab_int(row.get("windowId"), minimum=0),
+        "title": _tab_clean_title(row.get("title")),
+        "url": url,
+        "modelId": str(model_id),
+        "versionId": str(version_id) if version_id is not None else "",
+        "fileId": str(file_id) if file_id is not None else "",
+        "active": row.get("active") is True,
+        "pinned": row.get("pinned") is True,
+        "discarded": row.get("discarded") is True,
+        "copies": _tab_int(row.get("copies"), minimum=1, maximum=999) or 1,
+    }
+    return out
+
+
+def _tab_index_counts(raw, accepted):
+    raw = raw if isinstance(raw, dict) else {}
+
+    def num(key, fallback=0):
+        value = _tab_int(raw.get(key), minimum=0, maximum=10 ** 9)
+        return value if value is not None else fallback
+
+    return {
+        "tabs": num("tabs"),
+        "civitai": num("civitai"),
+        "models": len(accepted),
+        "windows": num("windows"),
+        "discarded": num("discarded"),
+    }
+
+
+def store_tab_index(payload, origin=""):
+    """校验并替换内存索引；返回 {ok, accepted, rejected, received_at} 或抛 ValueError。"""
+    if not isinstance(payload, dict):
+        raise ValueError("body 必须是 JSON 对象")
+    version = payload.get("v", TAB_INDEX_VERSION)
+    if _tab_int(version, minimum=1) != TAB_INDEX_VERSION:
+        raise ValueError("不支持的索引版本")
+    rows = payload.get("tabs")
+    if not isinstance(rows, list):
+        raise ValueError("tabs 必须是数组")
+    if len(rows) > TAB_INDEX_MAX_INPUT_ROWS:
+        raise ValueError("tabs 超过上限 %d" % TAB_INDEX_MAX_INPUT_ROWS)
+    accepted, rejected, seen = [], 0, set()
+    for row in rows:
+        clean = _sanitize_tab_row(row)
+        if clean is None:
+            rejected += 1
+            continue
+        key = (clean["url"], clean["tabId"])
+        if key in seen:
+            rejected += 1
+            continue
+        seen.add(key)
+        accepted.append(clean)
+        if len(accepted) >= TAB_INDEX_MAX_ROWS:
+            break
+    if rows and not accepted:
+        raise ValueError("没有合法的 Civitai 模型页")
+    source = str(payload.get("source") or "").strip().lower()[:32]
+    if source not in ("chrome-extension", "firefox-extension"):
+        source = "firefox-extension" if origin.startswith("moz-extension://") else "chrome-extension"
+    ext_version = str(payload.get("ext_version") or "").strip()
+    if not _EXT_VERSION_RE.match(ext_version):
+        ext_version = ""
+    at = time.time()
+    with _TAB_INDEX_LOCK:
+        _TAB_INDEX.update({
+            "at": at,
+            "source": source,
+            "ext_version": ext_version,
+            "counts": _tab_index_counts(payload.get("counts"), accepted),
+            "rows": accepted,
+        })
+    return {"ok": True, "received_at": at, "accepted": len(accepted), "rejected": rejected}
+
+
+def tab_index_snapshot():
+    with _TAB_INDEX_LOCK:
+        return {
+            "at": _TAB_INDEX["at"],
+            "source": _TAB_INDEX["source"],
+            "ext_version": _TAB_INDEX.get("ext_version", ""),
+            "counts": dict(_TAB_INDEX["counts"]),
+            "rows": [dict(row) for row in _TAB_INDEX["rows"]],
+        }
+
+
+def search_tab_index(query="", limit=50, include_discarded=False, window_id=None, active_only=False):
+    """只读搜索内存索引；返回 Agent 可直接消费的结构（URL 已清洗）。"""
+    snap = tab_index_snapshot()
+    rows = snap["rows"]
+    if not include_discarded:
+        rows = [row for row in rows if not row["discarded"]]
+    if window_id is not None:
+        rows = [row for row in rows if row["windowId"] == window_id]
+    if active_only:
+        rows = [row for row in rows if row["active"]]
+    tokens = [token for token in str(query or "").lower().split() if token]
+    if tokens:
+        def hit(row):
+            hay = " ".join((row["title"], row["url"], row["modelId"], row["versionId"])).lower()
+            return all(token in hay for token in tokens)
+        rows = [row for row in rows if hit(row)]
+    try:
+        limit = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        limit = 50
+    age_s = max(0.0, time.time() - snap["at"]) if snap["at"] else None
+    stale = snap["at"] == 0 or (age_s is not None and age_s > TAB_INDEX_STALE_S)
+    out = {
+        "ok": True,
+        "at": snap["at"],
+        "age_s": round(age_s, 1) if age_s is not None else None,
+        "stale": stale,
+        "source": snap["source"],
+        "ext_version": snap["ext_version"],
+        "counts": snap["counts"],
+        "total": len(rows),
+        "matched": min(len(rows), limit),
+        "items": rows[:limit],
+    }
+    if not snap["at"]:
+        out["hint"] = "扩展尚未上报标签页索引：确认浏览器扩展已安装并启用，且桌面端正在运行"
+    elif stale:
+        out["hint"] = "索引已过期：切换/打开浏览器标签页或重载扩展后会重新上报"
+    return out
+
+
+def tab_index_status():
+    snap = tab_index_snapshot()
+    age_s = max(0.0, time.time() - snap["at"]) if snap["at"] else None
+    return {
+        "at": snap["at"],
+        "age_s": round(age_s, 1) if age_s is not None else None,
+        "stale": snap["at"] == 0 or (age_s is not None and age_s > TAB_INDEX_STALE_S),
+        "source": snap["source"],
+        "ext_version": snap["ext_version"],
+        "counts": snap["counts"],
+        "accepted": len(snap["rows"]),
+        "pushed_at": _EXT_DEV["pushed_at"],
+    }
 
 
 # bundle 形态的 filename 语法闸（纯文件名）。为什么桥层也要判一次：
@@ -625,6 +980,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True}, origin)
         if path == "/api/rpc/methods":
             return self._json(200, rpc_methods(), origin)
+        if path == "/api/automation/events/stream":
+            return self._automation_sse(origin)
+        if path == "/api/ext/tabs":
+            return self._handle_ext_tabs_get(origin)
+        if path == "/api/ext/dev/state":
+            return self._handle_ext_dev_state(origin)
         if path.startswith("/api/automation"):
             return self._automation(origin, "GET")
         if path == "/api/archive/config":
@@ -789,6 +1150,198 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _automation_sse(self, origin):
+        """SSE 领域事件流：标准 event/id/data + 心跳 + Last-Event-ID 重放。
+
+        传输层细节（chunked、断开、写超时）留在桥；事件语义在 automation_events。
+        """
+        import ai_contract
+        import automation_events
+
+        split = urlsplit(self.path)
+        query = urllib.parse.parse_qs(split.query)
+        raw_since = self.headers.get("Last-Event-ID")
+        if raw_since is None or not str(raw_since).strip():
+            raw_since = (query.get("since") or [""])[0]
+        since = None
+        if str(raw_since or "").strip():
+            try:
+                since = int(str(raw_since).strip())
+                if since < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self._json(400, {
+                    "ok": False, "msg": "since / Last-Event-ID 必须是非负整数",
+                    "hint": "用上一条事件的 id（seq）作为 Last-Event-ID；首次连接可省略",
+                }, origin)
+
+        raw_types = str((query.get("types") or [""])[0] or "").strip()
+        types = set(ai_contract.DOMAIN_EVENT_TYPES)
+        if raw_types:
+            if raw_types.lower() in ("all", "*"):
+                types = None
+            else:
+                parts = {part for part in re.split(r"[,\s]+", raw_types) if part}
+                known = set(ai_contract.EVENT_TYPES) | {
+                    item["group"] for item in ai_contract.EVENTS}
+                unknown = sorted(parts - known)
+                if unknown:
+                    return self._json(400, {
+                        "ok": False, "msg": "未知事件类型: " + ", ".join(unknown),
+                        "hint": "types 可写事件名、组名（task/scan/ui/config/...）或 all",
+                        "known": sorted(known),
+                    }, origin)
+                types = parts or None
+
+        snapshot = str((query.get("snapshot") or ["1"])[0] or "1").lower() not in (
+            "0", "false", "no", "off")
+        hub = automation_events.get_hub()
+        if hub is None:
+            return self._json(503, {
+                "ok": False, "msg": "SSE 事件总线未就绪",
+                "hint": "升级桌面端到 >= %s 后重试" % ai_contract.MIN_APP_VERSION,
+            }, origin)
+        if str(getattr(self, "request_version", "")).upper() != "HTTP/1.1":
+            return self._json(400, {
+                "ok": False, "msg": "SSE 需要 HTTP/1.1",
+                "hint": "使用支持 chunked SSE 的本地 Agent 客户端；HTTP/1.0 不能可靠分帧",
+            }, origin)
+        if hub.active_clients() >= hub.max_clients:
+            return self._json(429, {
+                "ok": False, "msg": "SSE 连接数已达上限",
+                "hint": "关闭空闲的 SSE 客户端后重试", "limit": hub.max_clients,
+            }, origin)
+
+        # 先把 header 刷出去再订阅：客户端在 header 前断开时不会留下占槽位的 Subscription。
+        self.protocol_version = "HTTP/1.1"
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("X-Accel-Buffering", "no")
+            self._cors(origin)
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+
+        subscribed = hub.subscribe(since=since, types=types)
+        if subscribed is None:
+            try:
+                msg = b": SSE connection limit reached\n\n"
+                self.wfile.write(("%X\r\n" % len(msg)).encode("ascii") + msg + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            self.close_connection = True
+            return
+        sub, info = subscribed
+
+        try:
+            self.connection.settimeout(max(5.0, hub.heartbeat_s * 2))
+        except Exception:
+            pass
+
+        last_write = [time.time()]
+
+        def write_chunk(data):
+            body = data.encode("utf-8") if isinstance(data, str) else data
+            self.wfile.write(("%X\r\n" % len(body)).encode("ascii") + body + b"\r\n")
+            self.wfile.flush()
+            last_write[0] = time.time()
+
+        def emit(event):
+            payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            write_chunk("id: %s\nevent: %s\ndata: %s\n\n" % (
+                event.get("seq", 0), event.get("type", "message"), payload))
+
+        def client_alive():
+            """SSE 客户端不再发请求；用 peek 检测 FIN，及时释放订阅名额。"""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if not readable:
+                    return True
+                return bool(self.connection.recv(1, socket.MSG_PEEK))
+            except (OSError, ValueError):
+                return False
+
+        def control(event_type, data, seq=None):
+            return {
+                "seq": int(info.get("last_seq", 0) if seq is None else seq),
+                "instance_id": hub.instance_id,
+                "type": event_type,
+                "group": "stream",
+                "at": automation_events.now_iso(),
+                "data": data if isinstance(data, dict) else {},
+            }
+
+        try:
+            emit(control("stream.ready", {
+                "instance_id": hub.instance_id,
+                "last_seq": int(info.get("last_seq", 0)),
+                "oldest_seq": int(info.get("oldest_seq", 0)),
+                "heartbeat_s": hub.heartbeat_s,
+                "types": sorted(types) if types else ["all"],
+            }))
+            if info.get("reset"):
+                emit(control("stream.reset", {
+                    "instance_id": hub.instance_id,
+                    "oldest_seq": int(info.get("oldest_seq", 0)),
+                    "last_seq": int(info.get("last_seq", 0)),
+                }))
+            if snapshot and (since is None or info.get("reset")):
+                snap = automation_state()
+                emit(control("state.snapshot", snap))
+            for event in info.get("replay") or []:
+                emit(event)
+
+            while True:
+                if sub.closed.is_set() and sub.queue.empty():
+                    break
+                try:
+                    event = sub.queue.get(timeout=0.5)
+                except queue.Empty:
+                    if sub.closed.is_set():
+                        break
+                    if not client_alive():
+                        break
+                    if time.time() - last_write[0] >= hub.heartbeat_s:
+                        write_chunk(": keep-alive %s\n\n" % automation_events.now_iso())
+                    continue
+                dropped = sub.take_dropped()
+                if dropped:
+                    emit(control("stream.overflow", {"dropped": int(dropped)},
+                                 seq=event.get("seq")))
+                emit(event)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+        except Exception:
+            pass
+        finally:
+            hub.unsubscribe(sub)
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            self.close_connection = True
+
+    def _drain_rejected_body(self, length, cap):
+        """回 413 前排空已发送的字节，否则客户端只看到连接中断、拿不到错误信封。
+
+        Windows 上若在接收缓冲仍有未读数据时关闭 socket，会直接 RST，httplib/requests
+        读响应头就失败。上限只排到 2 倍 cap，更大的请求放弃排空——不给对端免费的带宽消耗。
+        """
+        if length > 2 * cap:
+            return
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _automation(self, origin, method):
         """所有 /api/automation* 请求的统一入口：解析 query/body → automation_api.dispatch
 
@@ -801,9 +1354,23 @@ class _Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(split.query)
         body = None
         if method == "POST":
+            # 图片上传放宽到 8MB（/tool 是 MCP inspect_image 的入口）；其余自动化请求仍守 1MB，
+            # 避免把桥变成任意大文件入口。
+            import ai_contract
+            tool_name = ""
+            if path.startswith("/api/automation/tool/"):
+                tool_name = unquote(path[len("/api/automation/tool/"):]).strip("/")
+            large_body = (path in ("/api/automation/vision/analyze", "/api/automation/tool") or
+                          tool_name in ai_contract.LARGE_BODY_TOOLS)
+            cap = (8 << 20) if large_body else (1 << 20)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(min(length, 1 << 20)) if length else b"{}"
+                if length > cap:
+                    self._drain_rejected_body(length, cap)
+                    return self._json(413, {"ok": False, "msg": "请求体过大",
+                                            "limit_bytes": cap,
+                                            "hint": "图片分析请压缩到 8MB 以内或改用 path"}, origin)
+                raw = self.rfile.read(length) if length else b"{}"
                 body = json.loads(raw.decode("utf-8", "replace") or "{}")
             except Exception:
                 return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
@@ -826,10 +1393,12 @@ class _Handler(BaseHTTPRequestHandler):
         import config
         return {
             "version": _version,
+            "host": self.headers.get("Host") or "",
             "state": automation_state,
             "extension": extension_status,
             "config_keys": AUTOMATION_CONFIG_KEYS,
             "rpc_methods": _rpc_method_list(),
+            "bridge_port": port(),
             "data_dir": getattr(config, "APP_DIR", ""),
             "error_log": os.path.join(getattr(config, "APP_DIR", ""), "error.log"),
             "save_config": self._automation_save_config,
@@ -968,6 +1537,145 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "msg": "重扫触发失败: %s" % str(e)[:120]}, origin)
         return self._json(200, {"ok": True}, origin)
 
+    def _handle_model_status(self, origin):
+        """POST /api/model/status：扩展批量查询本地下载状态（只读、不联网）。
+
+        入参 {items:[{model_id,version_id,url}], include_updates?:bool}，最多 500 项。
+        单条缺 ID 走 200 + 逐条 unknown，不因一条坏数据整批失败。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(min(length, 65536)) if length else b""
+            data = json.loads(raw.decode("utf-8", "replace") or "{}")
+        except Exception:
+            return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+        if not isinstance(data, dict):
+            return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+        items = data.get("items")
+        if not isinstance(items, list):
+            return self._json(400, {"ok": False, "msg": "items 必须是数组"}, origin)
+        if len(items) > 500:
+            return self._json(400, {"ok": False, "msg": "一次最多查询 500 个模型"}, origin)
+        fn = _model_status_fn
+        if fn is None:
+            return self._json(500, {"ok": False, "msg": "状态服务未就绪"}, origin)
+        include_updates = data.get("include_updates", True) is not False
+        try:
+            result = fn(items, include_updates=include_updates) or {}
+        except Exception as e:
+            return self._json(500, {"ok": False, "msg": "状态查询失败: %s" % str(e)[:120]}, origin)
+        if not isinstance(result, dict):
+            return self._json(500, {"ok": False, "msg": "状态查询返回格式异常"}, origin)
+        return self._json(200, {"ok": True, **result} if result.get("ok") is not False else result, origin)
+
+    def _handle_ext_tabs(self, origin):
+        """POST /api/ext/tabs：扩展上报打开的 C 站模型页索引（只读、仅内存）。
+
+        只接受浏览器扩展来源；普通网页即使能打到回环端口也不能写索引。
+        """
+        if origin and not _EXT_ORIGIN_RE.match(origin):
+            return self._json(403, {"ok": False, "msg": "只接受浏览器扩展上报"}, origin)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length > TAB_INDEX_MAX_BYTES:
+            self._drain_rejected_body(length, TAB_INDEX_MAX_BYTES)
+            return self._json(413, {"ok": False, "msg": "标签页索引过大",
+                                    "limit_bytes": TAB_INDEX_MAX_BYTES}, origin)
+        try:
+            raw = self.rfile.read(length) if length else b"{}"
+            data = json.loads(raw.decode("utf-8", "replace") or "{}")
+        except Exception:
+            return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+        try:
+            result = store_tab_index(data, origin)
+        except ValueError as e:
+            return self._json(400, {"ok": False, "msg": str(e)}, origin)
+        with _EXT_DEV_LOCK:
+            _EXT_DEV["pushed_at"] = time.time()
+            reload_at = _EXT_DEV["reload_at"]
+        if reload_at:
+            result["dev_reload_at"] = reload_at
+        return self._json(200, result, origin)
+
+    def _handle_ext_dev_state(self, origin):
+        """开发态：扩展与重载标记的只读状态。"""
+        with _EXT_DEV_LOCK:
+            reload_at = _EXT_DEV["reload_at"]
+            pushed_at = _EXT_DEV["pushed_at"]
+        return self._json(200, {
+            "ok": True, "reload_at": reload_at, "pushed_at": pushed_at,
+            "pending": bool(reload_at > pushed_at),
+            "extension": tab_index_status(),
+        }, origin)
+
+    def _handle_ext_dev_reload(self, origin):
+        """开发态：请求已加载的扩展重载（只改时间戳，不传代码/数据）。
+
+        全局 Origin 白名单已在本层之前执行；网页来源进不来。
+        """
+        at = time.time()
+        with _EXT_DEV_LOCK:
+            _EXT_DEV["reload_at"] = at
+        return self._json(200, {
+            "ok": True, "reload_at": at,
+            "hint": "扩展下一次索引上报后会 runtime.reload()；内容脚本仍需刷新对应页面",
+        }, origin)
+
+    def _handle_ext_tabs_get(self, origin):
+        """GET /api/ext/tabs：本机 Agent 只读查询索引。"""
+        try:
+            query = urllib.parse.parse_qs(urlsplit(self.path).query)
+        except Exception:
+            query = {}
+
+        def one(key, default=""):
+            values = query.get(key) or [default]
+            return values[0]
+
+        limit = _tab_int(one("limit", "50"), minimum=1, maximum=200) or 50
+        window_raw = one("window_id", "")
+        window_id = _tab_int(window_raw, minimum=0) if window_raw != "" else None
+        truthy = ("1", "true", "yes", "on")
+        out = search_tab_index(
+            one("q", ""), limit=limit,
+            include_discarded=one("include_discarded", "").lower() in truthy,
+            window_id=window_id,
+            active_only=one("active", "").lower() in truthy,
+        )
+        return self._json(200, out, origin)
+
+    def _handle_reveal(self, origin):
+        """POST /api/reveal：打开桌面端已登记的落点。
+
+        只做形状校验并把 path 交给 Api.reveal_registered_path；白名单、存在性、
+        跨平台打开全在 webui 侧。未登记一律 403 —— 这不是任意路径浏览器。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(min(length, 65536)) if length else b""
+            data = json.loads(raw.decode("utf-8", "replace") or "{}")
+        except Exception:
+            return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+        if not isinstance(data, dict):
+            return self._json(400, {"ok": False, "msg": "请求格式错误"}, origin)
+        path = data.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return self._json(400, {"ok": False, "msg": "path 必须是非空字符串"}, origin)
+        if len(path) > 4096:
+            return self._json(400, {"ok": False, "msg": "路径过长"}, origin)
+        fn = _reveal_fn
+        if fn is None:
+            return self._json(503, {"ok": False, "msg": "打开目录服务未就绪，请升级 CFT"}, origin)
+        try:
+            result = fn(path.strip()) or {}
+        except Exception as e:
+            return self._json(500, {"ok": False, "msg": "打开目录失败: %s" % str(e)[:120]}, origin)
+        if not isinstance(result, dict):
+            return self._json(500, {"ok": False, "msg": "打开目录返回格式异常"}, origin)
+        return self._json(200 if result.get("ok") is True else 403, result, origin)
+
     def do_POST(self):
         origin = self._origin()
         if not self._check_origin(origin):
@@ -976,12 +1684,20 @@ class _Handler(BaseHTTPRequestHandler):
         touch()
         if path == "/api/rpc":
             return self._rpc(origin)
+        if path == "/api/reveal":
+            return self._handle_reveal(origin)
         if path == "/api/archive/file":
             return self._handle_archive_file(origin)
         if path == "/api/archive/done":
             return self._handle_archive_done(origin)
         if path.startswith("/api/automation"):
             return self._automation(origin, "POST")
+        if path == "/api/ext/tabs":
+            return self._handle_ext_tabs(origin)
+        if path == "/api/ext/dev/reload":
+            return self._handle_ext_dev_reload(origin)
+        if path == "/api/model/status":
+            return self._handle_model_status(origin)
         if path != "/api/download":
             return self._json(404, {"ok": False, "msg": "Not Found"}, origin)
         try:
@@ -1017,6 +1733,17 @@ class _Handler(BaseHTTPRequestHandler):
 def start(version="", port=None):
     """启动桥服务（幂等，端口冲突/异常静默）。返回端口号或 0。"""
     global _server, _version
+    try:
+        import automation_events
+        if automation_events.get_hub() is None:
+            automation_events.configure(
+                snapshot_provider=automation_state,
+                tasks_provider=_event_tasks_snapshot,
+                model_scan_provider=_event_model_scan,
+                library_scan_provider=_event_library_scan,
+            )
+    except Exception:
+        pass
     if _server is not None:
         return _server.server_port
     _version = version or _version
@@ -1033,6 +1760,11 @@ def start(version="", port=None):
 
 def stop():
     global _server
+    try:
+        import automation_events
+        automation_events.shutdown()
+    except Exception:
+        pass
     if _server is not None:
         try:
             _server.shutdown()

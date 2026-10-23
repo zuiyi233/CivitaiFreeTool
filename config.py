@@ -47,6 +47,7 @@ DEFAULTS = {
     "download_cover": True,             # 下载完成后自动下载封面
     "update_keep_old": "keep",           # 更新下载完成后旧版处理：keep=保留（默认）/ delete=移入回收站（可还原）
     "window_wait_seconds": 30,           # 窗口启动至少等待 30 秒，检测到进展可继续宽限
+    "mcp_http_autostart": True,          # 冻结版随桌面端启动 MCP HTTP 侧车（47532，Bearer）；源码运行不启动
     "browser_fallback_enabled": True,   # 原生窗口仍是默认；失败时允许浏览器兜底
     "cache_detail_images": True,        # 详情在线缩略图本地缓存；不下载原图
     "pointer_effects": "off",           # off / click / trail
@@ -63,6 +64,7 @@ DEFAULTS = {
     "model_favorites": [],             # 收藏置顶的本地模型路径
     "model_toolbar_locked": False,
     "onboarding_done": False,
+    "auto_guides": True,                # 自动弹出新手引导/教程；AI 可永久关闭，手动入口仍可用
     "model_folder_visibility": {},     # 显式目录选择，更深层选择优先
     "model_folder_include_subfolders": True,  # 默认递归包含子目录
     "hidden_model_folders": [],         # 模型管理目录中隐藏的子文件夹
@@ -224,9 +226,12 @@ def normalize_ui_preferences(cfg):
         try:value=int(cfg.get(key,default));cfg[key]=0 if key=="effects_fps_limit" and value==0 else max(lo,min(hi,value))
         except (TypeError,ValueError,OverflowError):cfg[key]=default
     cfg['images_dir_autofill']=cfg.get('images_dir_autofill',True) is not False   # 默认开；只有显式 false 才关
+    cfg['auto_guides']=cfg.get('auto_guides',True) is not False
+    cfg['onboarding_done']=cfg.get('onboarding_done') is True
     # —— 分流：默认关，只有显式 true 才开（脏值 "true"/1 一律当关，避免半开状态）——
     cfg['route_by_type']=cfg.get('route_by_type') is True
     cfg['comfyui_models_root']=str(cfg.get('comfyui_models_root') or '').strip()
+    cfg['mcp_http_autostart']=cfg.get('mcp_http_autostart', True) is not False
     cfg['shortcuts_enabled']=cfg.get('shortcuts_enabled') is True
     legacy_shortcuts=cfg.pop("shortcuts_preset", None)
     bindings=cfg.get('shortcuts_bindings')

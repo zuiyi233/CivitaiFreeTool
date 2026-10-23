@@ -105,7 +105,10 @@ function publishSettingsDirty(){if(typeof api!=='undefined')api.call('set_settin
 async function requestSettingsLeave(proceed){
   if(settingsExitPending)return;settingsExitPending=true;
   const mask=document.createElement('div');mask.className='rd-mask settings-exit-mask';mask.innerHTML='<div class="rename-dialog settings-exit-dialog" role="dialog" aria-modal="true" aria-label="设置尚未保存"><div class="rd-title">设置尚未保存</div><p>是否保存这些修改？放弃会恢复到上次已保存的设置。</p><div class="rd-actions"><button class="btn" id="settingsStay">继续编辑</button><button class="btn btn-danger" id="settingsDiscard">放弃修改</button><button class="btn btn-primary" id="settingsSaveLeave">保存并离开</button></div><p id="settingsExitError" role="status"></p></div>';document.body.appendChild(mask);
-  const finish=()=>{mask.remove();settingsExitPending=false;};
+  mask.dataset.aiOverlay='1';
+  // AI 关闭 = 继续编辑（不丢修改、也不代替用户保存）。
+  const aiOff=window.CftOverlays?window.CftOverlays.register('settings_unsaved',()=>mask.querySelector('#settingsStay')?.click(),{group:'dialogs',kind:'settings_unsaved',title:'设置尚未保存',el:mask}):null;
+  const finish=()=>{if(aiOff)aiOff();mask.remove();settingsExitPending=false;};
   const leave=async save=>{mask.querySelectorAll('button').forEach(b=>b.disabled=true);try{if(save){if(!await saveSettings())throw Error('save');}else{state.cfg=await api.call('get_config');buildSettingsForm();document.documentElement.dataset.theme=state.cfg.theme||'modern';applyZoom(state.cfg.ui_zoom||100);applyUiAppearance();}await api.call('set_settings_dirty',false);finish();proceed();}catch(_){mask.querySelectorAll('button').forEach(b=>b.disabled=false);mask.querySelector('#settingsExitError').textContent='设置未能保存或恢复，仍留在设置页，请重试。';}};
   mask.querySelector('#settingsStay').onclick=finish;mask.querySelector('#settingsDiscard').onclick=()=>leave(false);mask.querySelector('#settingsSaveLeave').onclick=()=>leave(true);mask.querySelector('#settingsStay').focus();mask.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();finish();}});
 }

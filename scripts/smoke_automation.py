@@ -78,6 +78,21 @@ def main():
     check("schema-routing", bool((schema.get("routing") or {}).get("type_to_folder")),
           (schema.get("routing") or {}).get("core_folders"))
 
+    st, ai = http(B, "/api/automation/ai")
+    check("ai-capabilities", st == 200 and (ai.get("toolsets") or {}).get("core", {}).get("count") >= 12,
+          (ai.get("toolsets") or {}).get("core"))
+    st, tools = http(B, "/api/automation/tools?format=openai&profile=text")
+    check("ai-tools-openai", st == 200 and tools.get("count", 0) >= 12
+          and tools.get("tools", [{}])[0].get("type") == "function")
+    st, guide = http(B, "/api/automation/guide?profile=text")
+    check("ai-guide", st == 200 and "Core loop" in (guide.get("guide") or ""))
+    st, tool_state = http(B, "/api/automation/tool", "POST",
+                          {"name": "cft_get_state", "arguments": {"compact": True, "task_limit": 2}})
+    check("ai-tool-state", st == 200 and tool_state.get("tool") == "cft_get_state"
+          and isinstance(tool_state.get("next_actions"), list))
+    st, compact = http(B, "/api/automation/state?compact=1&task_limit=2")
+    check("state-compact", st == 200 and len(compact.get("tasks") or []) <= 2)
+
     st, events = http(B, "/api/automation/events?since=0&limit=5")
     check("events", st == 200 and isinstance(events.get("events"), list)
           and "next_since" in events)

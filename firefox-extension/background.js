@@ -1,7 +1,84 @@
 /* Requests run in the background, not in the short-lived popup. */
-if (typeof importScripts === 'function') importScripts('tabs-common.js');
+if (typeof importScripts === 'function') {
+  importScripts('tabs-common.js');
+  importScripts('lib/tab-index.js');
+}
 const ext = typeof browser !== 'undefined' ? browser : chrome;
 const BRIDGE = 'http://127.0.0.1:47531';
+const TAB_INDEX_ALARM = 'cftTabIndex';
+const TAB_INDEX_DEBOUNCE_MS = 1200;
+const DEV_RELOAD_SEEN_KEY = 'cftDevReloadSeenV1';
+
+// ---- 打开的模型页索引：只读上报给本机桥（契约见 docs/browser-tabs-bridge.md） ----
+let tabIndexTimer = null, tabIndexInFlight = false, tabIndexAgain = false;
+function scheduleTabIndexPush(delay) {
+  if (tabIndexTimer) clearTimeout(tabIndexTimer);
+  tabIndexTimer = setTimeout(() => {
+    tabIndexTimer = null;
+    void pushTabIndex();
+  }, Math.max(150, Number(delay) || TAB_INDEX_DEBOUNCE_MS));
+}
+async function pushTabIndex() {
+  const index = globalThis.CftTabIndex;
+  if (!index || typeof index.buildPayload !== 'function') return;
+  if (tabIndexInFlight) { tabIndexAgain = true; return; }
+  tabIndexInFlight = true;
+  try {
+    const tabs = await ext.tabs.query({});
+    const payload = index.buildPayload(tabs, {
+      source: 'firefox-extension', extVersion: extensionVersion(),
+    });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const res = await fetch(BRIDGE + '/api/ext/tabs', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload), signal: ctrl.signal,
+      });
+      const data = await res.json().catch(() => ({}));
+      await maybeDevReload(data);
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (_) {
+    // 桌面端未启动/端口未开：下次标签页事件或心跳再试；不要把 URL 写进日志
+  } finally {
+    tabIndexInFlight = false;
+    if (tabIndexAgain) { tabIndexAgain = false; scheduleTabIndexPush(300); }
+  }
+}
+function extensionVersion() {
+  try {
+    const manifest = ext.runtime && typeof ext.runtime.getManifest === 'function'
+      ? ext.runtime.getManifest() : null;
+    const version = manifest && manifest.version ? String(manifest.version) : '';
+    return /^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$/.test(version) ? version : '';
+  } catch (_) { return ''; }
+}
+
+// 开发态重载：只认桥回传的新 dev_reload_at；先写 storage 再 reload，避免循环。
+async function maybeDevReload(data) {
+  const at = Number(data && data.dev_reload_at) || 0;
+  if (!at) return;
+  let seen = 0;
+  try {
+    const saved = await ext.storage.local.get(DEV_RELOAD_SEEN_KEY);
+    seen = Number(saved && saved[DEV_RELOAD_SEEN_KEY]) || 0;
+  } catch (_) { return; }
+  if (at <= seen) return;
+  try { await ext.storage.local.set({ [DEV_RELOAD_SEEN_KEY]: at }); } catch (_) { return; }
+  try { ext.runtime.reload(); } catch (_) {}
+}
+
+function ensureTabIndexAlarm() {
+  if (!ext.alarms) return;
+  try { ext.alarms.create(TAB_INDEX_ALARM, {periodInMinutes: 1}); } catch (_) {}
+}
+if (ext.alarms && ext.alarms.onAlarm) {
+  ext.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === TAB_INDEX_ALARM) void pushTabIndex();
+  });
+}
 const STORE = 'lastBatch';
 let job = null, starting = false;
 const ready = (async () => {
@@ -23,6 +100,81 @@ function badge(text, color) {
   ext.action.setBadgeBackgroundColor({color}).catch(() => {});
 }
 async function save() { await ext.storage.local.set({[STORE]:job}); }
+
+// ---- 页面级历史：只记 C 站模型页 URL/标题/时间，仅本地（与 Chrome 版同 key/同去重） ----
+const HISTORY_KEY = 'cftPageHistoryV1';
+const HISTORY_MAX = 500;
+const _visitSeen = new Map();
+function historyKeyOf(link) {
+  if (!link) return '';
+  return link.version ? 'version:' + link.version : (link.id ? 'model:' + link.id : '');
+}
+async function readPageHistory() {
+  try {
+    const raw = (await ext.storage.local.get(HISTORY_KEY))[HISTORY_KEY];
+    return {version:1, savedAt:Number(raw && raw.savedAt) || 0,
+      items:(raw && raw.items && typeof raw.items === 'object') ? Object.assign({}, raw.items) : {}};
+  } catch (_) { return {version:1, savedAt:0, items:{}}; }
+}
+async function rememberVisit(tab) {
+  try {
+    if (!tab || !tab.url) return;
+    try {
+      if (/^\/api\/download\//i.test(new URL(tab.url).pathname)) return;
+    } catch (_) { return; }
+    const link = CftTabs.modelLink(tab.url);
+    if (!link) return;
+    const key = historyKeyOf(link);
+    if (!key) return;
+    const now = Date.now();
+    const sig = key + '@' + Math.floor(now / 30000);
+    if (_visitSeen.get(tab.id) === sig) return;
+    _visitSeen.set(tab.id, sig);
+    if (_visitSeen.size > 400) _visitSeen.clear();
+    const h = await readPageHistory();
+    const prev = h.items[key] || {};
+    h.items[key] = {key, modelId:link.id, versionId:link.version || '', url:link.url,
+      title:CftTabs.cleanTitle(tab.title), firstAt:Number(prev.firstAt) || now,
+      lastAt:now, count:(Number(prev.count) || 0) + 1};
+    const keys = Object.keys(h.items);
+    if (keys.length > HISTORY_MAX) {
+      keys.sort((a,b) => (Number(h.items[b].lastAt) || 0) - (Number(h.items[a].lastAt) || 0));
+      for (const k of keys.slice(HISTORY_MAX)) delete h.items[k];
+    }
+    h.savedAt = now;
+    await ext.storage.local.set({[HISTORY_KEY]:h});
+  } catch (_) { /* 历史失败不影响发送 */ }
+}
+async function rememberOpenTabs() {
+  try {
+    const tabs = await ext.tabs.query({});
+    for (const tab of tabs) await rememberVisit(tab);
+  } catch (_) {}
+}
+ext.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo) return;
+  scheduleTabIndexPush(TAB_INDEX_DEBOUNCE_MS);
+  if (changeInfo.url !== undefined || changeInfo.status === 'complete') {
+    void rememberVisit(tab || {id:tabId, url:changeInfo.url, title:''});
+  }
+});
+for (const name of ['onCreated', 'onActivated', 'onMoved', 'onAttached', 'onDetached']) {
+  try { ext.tabs[name].addListener(() => scheduleTabIndexPush(TAB_INDEX_DEBOUNCE_MS)); } catch (_) {}
+}
+ext.tabs.onRemoved.addListener(() => scheduleTabIndexPush(300));
+ensureTabIndexAlarm();
+scheduleTabIndexPush(1200);
+ext.runtime.onStartup.addListener(() => {
+  void rememberOpenTabs();
+  ensureTabIndexAlarm();
+  scheduleTabIndexPush(800);
+});
+ext.runtime.onInstalled.addListener(() => {
+  void rememberOpenTabs();
+  ensureTabIndexAlarm();
+  scheduleTabIndexPush(800);
+});
+
 async function post(url) {
   const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), 12000);
   try {

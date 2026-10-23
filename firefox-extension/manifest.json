@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "CivitaiFreeTool 一键下载",
-  "version": "1.4.0",
+  "version": "1.7.1",
   "description": "筛选全部浏览器窗口的 C 站模型标签页，用公开接口补全类型/底模/大小，批量提交到 CivitaiFreeTool 并跟踪软件里的下载状态",
   "permissions": [
     "tabs",
     "storage",
-    "contextMenus"
+    "contextMenus",
+    "alarms"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",

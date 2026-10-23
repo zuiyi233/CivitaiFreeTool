@@ -312,8 +312,27 @@ class DispatchTest(unittest.TestCase):
         self.assertTrue(f["would_route"])
         self.assertTrue(f["routed_dir"].endswith(os.path.join("loras", "demo")))
         self.assertFalse(f["exists"])
+        self.assertEqual(f["download_url"], "https://civitai.red/api/download/models/123?fileId=1",
+                         "plan 必须把可用的下载 URL 交给 AI，不能只留空串")
+        self.assertNotIn("download_url_error", f)
         self.assertEqual(self.api.submitted, [], "plan 绝不能入队")
         self.assertFalse(os.path.isdir(f["routed_dir"]), "plan 绝不能建目录")
+
+    def test_plan_without_civ_reports_reason_not_name_error(self):
+        self.api.api = None
+        status, body = automation_api.dispatch("/api/automation/plan", "POST", {},
+                                              {"url": "https://civitai.red/models/456"}, self.api, ctx(self.api))
+        self.assertEqual(status, 500, body)
+        self.assertIn("API 未就绪", body["msg"])
+        plan = automation_api._plan_payload(self.api, {}, 456, 123,
+                                            {"id": 123, "name": "v1", "baseModel": "PonyXL"},
+                                            {"id": 456, "name": "Demo", "type": "LORA"},
+                                            [{"id": 1, "name": "demo.safetensors", "type": "Model",
+                                              "primary": True, "sizeKB": 1000}])
+        f = plan["files"][0]
+        self.assertEqual(f["download_url"], "")
+        self.assertNotIn("not defined", f.get("download_url_error", ""),
+                         "缺客户端要如实说明，不能把 NameError 当成错误信息")
 
     def test_plan_rejects_empty_url(self):
         status, body = automation_api.dispatch("/api/automation/plan", "POST", {}, {}, self.api, ctx(self.api))
@@ -377,6 +396,32 @@ class DispatchTest(unittest.TestCase):
                                                {"path": [d]}, None, self.api, ctx(self.api))
         self.assertEqual(status, 200)
         self.assertTrue(body["exists"])
+
+    def test_verify_passes_through_download_hash_verdict(self):
+        d = os.path.join(self.api.cfg["comfyui_models_root"], "loras", "demo")
+        make_tree(d)
+        self.api.tasks.append({"id": "t-hash", "filename": "demo.safetensors", "status": "done",
+                               "dest_dir": d, "routed_dir": d,
+                               "expected_sha256": "AA" * 32, "actual_sha256": "aa" * 32,
+                               "verification_status": "verified"})
+        status, body = automation_api.dispatch("/api/automation/verify", "GET",
+                                               {"task_id": ["t-hash"]}, None, self.api, ctx(self.api))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["verification_status"], "verified")
+        self.assertEqual(body["expected_sha256"], "AA" * 32)
+        self.assertTrue(body["sha256_ok"], "下载时已 verified 的，不能只给 AI 一个 null")
+
+    def test_verify_reports_unchecked_hash_as_unchecked(self):
+        d = os.path.join(self.api.cfg["comfyui_models_root"], "loras", "demo")
+        make_tree(d)
+        self.api.tasks.append({"id": "t-none", "filename": "demo.safetensors", "status": "done",
+                               "dest_dir": d, "routed_dir": d,
+                               "expected_sha256": "", "actual_sha256": "",
+                               "verification_status": "unverified"})
+        status, body = automation_api.dispatch("/api/automation/verify", "GET",
+                                               {"task_id": ["t-none"]}, None, self.api, ctx(self.api))
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(body["sha256_ok"], "没校验过就如实报 null，不许替用户宣布通过")
 
     def test_verify_unknown_task_404(self):
         status, body = automation_api.dispatch("/api/automation/verify", "GET",
@@ -1276,6 +1321,84 @@ class GalleryApiTest(unittest.TestCase):
         self.assertFalse(body["timed_out"])
         self.assertIn("state", body)
         self.assertEqual(self.api.lib_calls[0], ("lib_scan",))
+
+
+class PlacementTest(unittest.TestCase):
+    """Read-only placement verdict + ComfyUI root suggestions. Never moves files."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "models"
+        for name in ("loras", "checkpoints", "vae"):
+            (self.root / name).mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_routed_under_models_root(self):
+        dest = str(self.root / "loras" / "demo")
+        out = automation_api._placement(dest, {"comfyui_models_root": str(self.root)})
+        self.assertEqual(out["status"], "routed")
+        self.assertEqual(out["folder"], "loras")
+        self.assertTrue(out["under_models_root"])
+        self.assertEqual(out["hint"], "")
+
+    def test_file_at_root_needs_routing(self):
+        out = automation_api._placement(str(self.root), {"comfyui_models_root": str(self.root)})
+        self.assertEqual(out["status"], "under_root")
+        self.assertIn("route_by_type", out["hint"])
+
+    def test_outside_configured_roots(self):
+        other = str(self.root.parent / "elsewhere")
+        out = automation_api._placement(other, {"comfyui_models_root": str(self.root)})
+        self.assertEqual(out["status"], "outside_root")
+        self.assertFalse(out["under_configured_root"])
+        self.assertIn("comfyui_models_root", out["hint"])
+
+    def test_missing_root_explains_why(self):
+        out = automation_api._placement(str(self.root / "loras"), {})
+        self.assertEqual(out["status"], "outside_root")
+        self.assertIn("未配置 comfyui_models_root", out["hint"])
+
+    def test_pending_when_not_resolved(self):
+        out = automation_api._placement("", {})
+        self.assertEqual(out["status"], "pending")
+        self.assertTrue(out["hint"])
+
+    def test_candidates_found_from_parent(self):
+        incoming = self.root / "incoming"
+        incoming.mkdir()
+        found = automation_api._model_root_candidates({"download_dir": str(incoming)})
+        self.assertEqual(found["suggested"], str(self.root))
+        self.assertTrue(any("上级" in row["reason"] for row in found["candidates"]))
+
+    def test_single_type_dir_is_not_a_candidate(self):
+        lonely = self.root.parent / "lonely"
+        (lonely / "loras").mkdir(parents=True)
+        found = automation_api._model_root_candidates({"download_dir": str(lonely)})
+        self.assertEqual(found["candidates"], [])
+
+    def test_plan_checks_default_destination_when_routing_off(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            api = FakeApi(Path(tmp))
+            api.cfg.update({"route_by_type": False, "comfyui_models_root": "",
+                            "download_dir": str(self.root), "download_target_dir": ""})
+            (self.root / "demo.safetensors").write_bytes(b"weights")
+            status, body = automation_api._plan(api, None, {"url": "https://civitai.red/models/456"})
+            self.assertEqual(status, 200, body)
+            item = body["files"][0]
+            self.assertTrue(item["exists"], "非分流时也要能在默认目录认出已下载")
+            self.assertEqual(item["existing_path"], str(self.root / "demo.safetensors"))
+            self.assertEqual(item["placement"]["status"], "under_root")
+            self.assertIn("route_by_type", item["placement"]["hint"])
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

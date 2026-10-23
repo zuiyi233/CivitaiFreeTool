@@ -11,12 +11,18 @@ function goToApiKeySettings() {
   row?.classList.add('api-key-highlight');setTimeout(()=>row?.classList.remove('api-key-highlight'),2500);
   setStatus('在 civitai.red 账号页申请 API Key，粘贴后点击底部“保存设置”');
 }
+let apiKeyAiOff=null;
+function closeApiKeyPrompt(){
+  document.getElementById('apiKeyPrompt')?.remove();
+  if(apiKeyAiOff){apiKeyAiOff();apiKeyAiOff=null;}
+}
 function apiKeyPrompt() {
   if(document.getElementById('apiKeyPrompt'))return;
   const root=document.createElement('div');root.id='apiKeyPrompt';root.className='key-prompt-mask';
   root.innerHTML='<div class="key-setup-card" role="dialog" aria-modal="true" aria-labelledby="keyPromptTitle"><h2 id="keyPromptTitle">先连接你的 C 站账号</h2><p>此功能需要 Civitai API Key。填写并保存后即可使用。</p><button class="btn btn-primary" data-key-settings>前往填写 API Key</button><button class="btn" data-key-close>暂不使用</button></div>';
-  document.body.append(root);root.querySelector('[data-key-settings]').onclick=()=>{root.remove();goToApiKeySettings();};root.querySelector('[data-key-close]').onclick=()=>root.remove();root.querySelector('[data-key-settings]').focus();
-  root.addEventListener('keydown',e=>{if(e.key==='Escape'){e.stopPropagation();root.remove();}if(e.key==='Tab'){const buttons=[...root.querySelectorAll('button')],i=buttons.indexOf(document.activeElement);e.preventDefault();buttons[(i+(e.shiftKey?-1:1)+buttons.length)%buttons.length].focus();}});
+  document.body.append(root);root.querySelector('[data-key-settings]').onclick=()=>{closeApiKeyPrompt();goToApiKeySettings();};root.querySelector('[data-key-close]').onclick=closeApiKeyPrompt;root.querySelector('[data-key-settings]').focus();
+  if(window.CftOverlays){apiKeyAiOff=window.CftOverlays.register('api_key',closeApiKeyPrompt,{group:'guides',kind:'guide',title:'API Key 提示',el:root});}
+  root.addEventListener('keydown',e=>{if(e.key==='Escape'){e.stopPropagation();closeApiKeyPrompt();}if(e.key==='Tab'){const buttons=[...root.querySelectorAll('button')],i=buttons.indexOf(document.activeElement);e.preventDefault();buttons[(i+(e.shiftKey?-1:1)+buttons.length)%buttons.length].focus();}});
 }
 function guardCivitaiAction(method,args) {
   const protectedAction=CIVITAI_KEY_ACTIONS.has(method)||(method==='dl_action'&&['start','start_all','retry'].includes(args[0]));
@@ -57,7 +63,7 @@ const REVERSE_TOUR_STEPS=[
   {title:'4 · 识别模型信息',selector:'#mmInfoMenu [data-proxy="mmSendRp"]',text:'点击“识别模型信息”。所选模型加入反向解析列表，页面会切到反向解析。此时还没有开始反查。'},
   {title:'5 · 开始反查',selector:'#rpStart',text:'在反向解析页点击“开始反查”。软件按 SHA256 查询模型名称、版本、触发词和封面。可勾选“仅显示/反查失败”重试失败项，也可只“反查选中”。'}
 ];
-function closeReverseTutorial(){document.getElementById('reverseTutorial')?.remove();document.querySelectorAll('.reverse-tour-target').forEach(el=>el.classList.remove('reverse-tour-target'));reverseTour=null;}
+function closeReverseTutorial(){document.getElementById('reverseTutorial')?.remove();document.querySelectorAll('.reverse-tour-target').forEach(el=>el.classList.remove('reverse-tour-target'));if(reverseTour?._aiOff){reverseTour._aiOff();}reverseTour=null;}
 function startReverseTutorial(){
   if(typeof settingsHaveChanges==='function'&&settingsHaveChanges()){requestSettingsLeave(startReverseTutorial);return;}
   if(!hasCivitaiKey()){apiKeyPrompt();return;}
@@ -68,6 +74,7 @@ function renderReverseTutorial(){
   const i=reverseTour.step,step=REVERSE_TOUR_STEPS[i],root=document.createElement('aside');root.id='reverseTutorial';root.className='reverse-tour-card';root.setAttribute('aria-label','反向解析逐步教程');
   root.innerHTML='<div class="reverse-tour-top"><span>反向解析 · '+(i+1)+'/5</span><button class="btn" id="reverseTourClose" aria-label="退出教程">'+_icon('x')+'</button></div><h3>'+step.title+'</h3><p>'+step.text+'</p><div class="reverse-tour-actions"><button class="btn" id="reverseTourBack"'+(!i?' disabled':'')+'>上一步</button><button class="btn btn-primary" id="reverseTourNext">'+(i===4?'完成教程':'下一步')+'</button></div><p class="reverse-tour-note">按提示操作页面，再点下一步。教程不会自动发起反查。</p>';
   document.body.append(root);document.querySelector(step.selector)?.classList.add('reverse-tour-target');
+  if(window.CftOverlays){reverseTour._aiOff=window.CftOverlays.register('reverse_tutorial',closeReverseTutorial,{group:'guides',kind:'guide',title:'反向解析教程',el:root});}
   root.querySelector('#reverseTourClose').onclick=closeReverseTutorial;root.querySelector('#reverseTourBack').onclick=()=>{reverseTour.step--;renderReverseTutorial();};
   root.querySelector('#reverseTourNext').onclick=async e=>{
     e.stopPropagation();

@@ -1,0 +1,18 @@
+{
+  "_comment": "Placeholder path: replace C:\\Program Files\\CivitaiFreeTool\\CivitaiFreeToolMCP.exe with your installed sidecar. Copy the mcpServers block into your Qoder MCP configuration. For Streamable HTTP instead of stdio, use http://127.0.0.1:47532/mcp with header 'Authorization: Bearer <token>'; never commit a real token.",
+  "_http_example": {
+    "url": "http://127.0.0.1:47532/mcp",
+    "headers": {
+      "Authorization": "Bearer <token>"
+    }
+  },
+  "mcpServers": {
+    "civitai-free-tool": {
+      "command": "C:\\Program Files\\CivitaiFreeTool\\CivitaiFreeToolMCP.exe",
+      "args": ["--stdio", "--toolsets", "core,vision"],
+      "env": {
+        "CFT_BRIDGE_URL": "http://127.0.0.1:47531"
+      }
+    }
+  }
+}

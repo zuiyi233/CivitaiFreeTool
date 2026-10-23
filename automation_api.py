@@ -20,7 +20,11 @@ import json
 import os
 import time
 from collections import deque
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
+
+import ai_contract
+import ai_tools
+import openapi_projection
 
 MAX_WAIT_S = 1800
 DEFAULT_WAIT_S = 300
@@ -50,6 +54,11 @@ def record_event(method, path, status, ms, summary=""):
     _EVENTS.append({"seq": _EVENT_SEQ, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "method": method, "path": path, "status": status,
                     "ms": round(ms, 1), "summary": str(summary or "")[:200]})
+    try:
+        import automation_events
+        automation_events.publish_api_call(method, path, status, ms, summary)
+    except Exception:
+        pass
 
 
 def _jsonish(value):
@@ -93,11 +102,17 @@ def _tasks_raw(api):
 _MISSING = object()
 
 
-def _fail(status, msg, hint=""):
+def _fail(status, msg, hint="", code="", retryable=None, next_actions=None):
     """失败响应：msg 说清「哪里不对」，hint 说清「下一步做什么」——AI 靠这两句决定重试还是改参数。"""
     out = {"ok": False, "msg": str(msg)}
     if hint:
         out["hint"] = str(hint)
+    if code:
+        out["code"] = str(code)
+    if retryable is not None:
+        out["retryable"] = bool(retryable)
+    if next_actions:
+        out["next_actions"] = list(next_actions)
     return status, out
 
 
@@ -160,6 +175,34 @@ def _fields_from(query, body=None):
     return ((query or {}).get("fields", [""])[0] or "")
 
 
+def _strip_media(value):
+    """mode=text：剥掉内联 base64/图片 data URL，保留路径与元数据。"""
+    try:
+        import ai_content
+        return ai_content.strip_inline_media(value)
+    except Exception:
+        count = 0
+
+        def walk(node):
+            nonlocal count
+            if isinstance(node, dict):
+                out = {}
+                for k, v in node.items():
+                    if k in ("b64", "preview_b64", "poster_b64"):
+                        count += 1
+                        continue
+                    out[k] = walk(v)
+                return out
+            if isinstance(node, list):
+                return [walk(v) for v in node]
+            if isinstance(node, str) and node.startswith("data:image/") and ";base64," in node:
+                count += 1
+                return ""
+            return node
+
+        return walk(value), count
+
+
 def _norm_query(q):
     """batch 里 query 允许 {k: 标量} 或 {k: [..]}，统一成 parse_qs 的形状（dict[str, list[str]]）"""
     out = {}
@@ -211,6 +254,8 @@ def _verify_dir(path, filename, expected_sha256="", do_hash=False, expect=None):
                 out["sha256"] = h.hexdigest().upper()
                 if expected_sha256:
                     out["sha256_ok"] = out["sha256"].lower() == str(expected_sha256).lower()
+                else:
+                    out["sha256_hint"] = "没有期望 SHA256 可比对，这里只给实算值"
             except OSError as e:
                 out["error"] = "读取文件失败: %s" % e
     elif target:
@@ -276,7 +321,52 @@ def _manifest(api, ctx):
              "desc": "一次 HTTP 跑多条本层调用（最多 50 条），逐条返回 http_status；batch 本身恒 200"},
             {"method": "GET", "path": "/api/automation/schema",
              "desc": "自描述：配置键类型/默认值/可选值 + 词表 + 类型目录映射"},
-            {"method": "GET", "path": "/api/automation/state", "desc": "配置 + 最近任务 + 待选文件"},
+            {"method": "GET", "path": "/api/automation/ai",
+             "params": {"include_tools": "0|1"},
+             "desc": "AI 能力协商：版本、toolsets、限额、guide、MCP 提示"},
+            {"method": "GET", "path": "/api/automation/tools",
+             "params": {"format": "mcp|openai|anthropic", "profile": "text|vision|admin|all"},
+             "desc": "从 ai_contract 生成的工具 schema（同一份契约给 MCP/HTTP）"},
+            {"method": "GET", "path": "/api/automation/openapi.json",
+             "params": {"profile": "text|vision|admin|all"},
+             "desc": "OpenAPI 3.1 文档：每个工具一个 POST /api/automation/tool/{name} 操作；"
+                     "默认 text（19 个），admin 需显式选择"},
+            {"method": "POST", "path": "/api/automation/tool/{name}",
+             "params": {"body": "工具 arguments 对象", "content_format": "neutral|openai|anthropic|mcp"},
+             "desc": "OpenAPI 导入器使用的每工具执行入口；与 POST /api/automation/tool 等价"},
+            {"method": "POST", "path": "/api/automation/tool",
+             "params": {"name": "cft_*", "arguments": "object", "content_format": "neutral|openai|anthropic|mcp"},
+             "desc": "统一工具执行入口；MCP 侧车也调用它"},
+            {"method": "GET", "path": "/api/automation/guide",
+             "params": {"profile": "text|vision", "format": "json|markdown"},
+             "desc": "给模型的紧凑 runbook（与 MCP resources 同源）"},
+            {"method": "GET", "path": "/api/automation/vision/model",
+             "params": {"path": "str", "limit_images": "1-8", "max_side": "256-1536",
+                        "delivery": "inline|paths", "include_prompts": "0|1", "safe": "0|1"},
+             "desc": "模型封面/示例图 + 提示词/参数（视觉内容块）"},
+            {"method": "GET", "path": "/api/automation/vision/gallery",
+             "params": {"ids": "csv int", "max_side": "256-1536", "delivery": "inline|paths"},
+             "desc": "资源库条目的图片/视频首帧 + 生成元数据"},
+            {"method": "GET", "path": "/api/automation/vision/workflow",
+             "params": {"path": "str", "max_side": "256-1536", "delivery": "inline|paths"},
+             "desc": "工作流/图片预览 + 提示词与模型引用"},
+            {"method": "GET", "path": "/api/automation/vision/contact-sheet",
+             "params": {"source": "gallery|model", "ids": "csv int?" , "path": "str?",
+                        "limit": "1-24", "cols": "1-6", "cell": "96-512"},
+             "desc": "多图拼一张带编号的 contact sheet + id 映射"},
+            {"method": "POST", "path": "/api/automation/vision/analyze",
+             "params": {"path": "str?", "data_b64": "str?", "filename": "str?", "include_image": "0|1"},
+             "desc": "解析本地/上传图片的生成参数与模型引用（只读、内存内）"},
+            {"method": "GET", "path": "/api/automation/state",
+             "params": {"compact": "0|1", "task_limit": "0-50", "fields": "csv"},
+             "desc": "配置 + 最近任务 + 待选文件；compact=1 给文本模型"},
+            {"method": "POST", "path": "/api/automation/ui/dismiss",
+             "params": {"targets": "[all|guides|dialogs|onboarding|api_key|reverse_tutorial|"
+                                    "confirm|file_choice|move_after_download|settings_unsaved|"
+                                    "restricted|info|result|detail|about|image_viewer]",
+                        "permanent": "bool（默认 true，仅对引导生效）"},
+             "desc": "AI 一键关闭所有挡路弹层；确认框关闭=取消，file_choice=取消本次下载；"
+                     "permanent=true 只把新手引导设为不再自动弹"},
             {"method": "GET", "path": "/api/automation/tasks",
              "params": {"ids": "csv", "status": "csv", "limit": "int", "wait": "0|1", "timeout": "s",
                         "since": "ms", "fields": "csv"},
@@ -291,6 +381,10 @@ def _manifest(api, ctx):
             {"method": "GET", "path": "/api/automation/events",
              "params": {"since": "int", "limit": "int"},
              "desc": "本层调用事件流（自检：请求到没到、多久、什么状态）"},
+            {"method": "GET", "path": "/api/automation/events/stream",
+             "params": {"since": "int?", "types": "csv 事件名/组 或 all",
+                        "snapshot": "0|1（默认 1）"},
+             "desc": "SSE 领域事件流：任务/文件选择/扫描/弹层/配置；支持 Last-Event-ID 重放"},
             {"method": "GET", "path": "/api/automation/history",
              "params": {"limit": "int", "status": "str", "detail": "0|1", "fields": "csv"},
              "desc": "已完成/失败/取消的下载历史（倒序）"},
@@ -349,8 +443,8 @@ def _manifest(api, ctx):
              "desc": "资源库（ComfyUI output 媒体库）列表：筛选/分页/分面；"
                      "filter 里的 limit/offset/with_facets 会被查询参数覆盖"},
             {"method": "GET", "path": "/api/automation/gallery/item",
-             "params": {"id": "int", "fields": "csv"},
-             "desc": "资源库条目详情（id 来自 /gallery 的 items[].id）"},
+             "params": {"id": "int", "fields": "csv", "mode": "full|text"},
+             "desc": "资源库条目详情；mode=text 剥掉 preview base64，给纯文本模型"},
             {"method": "GET", "path": "/api/automation/gallery/tags", "params": {"fields": "csv"},
              "desc": "资源库标签列表"},
             {"method": "POST", "path": "/api/automation/gallery/op",
@@ -370,16 +464,19 @@ def _manifest(api, ctx):
             {"method": "GET", "path": "/api/automation/images/state", "params": {"path": "str?"},
              "desc": "示例图下载 / 补帧进度"},
             {"method": "POST", "path": "/api/automation/workflow/analyze",
-             "params": {"path": "str", "full": "0|1"},
-             "desc": "解析 ComfyUI 工作流/生成参数 + 本地模型匹配（默认不带 base64 预览）"},
+             "params": {"path": "str", "full": "0|1", "include_image": "0|1", "max_side": "256-1536"},
+             "desc": "解析 ComfyUI 工作流/生成参数 + 本地模型匹配；"
+                     "include_image=1 时附缩略预览（默认不带 base64）"},
             {"method": "POST", "path": "/api/automation/move",
              "params": {"path": "str?", "task_id": "str?", "history_id": "str?", "dest_dir": "str"},
              "desc": "移动模型 / 下载任务落点 / 历史记录到已存在的目录"},
             {"method": "POST", "path": "/api/automation/rename",
              "params": {"path": "str?", "new_name": "str?", "paths": "[str]?", "preview": "bool?"},
              "desc": "单文件改名或批量改名（preview=true 只算不改）"},
-            {"method": "GET", "path": "/api/automation/model", "params": {"path": "str", "fields": "csv"},
-             "desc": "单个模型详情（info + 画廊）+ 附属文件清单"},
+            {"method": "GET", "path": "/api/automation/model",
+             "params": {"path": "str", "fields": "csv", "mode": "full|text"},
+             "desc": "单个模型详情（info + 画廊）+ 附属文件清单；"
+                     "mode=text 剥掉 covers base64，给纯文本模型"},
             {"method": "POST", "path": "/api/automation/file-choice",
              "params": {"identity": "str", "indices": "[int]?", "pause": "bool", "ack": "bool"},
              "desc": "回答/确认待选文件（identity 来自 state.pending_file_choice.id）"},
@@ -401,8 +498,76 @@ def _manifest(api, ctx):
     }
 
 
-def _state(api, ctx):
-    return 200, ctx["state"]()
+def _state(api, ctx, query=None):
+    """状态：compact=1 时只回关键配置与少量任务，fields 只裁剪 tasks。"""
+    q = query or {}
+    data = ctx["state"]()
+    if not isinstance(data, dict):
+        return 200, data
+    out = dict(data)
+    compact = _truthy(q.get("compact", ["0"])[0])
+    if compact:
+        limit = _int(q.get("task_limit", ["5"])[0], 5, 0, 50)
+        out["tasks"] = list(out.get("tasks") or [])[-limit:] if limit else []
+        cfg = out.get("config") or {}
+        out["config"] = {k: cfg.get(k) for k in (
+            "download_dir", "download_target_dir", "models_dir", "comfyui_models_root",
+            "route_by_type", "ask_move_after_download", "site_domain", "proxy_enabled",
+            "ssl_verify", "target_env", "organize_mode",
+            "onboarding_done", "auto_guides") if k in cfg}
+    fields = _fields_from(q)
+    if fields:
+        names = [s.strip() for s in fields.split(",") if s.strip()]
+        if names and isinstance(out.get("tasks"), list):
+            out["tasks"] = [_project_item(t, names) if isinstance(t, dict) else t
+                            for t in out["tasks"]]
+    return 200, out
+
+
+def _ui_dismiss(api, ctx, body):
+    """关闭引导类弹窗：人需要新手引导，AI 不需要，也不该为此研究怎么点 X。
+
+    只处理引导/教程（onboarding、API Key 提示、反向解析教程），不碰模型详情等业务弹层。
+    `permanent=true` 写入 onboarding_done + auto_guides=false，下次打开不再自动弹出。
+    """
+    b = body or {}
+    targets = b.get("targets")
+    if targets is None:
+        targets = ["all"]
+    if isinstance(targets, str):
+        targets = [targets]
+    if not isinstance(targets, list):
+        return _fail(400, "targets 必须是数组",
+                     '例如 {"targets":["all"],"permanent":true}')
+    allowed = tuple(getattr(api, "_UI_DISMISS_TARGETS", None) or (
+        "all", "guides", "dialogs", "onboarding", "api_key", "reverse_tutorial",
+        "confirm", "file_choice", "move_after_download", "settings_unsaved",
+        "restricted", "info", "result", "detail", "media", "about", "image_viewer"))
+    picked, seen = [], set()
+    for item in targets:
+        name = str(item or "").strip()
+        if name in allowed and name not in seen:
+            seen.add(name)
+            picked.append(name)
+    if not picked:
+        return _fail(400, "targets 必须是 %s 之一" % "|".join(allowed),
+                     "不传 targets = 关闭全部弹层；确认框关闭=取消，不会执行危险操作；"
+                     "AI 建议 permanent=true 只对引导生效")
+    permanent = b.get("permanent", True)
+    if not isinstance(permanent, bool):
+        return _fail(400, "permanent 必须是布尔值", "permanent=true 表示以后不再自动弹引导")
+    fn = getattr(api, "dismiss_ui", None)
+    if not callable(fn):
+        return _fail(501, "当前版本不支持关闭引导",
+                     "升级桌面端到 >= %s" % ai_contract.MIN_APP_VERSION)
+    try:
+        result = fn(targets=picked, permanent=permanent)
+    except Exception as e:
+        return _fail(500, "关闭引导失败: %s" % str(e)[:120], "查看 GET /api/automation/logs")
+    if not isinstance(result, dict) or result.get("ok") is False:
+        return _fail(500, (result or {}).get("msg") or "关闭引导失败",
+                     "检查配置是否可写（GET /api/automation/config）")
+    return 200, result
 
 
 def _tasks(api, ctx, query):
@@ -567,6 +732,152 @@ def _resolve_target(civ, body, allow_first_version=True, need_versions=False):
         return None, None, None, None, [], "解析失败: %s" % str(e)[:200]
 
 
+def _cfg_roots(cfg):
+    """All directories that can legitimately hold model files (ordered, deduped)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    roots = []
+    for key in ("comfyui_models_root", "models_dir", "download_target_dir", "download_dir"):
+        value = str(cfg.get(key) or "").strip()
+        if value:
+            roots.append(value)
+    for value in (cfg.get("models_dirs") or []):
+        value = str(value or "").strip()
+        if value:
+            roots.append(value)
+    out, seen = [], set()
+    for path in roots:
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def _under(path, root):
+    try:
+        child = os.path.normcase(os.path.abspath(str(path)))
+        parent = os.path.normcase(os.path.abspath(str(root)))
+    except (OSError, ValueError):
+        return False
+    return bool(child and parent and (child == parent or child.startswith(parent + os.sep)))
+
+
+def _default_dest_dir(api):
+    cfg = getattr(api, "cfg", None) or {}
+    target = str(cfg.get("download_target_dir") or "").strip()
+    if target and os.path.isdir(target):
+        return target
+    return str(cfg.get("download_dir") or "").strip()
+
+
+def _placement(dest, cfg, expected_folder=""):
+    """Read-only placement verdict; never moves files or changes config.
+
+    status:
+      routed       -> under comfyui_models_root/<type>/...
+      under_root   -> inside a configured root but not in a type subdirectory
+      outside_root -> not inside any configured model root
+      pending      -> destination is resolved only when the download starts
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    dest = str(dest or "").strip()
+    root = str(cfg.get("comfyui_models_root") or "").strip()
+    roots = _cfg_roots(cfg)
+    out = {
+        "dest_dir": dest, "routed_dir": "", "folder": "",
+        "expected_folder": str(expected_folder or ""),
+        "under_models_root": False, "under_configured_root": False,
+        "status": "pending", "hint": "",
+    }
+    if not dest:
+        out["hint"] = "落点将在下载开始时解析；先在 cft_diagnostics storage 里确认模型根与分流配置"
+        return out
+    under_root = bool(root and _under(dest, root))
+    out["under_models_root"] = under_root
+    out["under_configured_root"] = any(_under(dest, item) for item in roots)
+    rel = ""
+    if under_root:
+        try:
+            rel = os.path.relpath(os.path.abspath(dest), os.path.abspath(root))
+        except ValueError:
+            rel = ""
+        if rel and rel != ".":
+            out["folder"] = rel.split(os.sep)[0]
+            out["routed_dir"] = dest
+    if out["folder"]:
+        out["status"] = "routed"
+    elif under_root:
+        out["status"] = "under_root"
+        out["hint"] = ("文件落在模型根目录根部，未按类型分目录；开启 route_by_type 并设置 "
+                       "comfyui_models_root（候选值见 cft_diagnostics storage），"
+                       "或下载时传 dest_subdir")
+    elif out["under_configured_root"]:
+        out["status"] = "under_root"
+        out["hint"] = ("文件在已配置的模型目录内，但不在 comfyui_models_root 下；"
+                       "若要让 ComfyUI 直接扫到，设置 comfyui_models_root 并开启 route_by_type")
+    else:
+        out["status"] = "outside_root"
+        out["hint"] = ("文件不在任何已配置的模型根内；检查 models_dir / comfyui_models_root "
+                       "或下载时传 dest_subdir")
+    if not root and dest:
+        out["hint"] = ("未配置 comfyui_models_root，无法按类型分流；先设置根目录并开启 "
+                       "route_by_type（候选值见 cft_diagnostics storage）")
+    return out
+
+
+def _model_root_candidates(cfg):
+    """Suggest comfyui_models_root from configured dirs that already contain type folders.
+
+    Only looks at the configured paths and their direct parent — never scans drives.
+    """
+    import model_routing
+    cfg = cfg if isinstance(cfg, dict) else {}
+    folders = set(model_routing.CORE_FOLDERS)
+    out, seen = [], set()
+
+    def inspect(path, reason):
+        if not path or not os.path.isdir(path):
+            return
+        try:
+            names = [name for name in os.listdir(path)
+                     if os.path.isdir(os.path.join(path, name))]
+        except OSError:
+            return
+        matched = sorted(name for name in names if name.lower() in folders)
+        if len(matched) < 2:
+            return
+        key = os.path.normcase(os.path.realpath(path))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"path": path, "matched": matched, "reason": reason})
+
+    current = str(cfg.get("comfyui_models_root") or "").strip()
+    inspect(current, "当前 comfyui_models_root 已包含类型目录")
+    for key in ("models_dir", "download_dir", "download_target_dir"):
+        path = str(cfg.get(key) or "").strip()
+        if not path:
+            continue
+        inspect(path, "%s 本身包含多个 ComfyUI 类型目录" % key)
+        try:
+            inspect(os.path.dirname(os.path.normpath(path)),
+                    "%s 的上级目录包含多个 ComfyUI 类型目录" % key)
+        except (OSError, ValueError):
+            continue
+    for path in (cfg.get("models_dirs") or []):
+        path = str(path or "").strip()
+        if not path:
+            continue
+        inspect(path, "模型目录本身包含多个 ComfyUI 类型目录")
+        try:
+            inspect(os.path.dirname(os.path.normpath(path)),
+                    "模型目录的上级包含多个 ComfyUI 类型目录")
+        except (OSError, ValueError):
+            continue
+    best = out[0]["path"] if out else ""
+    return {"current": current, "suggested": best, "candidates": out}
+
+
 def _plan_payload(api, body, model_id, version_id, version, model, files):
     """纯计算：文件命名 / 分流决策 / 落点 / 是否已存在或在队列。不写盘、不入队、不发请求
     （probe=1 时才会为了 safetensors 头做两次 Range，这由调用方决定是否开启）。"""
@@ -576,6 +887,7 @@ def _plan_payload(api, body, model_id, version_id, version, model, files):
     root = str((api.cfg or {}).get("comfyui_models_root") or "").strip()
     route_on = bool((api.cfg or {}).get("route_by_type"))
     probe = bool((body or {}).get("probe"))
+    civ = getattr(api, "api", None)
     items = []
     for f in files:
         base = model_naming.download_name(api.cfg, f, model.get("name") or "",
@@ -589,6 +901,17 @@ def _plan_payload(api, body, model_id, version_id, version, model, files):
         folder = decision.folder
         bundle = model_routing.bundle_name_for(os.path.splitext(base)[0], "")
         dest = model_routing.resolve_dest_dir(root, folder, bundle) if (route_on and folder) else None
+        subdir = str((body or {}).get("dest_subdir") or "").strip()
+        final_dir = dest or ""
+        if not final_dir and subdir:
+            # 与 webui.dl_submit_url_from_bridge 的回落一致：未分流时 dest_subdir 落到归档根
+            try:
+                final_dir = api._safe_archive_path(api._archive_root(), subdir)
+            except Exception:
+                final_dir = ""
+        if not final_dir:
+            final_dir = _default_dest_dir(api)
+        placement = _placement(final_dir, getattr(api, "cfg", None), folder)
         item = {
             "name": base, "file_id": f.get("id"), "type": f.get("type"),
             "primary": bool(f.get("primary")), "size_kb": f.get("sizeKB"),
@@ -596,17 +919,24 @@ def _plan_payload(api, body, model_id, version_id, version, model, files):
             "routed_dir": dest or "", "route_reason": decision.reason,
             "route_source": decision.source,
             "would_route": bool(dest),
-            "exists": bool(dest and os.path.exists(os.path.join(dest, base))),
+            "placement": placement,
+            "exists": bool(final_dir and os.path.exists(os.path.join(final_dir, base))),
             "queued": False,
         }
-        try:
-            item["download_url"] = civ.file_download_url(version, f)
-        except Exception as e:
+        if item["exists"]:
+            item["existing_path"] = os.path.join(final_dir, base)
+        if civ is None:
             item["download_url"] = ""
-            item["download_url_error"] = str(e)[:120]
+            item["download_url_error"] = "桌面端未提供 C 站客户端"
+        else:
+            try:
+                item["download_url"] = civ.file_download_url(version, f)
+            except Exception as e:
+                item["download_url"] = ""
+                item["download_url_error"] = str(e)[:120]
         try:
             item["queued"] = bool(api._dup_in_queue(version_id, (f.get("hashes") or {}).get("SHA256"),
-                                                    base, dest or ""))
+                                                    base, dest or final_dir))
         except Exception:
             pass
         items.append(item)
@@ -751,10 +1081,15 @@ def _download(api, ctx, body):
     hit = _existing_target(api, b)
     if hit:
         plan, files = hit
-        return 200, {"ok": True, "skipped": "exists", "task": None, "files": files,
-                     "model": plan.get("model"), "version": plan.get("version"),
-                     "waited_s": 0, "timed_out": False,
-                     "hint": "目标文件已存在，未重复下载；确需重新下载请传 force:true"}
+        out = {"ok": True, "skipped": "exists", "task": None, "files": files,
+               "model": plan.get("model"), "version": plan.get("version"),
+               "waited_s": 0, "timed_out": False,
+               "hint": "目标文件已存在，未重复下载；确需重新下载请传 force:true"}
+        if files:
+            existing = files[0].get("existing_path") or ""
+            out["placement"] = files[0].get("placement") or _placement(
+                os.path.dirname(existing) if existing else "", getattr(api, "cfg", None))
+        return 200, out
     targets, err = _download_targets(api, b)
     if err:
         return 400, {"ok": False, "msg": err,
@@ -783,7 +1118,9 @@ def _download(api, ctx, body):
             submit = {"ok": True, "raw": submit}
         accepted = bool(submit.get("ok")) if "ok" in submit else bool(submit.get("started"))
         expect_task = expect_task or accepted
-        items.append({"url": t["url"], "ok": accepted, "submit": submit})
+        items.append({"url": t["url"], "ok": accepted, "submit": submit,
+                      "placement": _placement(submit.get("dest_dir") or "",
+                                              getattr(api, "cfg", None))})
 
     tasks, waited, timed_out = [], 0.0, False
     if wait and expect_task:
@@ -799,6 +1136,8 @@ def _download(api, ctx, body):
     for idx, task in enumerate(tasks):
         if idx < len(items):
             items[idx]["task"] = task
+            dest = task.get("routed_dir") or task.get("dest_dir") or ""
+            items[idx]["placement"] = _placement(dest, getattr(api, "cfg", None))
             if task.get("status") == "done" and want_verify:
                 items[idx]["verify"] = _verify_dir(
                     task.get("routed_dir") or task.get("dest_dir") or "",
@@ -815,7 +1154,11 @@ def _download(api, ctx, body):
             return 400, {"ok": False, "submit": r.get("submit"), "items": items,
                          "msg": (r.get("submit") or {}).get("msg") or "提交被拒绝"}
         out = {"ok": bool(r.get("ok")), "submit": r.get("submit"), "waited_s": waited,
-               "timed_out": timed_out, "task": r.get("task"), "items": items}
+               "timed_out": timed_out, "task": r.get("task"), "items": items,
+               "placement": r.get("placement")}
+        placement_hint = (r.get("placement") or {}).get("hint")
+        if placement_hint and not out.get("hint"):
+            out["hint"] = placement_hint
         if r.get("verify") is not None:
             out["verify"] = r["verify"]
             out["ok"] = bool(out["ok"] and r["verify"].get("ok"))
@@ -841,7 +1184,15 @@ def _verify(api, ctx, query):
         dest = task.get("routed_dir") or task.get("dest_dir") or ""
         info = (task.get("info") or {}) if isinstance(task.get("info"), dict) else {}
         expected = info.get("expected_sha256") or task.get("expected_sha256") or ""
-        return 200, _verify_dir(dest, task.get("filename") or "", expected, do_hash, expect)
+        out = _verify_dir(dest, task.get("filename") or "", expected, do_hash, expect)
+        # 下载那一刻的校验结论直接带出来：不然 hash:false 时 AI 只看到 sha256_ok=null，
+        # 分不清「已经校验过」和「根本没校验」
+        for k in ("expected_sha256", "actual_sha256", "verification_status"):
+            if task.get(k):
+                out[k] = task[k]
+        if out.get("verification_status") == "verified" and out.get("sha256_ok") is None:
+            out["sha256_ok"] = True
+        return 200, out
     if path:
         if os.path.isdir(path):
             # 目录形态：自动挑最大的权重文件当本体（多文件版本取主文件，体积最大最稳）
@@ -855,7 +1206,8 @@ def _verify(api, ctx, query):
             weights.sort(reverse=True)
             return 200, _verify_dir(path, weights[0][1] if weights else "", "", do_hash, expect)
         return 200, _verify_dir(os.path.dirname(path), os.path.basename(path), "", do_hash, expect)
-    return 400, {"ok": False, "msg": "需要 task_id 或 path"}
+    return 400, {"ok": False, "msg": "需要 task_id 或 path",
+                 "hint": "传 task_id；不知道 id 先 GET /api/automation/tasks"}
 
 
 def _config_get(api, ctx):
@@ -1057,7 +1409,14 @@ def _gallery_item(api, ctx, query):
         msg = item.get("msg") if isinstance(item, dict) else "条目不存在"
         return _fail(404, msg or "条目不存在",
                      "先 GET /api/automation/gallery 取 id（items[].id），再查详情")
-    return 200, _apply_fields({"ok": True, "id": item_id, "item": item}, _fields_from(query))
+    mode = str((query.get("mode", [""])[0] or "")).strip().lower()
+    omitted = 0
+    if mode == "text":
+        item, omitted = _strip_media(item)
+    out = {"ok": True, "id": item_id, "mode": mode or "full", "item": item}
+    if omitted:
+        out["media_omitted"] = omitted
+    return 200, _apply_fields(out, _fields_from(query))
 
 
 def _gallery_tags(api, ctx, query):
@@ -1174,7 +1533,8 @@ def _gallery_op(api, ctx, body):
     if not _truthy(b.get("confirm")):
         return _fail(400, "delete 会把媒体文件移入回收站，必须显式传 confirm:true",
                      "先 GET /api/automation/gallery 确认 ids，再带 confirm:true 执行；"
-                     "只回收媒体本体，不连带同名 .json 等 sidecar")
+                     "只回收媒体本体，不连带同名 .json 等 sidecar",
+                     code="destructive_requires_confirm")
     fn = getattr(api, "lib_delete", None)
     if not callable(fn):
         return _fail(501, "当前版本不支持删除", "升级桌面端后重试（需要 webui.py 的 lib_delete）")
@@ -1369,13 +1729,18 @@ def _model_detail(api, ctx, query):
         return 500, {"ok": False, "msg": "读取详情失败: %s" % str(e)[:200]}
     if not isinstance(detail, dict):
         detail = {"raw": detail}
+    mode = str((query.get("mode", [""])[0] or "")).strip().lower()
+    omitted = 0
+    if mode == "text":
+        detail, omitted = _strip_media(detail)
     v = _verify_dir(os.path.dirname(path), os.path.basename(path))
-    return 200, _apply_fields(
-        {"ok": True, "path": path, "detail": detail,
-         "files": {"exists": v["exists"], "size": v["size"],
-                   "sidecars": v["sidecars"], "images": v["images"],
-                   "artifacts": v["artifacts"]}},
-        _fields_from(query))
+    out = {"ok": True, "path": path, "mode": mode or "full", "detail": detail,
+           "files": {"exists": v["exists"], "size": v["size"],
+                     "sidecars": v["sidecars"], "images": v["images"],
+                     "artifacts": v["artifacts"]}}
+    if omitted:
+        out["media_omitted"] = omitted
+    return 200, _apply_fields(out, _fields_from(query))
 
 
 def _search(api, ctx, body):
@@ -1436,6 +1801,8 @@ _CONFIG_HINTS = {
     "metadata_format": ("enum", ["sd", "civitai", "both"], "生成的元数据格式"),
     "target_env": ("enum", ["", "webui", "comfyui"], "整理目标环境"),
     "organize_mode": ("enum", ["manual", "civitai", "rules"], "整理分类模式"),
+    "onboarding_done": ("bool", "", "首次使用引导是否已完成"),
+    "auto_guides": ("bool", "", "是否自动弹出新手引导/教程；AI 可关闭，手动入口仍可用"),
 }
 
 _MM_OPS = {
@@ -1492,6 +1859,129 @@ def _schema(api, ctx):
                      "preview_any_of": list(PREVIEW_SUFFIXES),
                      "archive": list(ARCHIVE_ARTIFACTS)},
     }
+
+
+def _ai(api, ctx, query):
+    include_tools = _truthy((query or {}).get("include_tools", ["0"])[0])
+    return 200, ai_tools.capabilities_payload(api, ctx, include_tools)
+
+
+def _tools(api, ctx, query):
+    """工具 schema 投影：同一份 ai_contract 生成 OpenAI/Anthropic/MCP 形状。"""
+    fmt = str((query or {}).get("format", ["mcp"])[0] or "mcp").strip().lower()
+    profile = str((query or {}).get("profile", ["text"])[0] or "text").strip().lower()
+    if profile not in ai_contract.PROFILES:
+        return _fail(400, "profile 必须是 %s 之一" % "|".join(ai_contract.PROFILES),
+                     "text=纯文本；vision=core+vision；admin=core+admin；all=全部")
+    if fmt not in ("mcp", "openai", "anthropic"):
+        return _fail(400, "format 必须是 mcp|openai|anthropic",
+                     "大多数函数调用客户端用 openai；Claude 用 anthropic；MCP 侧车用 mcp")
+    rows = [ai_contract.public_tool(t, format=fmt) for t in ai_contract.tools_for_profile(profile)]
+    return 200, {"ok": True, "format": fmt, "profile": profile,
+                 "tools": rows, "count": len(rows),
+                 "guide": "/api/automation/guide?profile=%s" % ("vision" if profile == "vision" else "text"),
+                 "limits": dict(ai_contract.LIMITS)}
+
+
+def _openapi(api, ctx, query):
+    """OpenAPI 3.1 文档：从 ai_contract 运行时生成，不落盘、不手写。"""
+    profile = str((query or {}).get("profile", ["text"])[0] or "text").strip().lower()
+    if profile not in ai_contract.PROFILES:
+        return _fail(400, "profile 必须是 %s 之一" % "|".join(ai_contract.PROFILES),
+                     "text=纯文本；vision=core+vision；admin=core+admin；all=全部")
+    try:
+        doc = openapi_projection.build_document(
+            profile,
+            host_header=str((ctx or {}).get("host") or ""),
+            app_version=str((ctx or {}).get("version") or ""),
+        )
+    except Exception as e:
+        return _fail(500, "生成 OpenAPI 失败: %s" % str(e)[:160],
+                     "检查 GET /api/automation/tools?profile=%s 是否正常" % profile)
+    return 200, doc
+
+
+def _tool_call(api, ctx, body):
+    """统一工具执行入口：MCP 侧车与 HTTP 客户端共用，不是过渡层。"""
+    b = body or {}
+    name = str(b.get("name") or "").strip()
+    args = b.get("arguments")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return _fail(400, "arguments 必须是 JSON 对象",
+                     '形如 {"name":"cft_get_state","arguments":{"compact":true}}')
+    status, payload = ai_tools.execute_tool(name, args, api, ctx, dispatch)
+    fmt = str(b.get("content_format") or b.get("format") or "neutral").strip().lower()
+    if fmt not in ("neutral", "openai", "anthropic", "mcp"):
+        return _fail(400, "content_format 必须是 neutral|openai|anthropic|mcp",
+                     "neutral 给通用客户端；openai/anthropic 直接给消息 content 块")
+    return status, ai_tools.format_content(payload, fmt)
+
+
+def _guide(api, ctx, query):
+    profile = str((query or {}).get("profile", ["text"])[0] or "text").strip().lower()
+    if profile not in ("text", "vision"):
+        return _fail(400, "profile 必须是 text|vision", "text 给纯文本模型；vision 给多模态模型")
+    guide = ai_contract.guide_for(profile)
+    if str((query or {}).get("format", ["json"])[0] or "json").strip().lower() == "markdown":
+        return 200, {"ok": True, "profile": profile, "format": "markdown", "markdown": guide}
+    return 200, {"ok": True, "profile": profile, "format": "json", "guide": guide,
+                 "tools": [t["name"] for t in ai_contract.tools_for_profile(profile)]}
+
+
+def _vision_query_args(query, tool):
+    """把 GET query 字符串转成工具参数；只保留契约里声明的键。"""
+    q = query or {}
+    spec = (ai_contract.TOOLS.get(tool) or {}).get("inputSchema") or {}
+    props = spec.get("properties") or {}
+    args = {}
+    for key, schema in props.items():
+        if key not in q:
+            continue
+        raw = (q.get(key) or [""])[0]
+        typ = schema.get("type")
+        try:
+            if typ == "integer":
+                args[key] = int(raw)
+            elif typ == "number":
+                args[key] = float(raw)
+            elif typ == "boolean":
+                args[key] = _truthy(raw)
+            elif typ == "array":
+                if raw.strip().startswith("["):
+                    args[key] = json.loads(raw)
+                else:
+                    item_type = (schema.get("items") or {}).get("type")
+                    parts = [s.strip() for s in raw.split(",") if s.strip()]
+                    args[key] = [int(s) for s in parts] if item_type == "integer" else parts
+            else:
+                args[key] = raw
+        except (TypeError, ValueError):
+            return None, "参数 %s 格式不对" % key
+    return args, ""
+
+
+def _vision_get(api, ctx, query, tool):
+    args, err = _vision_query_args(query, tool)
+    if err:
+        return _fail(400, err, "参数类型见 GET /api/automation/tools")
+    status, payload = ai_tools.execute_tool(tool, args, api, ctx, dispatch)
+    fmt = str((query or {}).get("content_format", ["neutral"])[0] or "neutral").lower()
+    if fmt not in ("neutral", "openai", "anthropic", "mcp"):
+        return _fail(400, "content_format 必须是 neutral|openai|anthropic|mcp", "默认 neutral")
+    return status, ai_tools.format_content(payload, fmt)
+
+
+def _vision_analyze(api, ctx, body):
+    b = body or {}
+    args = {k: b.get(k) for k in ("path", "data_b64", "filename", "max_side", "delivery", "include_image")
+            if b.get(k) is not None}
+    status, payload = ai_tools.execute_tool("cft_inspect_image", args, api, ctx, dispatch)
+    fmt = str(b.get("content_format") or "neutral").lower()
+    if fmt not in ("neutral", "openai", "anthropic", "mcp"):
+        return _fail(400, "content_format 必须是 neutral|openai|anthropic|mcp", "默认 neutral")
+    return status, ai_tools.format_content(payload, fmt)
 
 
 def _resolve(api, ctx, body):
@@ -1626,7 +2116,8 @@ def _library_op(api, ctx, body):
     if op in _CONFIRM_OPS:
         if not b.get("confirm"):
             return _fail(400, "%s 会删除文件/移入回收站，必须显式传 confirm:true" % op,
-                         "先跑只读的 dedupe / rename-preview 确认清单，再带 confirm:true 执行")
+                         "先跑只读的 dedupe / rename-preview 确认清单，再带 confirm:true 执行",
+                         code="destructive_requires_confirm")
         if not paths:
             return _fail(400, "%s 必须指定 paths" % op, "paths 是模型文件的绝对路径数组")
     fn = getattr(api, name, None)
@@ -1755,6 +2246,7 @@ def _workflow(api, ctx, body):
         return 400, data
     full = bool(b.get("full"))
     out = {k: v for k, v in data.items() if k not in ("preview_b64", "nodes", "edges")}
+    out["preview_available"] = bool(data.get("preview_b64"))
     nodes = data.get("nodes") or []
     out["nodes"] = nodes if full else [
         {"id": n.get("id"), "type": n.get("type"), "title": n.get("title")} for n in nodes]
@@ -1767,6 +2259,19 @@ def _workflow(api, ctx, body):
             out["local_matches"] = _jsonish(api.workflow_model_matches(models)) or []
         except Exception as e:
             out["local_matches_error"] = str(e)[:160]
+    if _truthy(b.get("include_image")):
+        max_side = _int(b.get("max_side", 1024), 1024, 256, 1536)
+        try:
+            import vision_api
+            v = vision_api.workflow_vision(api, path, max_side=max_side, delivery="inline")
+            items = v.get("items") if isinstance(v, dict) else []
+            if items and isinstance(items[0], dict):
+                out["preview"] = items[0].get("image") or {}
+                out["preview_meta"] = {k: items[0].get(k) for k in ("source", "text") if items[0].get(k)}
+            if isinstance(v, dict) and v.get("note"):
+                out["preview_note"] = v["note"]
+        except Exception as e:
+            out["preview_error"] = str(e)[:160]
     return 200, out
 
 
@@ -1798,10 +2303,15 @@ def _storage(api, ctx):
             exists = os.path.isdir(p)
             type_dirs.append({"folder": folder, "exists": exists,
                               "writable": bool(exists and os.access(p, os.W_OK))})
+    candidates = _model_root_candidates(cfg)
     return 200, {"ok": True,
                  "routing": {"enabled": bool(cfg.get("route_by_type")), "root": root},
                  "dirs": dirs, "type_dirs": type_dirs,
-                 "hint": "route_by_type=true 且类型目录存在时才分流；不存在的目录绝不新建"}
+                 "candidates": candidates.get("candidates") or [],
+                 "suggested_root": candidates.get("suggested") or "",
+                 "hint": ("route_by_type=true 且类型目录存在时才分流；不存在的目录绝不新建。"
+                          + (" 候选根：%s" % candidates.get("suggested")
+                             if candidates.get("suggested") and not root else ""))}
 
 
 _BATCH_MAX = 50
@@ -1992,7 +2502,8 @@ def _storage_migrate(api, ctx, body):
         return _fail(400, "directory 不能为空", "推荐先用 GET /api/automation/fs 选一个真实存在的目录")
     if not b.get("confirm"):
         return _fail(400, "迁移会移动配置/任务/历史/缓存，必须显式传 confirm:true",
-                     "先 GET /api/automation/config 看 storage.current 与 storage.suggested")
+                     "先 GET /api/automation/config 看 storage.current 与 storage.suggested",
+                     code="destructive_requires_confirm")
     try:
         r = _jsonish(api.migrate_data_storage(directory, bool(b.get("replace_existing")))) or {}
     except Exception as e:
@@ -2085,7 +2596,7 @@ def _history_action(api, ctx, body):
     return 200, out
 
 
-def dispatch(path, method, query, body, api, ctx):
+def _dispatch_impl(path, method, query, body, api, ctx):
     """返回 (status, payload)；路径不认识返回 None（交给上层 404）。
 
     query: dict[str, list[str]]（parse_qs 结果）；body: dict 或 None。
@@ -2101,8 +2612,28 @@ def dispatch(path, method, query, body, api, ctx):
             return _manifest(api, ctx)
         if path == "/api/automation/schema":
             return _schema(api, ctx)
+        if path == "/api/automation/ai":
+            return _ai(api, ctx, q)
+        if path == "/api/automation/tools":
+            return _tools(api, ctx, q)
+        if path == "/api/automation/openapi.json":
+            return _openapi(api, ctx, q)
+        if path.startswith("/api/automation/tool/"):
+            return _fail(405, "每工具操作必须用 POST",
+                         "POST /api/automation/tool/{name}，body 是工具 arguments 对象；"
+                         "GET 文档在 /api/automation/openapi.json")
+        if path == "/api/automation/guide":
+            return _guide(api, ctx, q)
         if path == "/api/automation/state":
-            return _state(api, ctx)
+            return _state(api, ctx, q)
+        if path == "/api/automation/vision/model":
+            return _vision_get(api, ctx, q, "cft_view_model")
+        if path == "/api/automation/vision/gallery":
+            return _vision_get(api, ctx, q, "cft_view_gallery")
+        if path == "/api/automation/vision/workflow":
+            return _vision_get(api, ctx, q, "cft_view_workflow")
+        if path == "/api/automation/vision/contact-sheet":
+            return _vision_get(api, ctx, q, "cft_contact_sheet")
         if path == "/api/automation/tasks":
             return _tasks(api, ctx, q)
         if path == "/api/automation/events":
@@ -2144,6 +2675,19 @@ def dispatch(path, method, query, body, api, ctx):
         return None
 
     if m == "POST":
+        if path.startswith("/api/automation/tool/"):
+            name = unquote(path[len("/api/automation/tool/"):]).strip("/")
+            if not name or "/" in name:
+                return _fail(404, "工具不存在",
+                             "工具名来自 GET /api/automation/tools?format=mcp")
+            fmt = str((q.get("content_format") or q.get("format") or ["neutral"])[0] or "neutral").strip().lower()
+            return _tool_call(api, ctx, {"name": name,
+                                         "arguments": {} if body is None else body,
+                                         "content_format": fmt})
+        if path == "/api/automation/tool":
+            return _tool_call(api, ctx, body)
+        if path == "/api/automation/vision/analyze":
+            return _vision_analyze(api, ctx, body)
         if path == "/api/automation/batch":
             return _batch(api, ctx, body)
         if path == "/api/automation/history":
@@ -2152,6 +2696,8 @@ def dispatch(path, method, query, body, api, ctx):
             return _tasks_action(api, ctx, body)
         if path == "/api/automation/tasks/repair":
             return _task_repair(api, ctx, body)
+        if path == "/api/automation/ui/dismiss":
+            return _ui_dismiss(api, ctx, body)
         if path == "/api/automation/plan":
             return _plan(api, ctx, body)
         if path == "/api/automation/resolve":
@@ -2185,3 +2731,14 @@ def dispatch(path, method, query, body, api, ctx):
         return None
 
     return 405, {"ok": False, "msg": "方法不支持"}
+
+
+def dispatch(path, method, query, body, api, ctx):
+    """统一入口：执行后给所有错误补 code/retryable，调用方不必逐条写。"""
+    result = _dispatch_impl(path, method, query, body, api, ctx)
+    if result is None:
+        return None
+    status, payload = result
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        payload = ai_contract.normalize_error(status, payload)
+    return status, payload

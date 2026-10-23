@@ -145,6 +145,10 @@ class UiFlagsTest(unittest.TestCase):
         self.assertEqual(flags["download_target_dir"], "D:/out")
         self.assertEqual(flags["multi_file_download"], "first")
         self.assertTrue(flags["route_by_type"])
+        self.assertFalse(flags["onboarding_done"])
+        self.assertTrue(flags["auto_guides"])
+        self.assertFalse(flags["api_key_present"])
+        self.assertEqual(flags["ui_dismiss_rev"], 0)
 
     def test_save_config_bumps_rev(self):
         from unittest.mock import patch
@@ -157,6 +161,54 @@ class UiFlagsTest(unittest.TestCase):
         with patch.object(webui.config, "save", return_value=True),              patch.object(webui.config, "normalize_ui_preferences"),              patch.object(webui.Api, "_new_api", return_value=Mock()):
             api.save_config({"ask_move_after_download": True})
         self.assertEqual(api.get_ui_flags()["cfg_rev"], 2)
+
+    def test_dismiss_ui_persists_and_bumps_dismiss_rev(self):
+        from unittest.mock import patch
+        api = webui.Api.__new__(webui.Api)
+        api.cfg = {"onboarding_done": False, "auto_guides": True,
+                   "models_dirs": [], "max_concurrent_downloads": 2}
+        api.dl = Mock()
+        with patch.object(webui.config, "save", return_value=True), \
+             patch.object(webui.config, "normalize_ui_preferences"), \
+             patch.object(webui.Api, "_new_api", return_value=Mock()):
+            out = api.dismiss_ui(["onboarding"], permanent=True)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["dismissed"], ["onboarding"])
+        self.assertTrue(api.cfg["onboarding_done"])
+        self.assertFalse(api.cfg["auto_guides"])
+        flags = api.get_ui_flags()
+        self.assertEqual(flags["ui_dismiss_rev"], 1)
+        self.assertTrue(flags["onboarding_done"])
+        self.assertFalse(flags["auto_guides"])
+
+    def test_dismiss_ui_temporary_does_not_write_config(self):
+        api = webui.Api.__new__(webui.Api)
+        api.cfg = {"onboarding_done": False, "auto_guides": True}
+        out = api.dismiss_ui(["api_key"], permanent=False)
+        self.assertTrue(out["ok"], out)
+        self.assertFalse(api.cfg["onboarding_done"])
+        self.assertEqual(api.get_ui_flags()["ui_dismiss_rev"], 1)
+
+    def test_dismiss_dialogs_does_not_disable_guides(self):
+        api = webui.Api.__new__(webui.Api)
+        api.cfg = {"onboarding_done": False, "auto_guides": True}
+        out = api.dismiss_ui(["dialogs"], permanent=True)
+        self.assertTrue(out["ok"], out)
+        self.assertFalse(out["permanent_applied"])
+        self.assertFalse(api.cfg["onboarding_done"])
+        self.assertTrue(api.cfg["auto_guides"])
+
+    def test_ui_overlays_are_sanitized_for_state(self):
+        api = webui.Api.__new__(webui.Api)
+        api.cfg = {}
+        api.set_ui_overlays([
+            {"name": "confirm", "title": "x" * 500, "blocking": True, "extra": "drop"},
+            {"name": ""}, "bad",
+        ])
+        rows = api.get_ui_flags()
+        self.assertEqual(rows["ui_overlay_count"], 1)
+        self.assertLessEqual(len(api._ui_overlays[0]["title"]), 120)
+        self.assertNotIn("extra", api._ui_overlays[0])
 
 
 if __name__ == "__main__":

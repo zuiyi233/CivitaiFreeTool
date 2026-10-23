@@ -212,6 +212,16 @@
     if (s == null || s <= 0) return null;
     return s >= 1e7 ? Math.round(s / 104857.6) / 10 : Math.round(s / 102.4) / 10;
   }
+  // C 站文件哈希：只取规范的 64 位十六进制 SHA256。桌面端用它做“改名/换目录后仍认得”的
+  // 内容身份回退；不存在就留空，绝不拿别的哈希算法冒充。
+  function fileSha256(f) {
+    try {
+      const h = f && f.hashes;
+      const v = h && (h.SHA256 || h.sha256);
+      const s = str(v).trim().toLowerCase();
+      return /^[a-f0-9]{64}$/.test(s) ? s : '';
+    } catch (_) { return ''; }
+  }
   function nsfwLevelOf(v) { const n = num(v && v.nsfwLevel); return n == null ? null : n; }
   function pickThumb(images, width) {
     const list = Array.isArray(images) ? images : [];
@@ -228,6 +238,11 @@
     const w = num(width) > 0 ? num(width) : DEFAULTS.thumbWidth;
     const files = Array.isArray(ver.files) ? ver.files : [];
     const sizes = files.map(fileMB).filter((x) => x != null);
+    const sha256s = [];
+    for (const f of files) {
+      const sha = fileSha256(f);
+      if (sha && sha256s.indexOf(sha) < 0) sha256s.push(sha);
+    }
     const trainedWords = Array.isArray(ver.trainedWords)
       ? trimArr(ver.trainedWords, DEFAULTS.maxWordsKept)
       : trimArr(str(ver.trainedWords).split(/[,，\s]+/), DEFAULTS.maxWordsKept);
@@ -241,7 +256,9 @@
       largestFileMB: sizes.length ? Math.max.apply(null, sizes) : null,
       files: files.slice(0, Math.max(1, DEFAULTS.maxFilesKept)).map((f) => ({
         name: str(f && f.name) || '', sizeMB: fileMB(f), type: str(f && f.type) || '',
+        sha256: fileSha256(f),
       })),
+      sha256s: sha256s.slice(0, Math.max(1, DEFAULTS.maxFilesKept)),
       thumb: pickThumb(ver.images, w),
       mediaCount: Array.isArray(ver.images) ? ver.images.length : 0,
       publishedAt: str(ver.publishedAt) || str(ver.createdAt) || '',

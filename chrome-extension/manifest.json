@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CivitaiFreeTool 一键下载",
-  "version": "2.3.0",
+  "version": "2.6.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt8xVVAbSOPpVuXibDkwr9wd/97spv7YY1lAMq+lnfKkTxabyOzLn7RGtVIhReXXEPC2tiD+x7mE3mwvwPuKbrOrFQxPrzaRld36DpcWKHzwc30qXUtNx2fPvz8TtDs4xY4aCEJzI3VNGUNtybPMq0jjL8bE1H8jt4k9ipmsv8j7H+t0C++B/BzLGR3RSQZZIfvnOdh6+ldv6UfN7G+z/kcmIEy5YWsd7Pe6Q7tsI/W4Lwn58I8vONBw4CzqiIPWJfQJRLHz+B8mN0Me2TASFmYOzK+578GmD3iNwVIY2KDvzwHsxshFyJnYyo9OHCZ+xa2m37zV+gO/uQzsDw8PObQIDAQAB",
   "description": "模型页一键下载/批量标签页提交到 CivitaiFreeTool；一键归档（封面/配图/评论/模型信息）到本地归档目录，软件离线时降级为浏览器下载",
   "permissions": [
@@ -9,7 +9,10 @@
     "contextMenus",
     "storage",
     "downloads",
-    "offscreen"
+    "offscreen",
+    "sidePanel",
+    "notifications",
+    "alarms"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",
@@ -28,13 +31,20 @@
   "content_scripts": [
     {
       "matches": [
-        "https://civitai.com/models/*",
-        "https://www.civitai.com/models/*",
-        "https://civitai.red/models/*",
-        "https://www.civitai.red/models/*"
+        "https://civitai.com/models*",
+        "https://www.civitai.com/models*",
+        "https://civitai.red/models*",
+        "https://www.civitai.red/models*"
       ],
-      "js": ["lib/util.js", "content/model-page.js"],
-      "css": ["content/content.css"],
+      "js": [
+        "lib/util.js",
+        "lib/model-status.js",
+        "content/model-page.js",
+        "content/list-status.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
       "run_at": "document_idle"
     },
     {
@@ -48,11 +58,22 @@
         "https://civitai.red/posts/*",
         "https://www.civitai.red/posts/*"
       ],
-      "js": ["lib/util.js", "lib/idb.js", "content/image-badge.js"],
-      "css": ["content/content.css"],
+      "js": [
+        "lib/util.js",
+        "lib/idb.js",
+        "lib/model-status.js",
+        "content/image-badge.js",
+        "content/list-status.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
       "run_at": "document_idle"
     }
   ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
   "action": {
     "default_title": "CivitaiFreeTool 一键下载",
     "default_popup": "popup.html",

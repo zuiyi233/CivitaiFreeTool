@@ -27,6 +27,18 @@
 .tab-row .row-state.stale{color:#8a6d3b;border-color:#dccfb4}
 .tab-row.nosub{opacity:.62}
 
+/* ---- 本机下载状态：徽章用色块，不抢「补全状态」的边框徽章视觉 ---- */
+.tab-row .dl-state{display:inline-block;margin-left:4px;padding:0 5px;border-radius:7px;font-size:10px;font-weight:600;color:#fff;background:#6b7280;vertical-align:middle}
+.tab-row .dl-state.dl-downloaded{background:#238b60}
+.tab-row .dl-state.dl-update_available{background:#b26a00}
+.tab-row .dl-state.dl-downloading{background:var(--accent)}
+.tab-row .dl-state.dl-other_version{background:#6b7280}
+.tab-row .dl-state.dl-not_downloaded{background:#6b7280;opacity:.85}
+.tab-row .dl-state.dl-unknown{background:#6b7280;opacity:.7}
+#dlSummary{margin-top:4px}
+#updateBar{margin-top:0}
+#btnSendUpdates{margin-top:0;background:var(--soft);color:#b26a00;border:1px solid var(--line)}
+
 /* ---- 发送到 CFT 之后：任务区。状态点用颜色分「在跑 / 完成 / 失败」，
        文字里再分开写「扩展：已提交」与「CFT：…」，避免把提交当成下载完成 ---- */
 #taskPanel{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
@@ -45,3 +57,13 @@
 .task-item small{display:block;color:var(--dim);font-size:11px;margin-top:2px;overflow-wrap:anywhere}
 .task-item .grow{min-width:0;flex:1}
 button.quiet{background:transparent;border:0;color:var(--dim);font-size:11px;padding:4px 0;margin-top:6px;text-decoration:underline}
+
+/* ---- 阶段二：批量检查更新 / 页面历史 ---- */
+#dlActions{justify-content:flex-start;margin-top:2px}
+#btnCheckUpdates{margin:0;padding:4px 0;text-decoration:none;color:var(--accent)}
+#pageHistoryPanel{margin-top:10px}
+#pageHistoryList{max-height:160px;overflow:auto;margin:6px 0}
+.hist-item{display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-bottom:1px solid var(--line);font-size:11px}
+.hist-item:last-child{border:0}
+.hist-item a{color:var(--accent);text-decoration:none;overflow-wrap:anywhere}
+.hist-item .hist-meta{color:var(--dim);margin-left:auto;white-space:nowrap}

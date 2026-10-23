@@ -4,6 +4,7 @@ window.CftDownloadFiles = (() => {
   const h = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   function close() {
     if (!current) return;
+    if (current._aiOff) current._aiOff();
     current.dialog.remove();
     document.removeEventListener('keydown', current.keydown, true);
     current = null;
@@ -62,6 +63,12 @@ window.CftDownloadFiles = (() => {
       }
     };
     current = {id:row.id,dialog,paused:row.paused,shown:row.shown!==false,ackBusy:false,busy:false,keydown};
+    dialog.dataset.aiOverlay = '1';
+    if (window.CftOverlays) {
+      // 关闭 = 取消本次下载（submit([])），与 Esc/取消按钮同一条安全路径。
+      current._aiOff = window.CftOverlays.register('file_choice', () => submit([]),
+        {group:'dialogs',kind:'file_choice',title:'选择下载文件',el:dialog});
+    }
     document.addEventListener('keydown',keydown,true);
     dialog.querySelectorAll('input').forEach(input=>input.addEventListener('change',()=>{
       pause();

@@ -8,6 +8,8 @@
  */
 (function () {
   var BTN_ID = 'cft-archive-btn';
+  var STATUS_ID = 'cft-status-chip';
+  var MS = (typeof globalThis !== 'undefined' && globalThis.CFT && globalThis.CFT.modelStatus) || null;
   var LABEL_DEFAULT = '🗂 一键归档';
   var RESTORE_DELAY_MS = 3000;
   var ROUTE_SETTLE_MS = 250;     // 路由事件后等 SPA 本轮渲染结束再处理一次
@@ -405,6 +407,7 @@
         setFill(100);
         setLabel('✓ 已归档 ' + (r.dirName || ''));
         showToast('归档完成：' + (r.destDir || r.dirName || ''), false);
+        setTimeout(function () { requestStatus('force'); }, 900);
       } else {
         btn.classList.remove('cft-done');
         btn.classList.add('cft-error');
@@ -437,6 +440,150 @@
         }
       );
     } catch (e) { warn('onArchiveClick failed', e); }
+  }
+
+  /* ================= 页面下载状态胶囊 =================
+   * 位置在归档按钮正上方。先读扩展缓存立即渲染，超过 TTL 才让 bg 去问本机桥；
+   * 点击 = 强制刷新。失败只改胶囊文案，绝不弹错误对话框、不阻断归档/下载。
+   */
+  var statusReqAt = 0, statusReqBusy = false, statusHandledPath = null, lastStatusVersion = '';
+
+  function getStatusChip() {
+    try {
+      var d = doc();
+      return (d && d.getElementById) ? d.getElementById(STATUS_ID) : null;
+    } catch (_) { return null; }
+  }
+
+  function sendBgStatus(payload, cb) {
+    var done = false;
+    var timer = setTimeout(function () {
+      if (done) return;
+      done = true;
+      try { cb(null); } catch (_) {}
+    }, 8000);
+    try {
+      if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) {
+        clearTimeout(timer); done = true; cb(null); return;
+      }
+      chrome.runtime.sendMessage(
+        { __cft: true, to: 'bg', type: 'modelStatusQuery', payload: payload },
+        function (r) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          try { void chrome.runtime.lastError; } catch (_) {}
+          cb(r || null);
+        }
+      );
+    } catch (e) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      cb(null);
+    }
+  }
+
+  function renderStatus(entry, opts) {
+    try {
+      var chip = getStatusChip();
+      if (!chip) return;
+      var lab = (MS && MS.labelOf) ? MS.labelOf(entry, opts || {}) : null;
+      if (!lab) {
+        chip.textContent = '? 状态未知';
+        chip.className = 'cft-status-chip cft-status-unknown';
+        chip.title = '下载状态模块未加载';
+        return;
+      }
+      var offline = !!(entry && entry.offline);
+      chip.textContent = lab.badge + ' ' + lab.text + (offline && entry && entry.state !== 'unknown' ? ' · 离线' : '');
+      chip.className = 'cft-status-chip cft-status-' + lab.state + (offline ? ' cft-status-offline' : '');
+      chip.title = (lab.title || lab.text) + '\n点击强制刷新';
+      chip.dataset.state = lab.state;
+    } catch (e) { warn('renderStatus failed', e); }
+  }
+
+  function requestStatus(mode, opts) {
+    try {
+      var o = opts || {};
+      if (!MS) return;
+      var ids = getCivitaiIdsFromPage();
+      if (!ids.modelId) {
+        renderStatus({ state: 'unknown', reason: '未识别到模型 ID' });
+        return;
+      }
+      var now = Date.now();
+      if (!o.versionChanged && mode !== 'force' && now - statusReqAt < 60000) return;
+      if (statusReqBusy) return;
+      // 后台页/隐藏标签不做联网刷新，但允许读缓存（refresh:false）
+      var effective = (mode !== 'force' && isPageHidden()) ? false : mode;
+      if (effective === false && !MS.getEntry) return;
+      statusReqBusy = true;
+      statusReqAt = now;
+      var vid = ids.modelVersionId || '';
+      var key = vid ? 'version:' + vid : 'model:' + ids.modelId;
+      sendBgStatus({
+        items: [{ key: key, modelId: ids.modelId, versionId: vid, url: safeLocationHref() }],
+        refresh: effective,
+      }, function (r) {
+        statusReqBusy = false;
+        if (!r || r.ok !== true) {
+          renderStatus({ state: 'unknown', reason: (r && (r.error || r.msg)) || '扩展后台无响应' },
+            { offline: !!(r && r.offline) });
+          return;
+        }
+        var entry = (r.items && r.items[0])
+          || (r.byKey && (r.byKey[key] || r.byKey[Object.keys(r.byKey)[0]]));
+        if (!entry) {
+          renderStatus({ state: 'unknown', reason: 'CFT 没有返回这个模型的状态' });
+          return;
+        }
+        lastStatusVersion = vid;
+        renderStatus(entry);
+      });
+    } catch (e) { warn('requestStatus failed', e); }
+  }
+
+  function ensureStatusChip(force) {
+    var path = safePathname();
+    if (!force && path === statusHandledPath) return;
+    try {
+      var d = doc();
+      if (!d || !d.body) return;
+      if (!isModelPath(path)) {
+        var stale = getStatusChip();
+        if (stale) { try { stale.remove(); } catch (_) {} }
+        statusHandledPath = path;
+        return;
+      }
+      var existing = getStatusChip();
+      if (existing) { statusHandledPath = path; return; }
+      var chip = d.createElement('button');
+      chip.id = STATUS_ID;
+      chip.type = 'button';
+      chip.className = 'cft-status-chip cft-status-loading';
+      chip.textContent = '… 查询下载状态';
+      chip.title = '查询这个模型在本机的下载状态';
+      chip.addEventListener('click', function () {
+        requestStatus('force');
+        showToast('正在查询下载状态…', false);
+      });
+      d.body.appendChild(chip);
+      statusHandledPath = path;
+      requestStatus('auto');
+      // 版本 ID 常在首屏后才从下载链接/代码块出现：两次有界复查，避免一直按模型级显示
+      [1500, 4000].forEach(function (ms) {
+        setTimeout(function () {
+          try {
+            if (isPageHidden()) return;
+            var ids = getCivitaiIdsFromPage();
+            if (ids.modelId && ids.modelVersionId && ids.modelVersionId !== lastStatusVersion) {
+              requestStatus('auto', { versionChanged: true });
+            }
+          } catch (_) {}
+        }, ms);
+      });
+    } catch (e) { warn('ensureStatusChip failed', e); statusHandledPath = null; }
   }
 
   function ensureArchiveButton(force) {
@@ -705,6 +852,10 @@
         case 'savedImageDone': {
           return; // 模型页无需处理，安全跳过
         }
+        case 'modelStatusPush': {
+          renderStatus(payload.entry);   // popup/后台刷新后即时更新胶囊，不再多打一轮本机桥
+          return;
+        }
         default: return; // 未知类型：不占用 sendResponse
       }
     } catch (e) { warn('onRuntimeMessage failed', e); }
@@ -744,6 +895,17 @@
 
   function runEnsure() {
     try { ensureArchiveButton(); } catch (e) { warn('ensure failed', e); }
+    try { ensureStatusChip(); } catch (e) { warn('status ensure failed', e); }
+  }
+
+  // 弹层/后台写缓存后同步页面胶囊：只读 storage，不联网
+  function onStatusStorage(changes, area) {
+    try {
+      if (area !== 'local' || !MS || !MS.getEntry || !changes || !changes[MS.CACHE_KEY]) return;
+      var ids = getCivitaiIdsFromPage();
+      var entry = MS.getEntry(changes[MS.CACHE_KEY].newValue, ids.modelId, ids.modelVersionId);
+      if (entry) renderStatus(entry);
+    } catch (e) { warn('status storage sync failed', e); }
   }
 
   // 同一轮 SPA 渲染里的连续路由事件合并成一次处理
@@ -826,7 +988,11 @@
     } catch (_) { /* 忽略 */ }
     try {
       var d = doc();
-      if (d) d.addEventListener('visibilitychange', function () { if (!isPageHidden()) revalidate(); });
+      if (d) d.addEventListener('visibilitychange', function () {
+        if (isPageHidden()) return;
+        revalidate();
+        if (Date.now() - statusReqAt > 60000) requestStatus('auto');
+      });
     } catch (_) { /* 忽略 */ }
   }
 
@@ -834,13 +1000,16 @@
     try {
       var d = doc();
       if (!d) return;
-      ensureArchiveButton();
+      runEnsure();
       wrapHistory('pushState');
       wrapHistory('replaceState');
       armWindowEvents();
       arm();
       if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
         chrome.runtime.onMessage.addListener(onRuntimeMessage);
+      }
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+        chrome.storage.onChanged.addListener(onStatusStorage);
       }
     } catch (e) { warn('init failed', e); }
   }

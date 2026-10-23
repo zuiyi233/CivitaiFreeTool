@@ -153,7 +153,9 @@ function popupWorld(opt = {}) {
   const document = makeDocument(html);
   const stored = opt.stored || {};
   const world = {
-    stored, document, netLog: [], runtimeCalls: [], sent: [], job: null,
+    stored, document, netLog: [], runtimeCalls: [], sent: [], job: null, statusLog: [],
+    revealLog: [],
+    modelStatus: opt.modelStatus || {},
     bridgeOnline: opt.bridgeOnline !== false, apiStatus: opt.apiStatus || {},
     rpc: { tasks: [], parse: { running: false, items: [], finished: true } },
   };
@@ -204,11 +206,37 @@ function popupWorld(opt = {}) {
     const p = new URL(String(u)).pathname;
     if (!world.bridgeOnline) throw new Error('Failed to fetch');
     if (p === '/api/health') return { ok: true, status: 200, body: { ok: true, app: 'CivitaiFreeTool', version: '2.6.30', mode: 'window', window: true } };
+    if (p === '/api/model/status') {
+      const req = JSON.parse((o && o.body) || '{}');
+      world.statusLog.push(req);
+      return { ok: true, status: 200, body: {
+        ok: true, generated_at: Math.floor(Date.now() / 1000),
+        library: { ready: true, scanning: false, count: 4 },
+        updates: { checked_at: Math.floor(Date.now() / 1000), count: 1 },
+        items: (req.items || []).map((it) => Object.assign(
+          { model_id: it.model_id, version_id: it.version_id },
+          world.modelStatus[String(it.version_id)] || world.modelStatus[String(it.model_id)]
+            || { state: 'not_downloaded', reason: '测试里没给这个版本配置状态' })),
+      } };
+    }
+    if (p === '/api/reveal') {
+      const req = JSON.parse((o && o.body) || '{}');
+      world.revealLog.push(req);
+      return { ok: true, status: 200, body: { ok: true, path: req.path } };
+    }
     if (p === '/api/rpc') {
       const req = JSON.parse((o && o.body) || '{}');
       if (req.method === 'get_tasks') return { ok: true, status: 200, body: { result: world.rpc.tasks } };
       if (req.method === 'get_parse_state') return { ok: true, status: 200, body: { result: world.rpc.parse } };
       if (req.method === 'library_check') return { ok: true, status: 200, body: { result: { ok: true, found: false, paths: [] } } };
+      if (req.method === 'mm_check_updates') {
+        world.rpc.check = req.args;
+        return { ok: true, status: 200, body: { result: { started: true, msg: '已开始检查' } } };
+      }
+      if (req.method === 'get_mm_update_state') {
+        return { ok: true, status: 200, body: { result: { running: false, done: 1, total: 1,
+          newer: 1, msg: '检查完成：1 个模型有更新' } } };
+      }
       return { ok: false, status: 400, body: { error: '测试桥不支持：' + req.method } };
     }
     return { ok: false, status: 404, body: { ok: false } };
@@ -244,15 +272,15 @@ function popupWorld(opt = {}) {
 
 (async () => {
   // ============ 1. 共用的纯逻辑模块必须与 chrome 版逐字节相同 ============
-  for (const rel of ['tabs-common.js', 'lib/tabrows.js', 'lib/enrich.js']) {
+  for (const rel of ['tabs-common.js', 'lib/tabrows.js', 'lib/enrich.js', 'lib/model-status.js', 'lib/tab-index.js']) {
     const a = read('chrome-extension/' + rel), b = read('firefox-extension/' + rel);
     assert.equal(b.length, a.length, rel + ' 字节数不同');
     assert.equal(Buffer.compare(a, b), 0, rel + ' 与 chrome 版不是逐字节相同（两份分叉就是下一个 bug 的来源）');
   }
-  ok('firefox-extension 的 tabs-common.js / lib/tabrows.js / lib/enrich.js 与 chrome 版逐字节相同');
+  ok('firefox-extension 的 tabs-common.js / lib/tabrows.js / lib/enrich.js / lib/model-status.js / lib/tab-index.js 与 chrome 版逐字节相同');
   // Firefox 侧不该把归档链路那套（civitai-api/pageFetch/util）拖进来：能力集不同，拖进来就是假功能
-  same(fs.readdirSync(path.join(root, 'firefox-extension', 'lib')).sort(), ['enrich.js', 'tabrows.js'],
-    'firefox-extension/lib 只该有这两个共用模块');
+  same(fs.readdirSync(path.join(root, 'firefox-extension', 'lib')).sort(), ['enrich.js', 'model-status.js', 'tab-index.js', 'tabrows.js'],
+    'firefox-extension/lib 只该有这四个共用模块');
   for (const f of ['content', 'offscreen', 'sidepanel']) {
     assert(!fs.existsSync(path.join(root, 'firefox-extension', f)), 'Firefox 侧不该有 ' + f + ' 目录');
   }
@@ -301,6 +329,9 @@ function popupWorld(opt = {}) {
       .test(stripComments(src)), name + ' 的代码里不该出现依赖归档/页面通道的入口（Firefox 做不到，出现就是假功能）');
   }
   assert(!popupJs.includes('已归档'), 'popup.js 不许把任何状态显示成"已归档"');
+  assert(bgJs.includes("const HISTORY_KEY = 'cftPageHistoryV1'") && bgJs.includes('rememberVisit('),
+    'Firefox 后台也要记录页面历史（弹层「看过但未下载」的数据源）');
+  assert(!/notifications\./.test(stripComments(bgJs)), 'Firefox 版没有 notifications 权限，代码里也不该调用');
   assert(/id="capNote"/.test(popupHtml) && /id="capNoteBatch"/.test(popupHtml) && popupHtml.includes('Chrome'),
     'popup.html 要明说归档只在 Chrome/Edge 版有');
   ok('弹层没有假归档入口：入口不存在、文案直说本浏览器不支持并指向 Chrome/Edge');
@@ -310,8 +341,8 @@ function popupWorld(opt = {}) {
   same(jsIds.filter((i) => !htmlIds.has(i)), [], 'popup.js 引用的控件都在 popup.html 里（共 ' + jsIds.length + ' 个）');
 
   // ============ 3. 弹层跑通：筛选 / 汇总 / 富化徽章 ============
-  same(popupWorld().scriptSrcs, ['tabs-common.js', 'lib/tabrows.js', 'lib/enrich.js', 'popup.js'],
-    'popup.html 的加载顺序必须是 tabs-common → lib/tabrows → lib/enrich → popup');
+  same(popupWorld().scriptSrcs, ['tabs-common.js', 'lib/tabrows.js', 'lib/enrich.js', 'lib/model-status.js', 'popup.js'],
+    'popup.html 的加载顺序必须是 tabs-common → lib/tabrows → lib/enrich → lib/model-status → popup');
 
   const w = popupWorld({ apiStatus: { 101: 401, 303: 429 } });   // 101 匿名被拒、303 限流、202/404 正常
   w.document.fire('DOMContentLoaded');
@@ -391,6 +422,131 @@ function popupWorld(opt = {}) {
   }
   assert(w.runtimeCalls.every((m) => !m.__cft), '不该有归档消息发往 background');
   ok('隐私面实测：富化只连 civitai.com / civitai.red 与本机桥，请求头没有凭据，没有一条归档消息');
+
+  // ============ 3.5 下载状态：徽章 / 筛选 / 只选未下载 / 下载新版 / 离线缓存 ============
+  // 状态机与文案全部来自共用的 lib/model-status.js；这里验证 Firefox 弹层真的把它接到了行、筛选和按钮上。
+  const sw = popupWorld({ modelStatus: {
+    '1001': { state: 'downloaded', matched: 'version', version_matched: true,
+      local: { source: 'library', path: 'D:\\models\\alpha.safetensors',
+        version_id: 1001, version_name: 'v1', model_name: 'Alpha LoRA', exists: true } },
+    '2002': { state: 'update_available', matched: 'version', version_matched: true,
+      local: { version_id: 2002, version_name: 'v1', model_name: 'Beta Checkpoint', exists: true },
+      update: { has_update: true, behind: 1, latest_version: 2099, latest_name: 'v2',
+        latest_url: 'https://civitai.com/models/202?modelVersionId=2099' } },
+    '4004': { state: 'not_downloaded', history: { file_exists: false } },
+    '1303': { state: 'unknown', reason: '模型库还没扫描到这个版本' },
+  } });
+  sw.document.fire('DOMContentLoaded');
+  await sw.wait(() => sw.el('tabList').children.length === 4, '状态世界里列表出现 4 行');
+  const dlLine = () => sw.el('dlSummary').textContent;
+  await sw.wait(() => /已下载 1/.test(dlLine()) && /有更新 1/.test(dlLine()), '状态汇总回来：' + dlLine());
+  assert(dlLine().includes('未下载 1') && dlLine().includes('未知 1'), dlLine());
+  const dlRows = sw.rowsText();
+  assert(dlRows.find((t) => t.includes('Alpha')).includes('✓ 已下载'), dlRows.join('\n'));
+  assert(dlRows.find((t) => t.includes('Beta')).includes('↑ 有更新'), dlRows.join('\n'));
+  assert(dlRows.find((t) => t.includes('Delta')).includes('↓ 未下载'), dlRows.join('\n'));
+  assert(dlRows.find((t) => t.includes('Gamma')).includes('? 未知'), dlRows.join('\n'));
+  const betaRow = dlRows.find((t) => t.includes('Beta'));
+  assert(betaRow.includes('本地 v1') && betaRow.includes('最新 v2'), '行内要说清本地与最新版本：' + betaRow);
+  assert(sw.statusLog.length >= 1 && sw.statusLog.every((r) => Array.isArray(r.items) && r.include_updates === true),
+    '状态查询走本机桥 /api/model/status，且带 include_updates：' + JSON.stringify(sw.statusLog));
+  assert(sw.stored.cftModelStatusV1 && sw.stored.cftModelStatusV1.entries['version:1001'],
+    '状态结果要落扩展缓存，关掉小窗再开还能先显示');
+  ok('下载状态进了 Firefox 弹层：已下载/有更新/未下载/未知各有徽章与汇总，本地与最新版本可见，结果落缓存');
+
+  sw.el('fDl').value = 'downloaded'; sw.el('fDl').dispatch('change');
+  await sw.wait(() => sw.el('tabList').children.length === 1 && sw.rowsText()[0].includes('Alpha'), '按「已下载」筛选');
+  sw.el('fDl').value = 'update'; sw.el('fDl').dispatch('change');
+  await sw.wait(() => sw.el('tabList').children.length === 1 && sw.rowsText()[0].includes('Beta'), '按「有更新」筛选');
+  sw.el('fDl').value = ''; sw.el('fDl').dispatch('change');
+  await sw.wait(() => sw.el('tabList').children.length === 4, '清空下载状态筛选');
+  await sw.el('selectUndownloaded').onclick();
+  assert.equal(sw.el('selectionCount').textContent, '已选 1 / 4', '只勾选确认未下载的页面：' + sw.el('selectionCount').textContent);
+  assert(sw.rowsText()[sw.rowInputs().findIndex((i) => i.checked)].includes('Delta'), '被选中的应只有未下载的 Delta');
+  ok('「按下载状态筛选」与「只选未下载」在 Firefox 弹层生效（状态未知的不会被误选）');
+
+  // 选中 Beta（有更新）→「下载选中项的新版」发的是最新版 URL，而不是页面里的旧版本
+  for (let i = 0; i < 4; i++) {
+    const input = sw.rowInputs()[i];
+    const want = sw.rowsText()[i].includes('Beta');
+    if (input.checked !== want) { input.checked = want; input.dispatch('change'); }
+  }
+  await sw.wait(() => !sw.el('updateBar').hidden, '有更新的选中项要显示「下载选中项的新版」');
+  assert(sw.el('btnSendUpdates').textContent.includes('（1）'), sw.el('btnSendUpdates').textContent);
+  await sw.el('btnSendUpdates').onclick();
+  await sw.wait(() => sw.sent.length === 1, '新版下载请求发出');
+  same(sw.sent[0], ['https://civitai.com/models/202?modelVersionId=2099'], '下载新版必须发 update.latest_url，不是页面里的旧版本');
+  await sw.wait(() => (sw.stored.cftExtTasks && sw.stored.cftExtTasks.items || []).some((it) => it.modelId === '202' && it.versionId === '2099'),
+    '提交跟踪落 storage');
+  const updTask = sw.stored.cftExtTasks.items.find((it) => it.modelId === '202');
+  assert(updTask && updTask.versionId === '2099', '提交跟踪要记下最新版本号：' + JSON.stringify(updTask));
+  ok('「下载选中项的新版」只发最新版 URL，提交跟踪记录的是新版本号（普通发送不会静默换版本）');
+
+  // 离线重开：缓存里的状态必须原样显示，并明确标「CFT 未连接」，绝不能塌成未知/未下载
+  const off = popupWorld({ stored: sw.stored, bridgeOnline: false });
+  off.document.fire('DOMContentLoaded');
+  await off.wait(() => off.el('tabList').children.length === 4, '离线世界里列表仍出现 4 行');
+  await off.wait(() => off.el('dlSummary').textContent.includes('CFT 未连接'), '离线汇总要说明是缓存：' + off.el('dlSummary').textContent);
+  const offRows = off.rowsText();
+  assert(offRows.find((t) => t.includes('Alpha')).includes('✓ 已下载'), '离线时缓存状态必须保留：' + offRows.join('\n'));
+  assert(offRows.find((t) => t.includes('Beta')).includes('↑ 有更新'), '离线时更新状态也要保留：' + offRows.join('\n'));
+  assert(off.el('dlSummary').textContent.includes('上次缓存'), off.el('dlSummary').textContent);
+  off.document.hidden = true; off.document.fire('visibilitychange');
+  sw.document.hidden = true; sw.document.fire('visibilitychange');
+  ok('CFT 离线重开：弹层显示上次缓存（已下载/有更新），明确标「未连接 · 上次缓存」，不把没查到说成未下载');
+
+  // ============ 3.6 阶段二：页面历史 / 检查更新 / 打开目录 ============
+  const ph = popupWorld({
+    stored: {
+      cftPageHistoryV1: { version: 1, savedAt: Date.now(), items: {
+        'version:4004': { key: 'version:4004', modelId: '404', versionId: '4004',
+          firstAt: Date.now() - 5000, lastAt: Date.now() - 1000, count: 2,
+          url: 'https://civitai.com/models/404?modelVersionId=4004', title: 'Delta seen' },
+        'version:1001': { key: 'version:1001', modelId: '101', versionId: '1001',
+          firstAt: Date.now() - 5000, lastAt: Date.now() - 500, count: 1,
+          url: 'https://civitai.red/models/101?modelVersionId=1001', title: 'Alpha seen' },
+      } },
+      cftExtTasks: { at: Date.now(), items: [{ key: 'version:1001', url: TABS[0].url, modelId: '101',
+        versionId: '1001', name: 'Alpha LoRA', sent: true, checkedAt: 0,
+        cft: { phase: 'done', terminal: true, text: '已完成 1',
+          filename: 'Alpha LoRA_v1.safetensors', dest_dir: 'D:\\models' } }] },
+    },
+    modelStatus: {
+      '1001': { state: 'downloaded', matched: 'version', version_matched: true,
+        local: { source: 'library', path: 'D:\\models\\alpha.safetensors',
+          version_id: 1001, version_name: 'v1', model_name: 'Alpha LoRA', exists: true } },
+      '2002': { state: 'not_downloaded' },
+      '4004': { state: 'not_downloaded' },
+      '1303': { state: 'unknown', reason: '模型库还没扫描到这个版本' },
+    },
+  });
+  ph.document.fire('DOMContentLoaded');
+  await ph.wait(() => ph.el('tabList').children.length === 4
+    && /已下载 1/.test(ph.el('dlSummary').textContent), '阶段二世界状态加载');
+  await ph.wait(() => !ph.el('pageHistoryPanel').hidden
+    && ph.el('pageHistoryList').children.length === 1, '页面历史只剩未下载的一条');
+  const histText = ph.el('pageHistoryList').textContent;
+  assert(histText.includes('Delta seen') && !histText.includes('Alpha seen'),
+    '已下载的页面不该留在「看过但未下载」：' + histText);
+  await ph.el('clearPageHistory').onclick();
+  same(ph.stored.cftPageHistoryV1.items, {}, '清除页面历史只清扩展记录');
+  assert.equal(ph.el('pageHistoryPanel').hidden, true);
+  ok('Firefox 页面历史：只列看过未下载、已下载被过滤、一键清除');
+
+  await ph.wait(() => !ph.el('btnCheckUpdates').disabled, '检查更新按钮可用');
+  await ph.el('btnCheckUpdates').onclick();
+  same(ph.rpc.check, [false, ['D:\\models\\alpha.safetensors']], '只把模型库命中的本地路径交给 mm_check_updates');
+  assert(/检查完成/.test(ph.el('feedback').textContent), ph.el('feedback').textContent);
+  ok('Firefox 一键检查更新：直连桥 mm_check_updates + 轮询进度，完成后刷新状态');
+
+  await ph.wait(() => ph.el('taskList').find((c) => c.tagName === 'BUTTON').length === 1,
+    '任务行出现「打开目录」按钮');
+  ph.el('taskList').find((c) => c.tagName === 'BUTTON')[0].dispatch('click');
+  await ph.wait(() => ph.revealLog.length === 1, '打开目录请求应发到 /api/reveal');
+  same(ph.revealLog[0], { path: 'D:\\models' }, '只发桌面登记的 dest_dir');
+  await ph.wait(() => ph.el('feedback').textContent.includes('已在文件管理器中打开'), '打开目录的成功文案');
+  ph.document.hidden = true; ph.document.fire('visibilitychange');
+  ok('Firefox 任务行「打开目录」：直连 /api/reveal，路径来自 CFT 任务落点');
 
   // ============ 4. 任务区：精确发送 + CFT 侧状态 + 跨窗口恢复 ============
   // speed/downloaded/total 一律字节口径（与 downloader.DownloadTask 一致）
@@ -472,7 +628,7 @@ function popupWorld(opt = {}) {
   await fb.el('sendBatch').onclick();
   same(fb.sent, [['https://civitai.red/models/101/a?modelVersionId=1001', 'https://civitai.com/models/202?modelVersionId=2002',
     'https://civitai.red/models/303', 'https://civitai.com/models/404?modelVersionId=4004']], '兜底路径下发送集合仍然正确（token 被剥）');
-  assert.equal(fb.el('taskList').children.length, 4, '任务区不依赖 lib，兜底时照样能跟踪');
+  assert.equal(fb.el('taskList').children.length, 4, '任务区不依赖 lib，兜底时照样能跟踪；feedback=' + fb.el('feedback').textContent);
   fb.document.hidden = true; fb.document.fire('visibilitychange');
   cb.document.hidden = true; cb.document.fire('visibilitychange');
   ok('lib 没加载成功时退回 CftTabs.candidates：列表、搜索、发送、任务区全部照常，只是没有汇总与富化');
@@ -551,6 +707,22 @@ function popupWorld(opt = {}) {
           if (url.indexOf('127.0.0.1:47531') >= 0) {
             const p = new URL(url).pathname;
             if (p === '/api/health') return { ok: true, status: 200, json: async () => ({ ok: true, app: 'CivitaiFreeTool', version: '2.6.30', mode: 'window', window: true }) };
+            if (p === '/api/model/status') {
+              const req = JSON.parse((o && o.body) || '{}');
+              const MAP = {
+                1001: { state: 'downloaded', local: { version_id: 1001, version_name: 'v1', model_name: 'Alpha LoRA', exists: true } },
+                2002: { state: 'update_available', local: { version_id: 2002, version_name: 'v1', model_name: 'Beta Checkpoint', exists: true },
+                  update: { has_update: true, behind: 1, latest_version: 2099, latest_name: 'v2', latest_url: 'https://civitai.com/models/202?modelVersionId=2099' } },
+                4004: { state: 'not_downloaded' },
+              };
+              return { ok: true, status: 200, json: async () => ({
+                ok: true, generated_at: Math.floor(Date.now() / 1000),
+                library: { ready: true, scanning: false, count: 3 },
+                updates: { checked_at: Math.floor(Date.now() / 1000), count: 1 },
+                items: (req.items || []).map((it) => Object.assign({ model_id: it.model_id, version_id: it.version_id },
+                  MAP[String(it.version_id)] || { state: 'unknown', reason: '测试里的 Gamma 没有状态' })),
+              }) };
+            }
             if (p === '/api/rpc') {
               const req = JSON.parse((o && o.body) || '{}');
               if (req.method === 'get_tasks') return { ok: true, status: 200, json: async () => ({ result: window.__tasks || [] }) };
@@ -576,12 +748,18 @@ function popupWorld(opt = {}) {
         };
       });
       const page = await context.newPage();
-      const errors = [];
+      const errors = [], dialogs = [];
       page.on('pageerror', (e) => errors.push(e.message));
+      page.on('dialog', async (d) => { dialogs.push(d.message()); await d.accept(); });
       await page.goto('http://127.0.0.1:' + port + '/popup.html');
       await page.waitForFunction(() => document.querySelectorAll('.tab-row').length === 4);
-      // 富化是异步的：先等"这一轮结束"的汇总行出现（中途它是"联网补全中 x/y"的进度文本）
-      await page.waitForFunction(() => /信息补全 \d+\/\d+/.test(document.querySelector('#enrichSummary').textContent));
+      // 富化是异步的：先读缓存（peek）也会出现「信息补全 x/y」，必须等联网这一轮真结束
+      // （进度文本是「联网补全中…」，完成后的汇总才有「本次联网」/「缓存命中」等明细）
+      await page.waitForFunction(() => {
+        const t = document.querySelector('#enrichSummary').textContent;
+        return /信息补全 \d+\/\d+/.test(t) && !t.includes('联网补全中')
+          && (t.includes('本次联网') || t.includes('缓存命中'));
+      });
       const sum = await page.textContent('#tabSummary');
       assert(sum.includes('共 9 个标签页') && sum.includes('可提交模型页 5') && sum.includes('非 C 站已忽略 1'), sum);
       const enLine = await page.textContent('#enrichSummary');
@@ -593,6 +771,23 @@ function popupWorld(opt = {}) {
       assert.equal(await page.locator('.tab-row img.thumb').count(), 2, '两个补全成功的模型页要画出缩略图');
       const typeOpts = await page.$$eval('#fType option', (els) => els.map((e) => e.value).filter(Boolean));
       same(typeOpts, ['CheckPoint', 'Lora'], '类型筛选项由富化结果生成：' + typeOpts.join(','));
+      // 下载状态（真 DOM）：徽章要画在行里、汇总要出数、筛选要真的收敛列表
+      await page.waitForFunction(() => document.querySelectorAll('.tab-row .dl-state').length === 4
+        && /已下载 1/.test(document.querySelector('#dlSummary').textContent));
+      const dlSum = await page.textContent('#dlSummary');
+      assert(dlSum.includes('有更新 1') && dlSum.includes('未下载 1') && dlSum.includes('未知 1'), dlSum);
+      const badges = await page.$$eval('.tab-row .dl-state', (els) => els.map((e) => e.textContent));
+      assert(badges.some((t) => t.includes('已下载')) && badges.some((t) => t.includes('有更新'))
+        && badges.some((t) => t.includes('未下载')), '下载状态徽章：' + badges.join(','));
+      await page.locator('#modeBatch').click();   // 下载筛选控件在批量面板里
+      await page.selectOption('#fDl', 'downloaded');
+      await page.waitForFunction(() => document.querySelectorAll('.tab-row').length === 1);
+      assert((await page.textContent('.tab-row')).includes('Alpha'), '按「已下载」筛选只剩 Alpha');
+      await page.selectOption('#fDl', '');
+      await page.waitForFunction(() => document.querySelectorAll('.tab-row').length === 4);
+      assert.equal(await page.locator('#updateBar').isVisible(), true, '选中「有更新」的行时应出现新版按钮');
+      assert((await page.textContent('#btnSendUpdates')).includes('（1）'), await page.textContent('#btnSendUpdates'));
+      await page.locator('#modeCurrent').click();
       // 「本浏览器做不到」的说明必须真的可见，而不是藏在 DOM 里（批量列表默认在"批量标签页"面板里）
       await page.locator('#modeBatch').click();
       assert(await page.locator('#batchPanel').isVisible(), '批量面板应可切到');
@@ -619,6 +814,8 @@ function popupWorld(opt = {}) {
       assert((await page.textContent('#sendBatch')).includes('发送选中 3 项'), await page.textContent('#sendBatch'));
       await page.locator('#sendBatch').click();
       await page.waitForFunction(() => window.sent.length === 1);
+      assert(dialogs.some((m) => m.includes('有更新') && m.includes('下载选中项的新版')),
+        '普通发送命中「有更新」的行时要先确认并指出新版按钮：' + JSON.stringify(dialogs));
       same(await page.evaluate(() => window.sent[0]),
         ['https://civitai.red/models/101/a?modelVersionId=1001', 'https://civitai.com/models/202?modelVersionId=2002', 'https://civitai.com/models/404?modelVersionId=4004'],
         '真浏览器里发送集合 = 勾选集合，token/追踪参数被剥掉');

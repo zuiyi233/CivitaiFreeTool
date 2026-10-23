@@ -180,6 +180,137 @@ class BridgeTest(unittest.TestCase):
             browser_bridge.set_download_handler(self._fake_dl)
 
 
+class TabIndexBridgeTest(unittest.TestCase):
+    """POST/GET /api/ext/tabs：只收 C 站模型页、只存内存、来源/大小/URL 校验。"""
+
+    def setUp(self):
+        boot_bridge()
+        with browser_bridge._TAB_INDEX_LOCK:
+            browser_bridge._TAB_INDEX.update(
+                {"at": 0.0, "source": "", "ext_version": "", "counts": {}, "rows": []})
+        with browser_bridge._EXT_DEV_LOCK:
+            browser_bridge._EXT_DEV.update({"reload_at": 0.0, "pushed_at": 0.0})
+
+    @staticmethod
+    def _payload():
+        return {
+            "v": 1,
+            "source": "chrome-extension",
+            "ext_version": "2.6.1",
+            "counts": {"tabs": 100, "civitai": 8, "models": 2, "windows": 1, "discarded": 1},
+            "tabs": [
+                {"tabId": 11, "windowId": 7, "title": "Live Wallpaper Style | Civitai",
+                 "url": "https://civitai.red/models/1264662/live-wallpaper-style"
+                        "?modelVersionId=3351608&utm_source=x#frag",
+                 "modelId": "1264662", "versionId": "3351608", "pinned": True},
+                {"tabId": 12, "windowId": 7, "title": "Other Model",
+                 "url": "https://www.civitai.com/models/999/other",
+                 "modelId": "999", "discarded": True},
+                {"tabId": 13, "windowId": 7, "title": "bad host",
+                 "url": "https://example.com/models/1"},
+                {"tabId": 14, "windowId": 7, "title": "bad path",
+                 "url": "https://civitai.red/models"},
+                {"tabId": 15, "windowId": 7, "title": "bad version",
+                 "url": "https://civitai.red/models/1/x?modelVersionId=abc"},
+            ],
+        }
+
+    def test_push_and_search(self):
+        st, d = req("/api/ext/tabs", "POST", self._payload(),
+                    origin="chrome-extension://cljlgpakghbofcdjbimchcmefdfnfdii")
+        self.assertEqual(st, 200, d)
+        self.assertEqual(d["accepted"], 2)
+        self.assertEqual(d["rejected"], 3)
+
+        st, d = req("/api/ext/tabs?q=wallpaper")
+        self.assertEqual(st, 200)
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["stale"])
+        self.assertEqual(d["counts"]["models"], 2)
+        self.assertEqual(d["ext_version"], "2.6.1")
+        self.assertEqual(d["total"], 1)
+        row = d["items"][0]
+        self.assertEqual(row["title"], "Live Wallpaper Style")
+        self.assertEqual(row["url"],
+                         "https://civitai.red/models/1264662/live-wallpaper-style"
+                         "?modelVersionId=3351608")
+        self.assertEqual(row["modelId"], "1264662")
+        self.assertEqual(row["versionId"], "3351608")
+        self.assertTrue(row["pinned"])
+
+    def test_discarded_and_window_filters(self):
+        req("/api/ext/tabs", "POST", self._payload(), origin="chrome-extension://abc")
+        st, d = req("/api/ext/tabs?q=999")
+        self.assertEqual(d["total"], 0)
+        st, d = req("/api/ext/tabs?q=999&include_discarded=1")
+        self.assertEqual(d["total"], 1)
+        self.assertTrue(d["items"][0]["discarded"])
+        st, d = req("/api/ext/tabs?window_id=8")
+        self.assertEqual(d["total"], 0)
+        st, d = req("/api/ext/tabs?limit=1&include_discarded=1")
+        self.assertEqual(d["total"], 2)
+        self.assertEqual(len(d["items"]), 1)
+
+    def test_stale_and_empty_hints(self):
+        st, d = req("/api/ext/tabs")
+        self.assertTrue(d["stale"])
+        self.assertEqual(d["at"], 0)
+        self.assertIn("尚未上报", d["hint"])
+        req("/api/ext/tabs", "POST", self._payload(), origin="chrome-extension://abc")
+        with browser_bridge._TAB_INDEX_LOCK:
+            browser_bridge._TAB_INDEX["at"] = time.time() - 500
+        st, d = req("/api/ext/tabs")
+        self.assertTrue(d["stale"])
+        self.assertIn("已过期", d["hint"])
+
+    def test_reject_foreign_origin_and_bad_version(self):
+        st, d = req("/api/ext/tabs", "POST", self._payload(),
+                    origin="https://evil.example.com")
+        self.assertEqual(st, 403)
+        st, d = req("/api/ext/tabs", "POST", {"v": 2, "tabs": []},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400)
+        st, d = req("/api/ext/tabs", "POST", {"v": 1, "tabs": [{"url": "https://x"}]},
+                    origin="chrome-extension://abc")
+        self.assertEqual(st, 400)
+
+    def test_dev_reload_flag_roundtrip(self):
+        st, d = req("/api/ext/dev/state")
+        self.assertEqual(st, 200)
+        self.assertEqual(d["reload_at"], 0)
+        st, d = req("/api/ext/dev/reload", "POST", {}, origin=None)
+        self.assertEqual(st, 200, d)
+        reload_at = d["reload_at"]
+        self.assertGreater(reload_at, 0)
+        st, state = req("/api/ext/dev/state")
+        self.assertTrue(state["pending"], "还没有新的索引上报")
+        st, pushed = req("/api/ext/tabs", "POST", self._payload(),
+                         origin="chrome-extension://abc")
+        self.assertEqual(st, 200, pushed)
+        self.assertEqual(pushed["dev_reload_at"], reload_at)
+        st, state = req("/api/ext/dev/state")
+        self.assertFalse(state["pending"])
+        self.assertGreaterEqual(state["pushed_at"], reload_at)
+        self.assertEqual(state["extension"]["ext_version"], "2.6.1")
+
+    def test_dev_reload_rejects_web_origin(self):
+        st, d = req("/api/ext/dev/reload", "POST", {}, origin="https://evil.example.com")
+        self.assertEqual(st, 403, d)
+
+    def test_dev_state_does_not_leak_urls(self):
+        req("/api/ext/tabs", "POST", self._payload(), origin="chrome-extension://abc")
+        st, d = req("/api/ext/dev/state")
+        self.assertEqual(st, 200)
+        self.assertNotIn("civitai.red/models", json.dumps(d))
+
+    def test_reject_oversize_body(self):
+        payload = {"v": 1, "tabs": [{"title": "x" * (browser_bridge.TAB_INDEX_MAX_BYTES + 1),
+                                     "url": "https://civitai.red/models/1"}]}
+        st, d = req("/api/ext/tabs", "POST", payload, origin="chrome-extension://abc")
+        self.assertEqual(st, 413)
+        self.assertEqual(d["limit_bytes"], browser_bridge.TAB_INDEX_MAX_BYTES)
+
+
 class SyncEnqueueTest(unittest.TestCase):
     """dl_enqueue_url_sync：同步解析 + 真实入队（FakeAPI，不碰网络与磁盘）"""
 
@@ -675,6 +806,70 @@ class ArchiveBridgeTest(unittest.TestCase):
         for bad in ("..\\evil", "C:\\x", "\\\\srv\\share", "../x", "C:/evil/x", "/abs/x"):
             with self.assertRaises(ValueError, msg=bad):
                 webui.Api._safe_archive_path(root, bad)
+
+    def test_model_status_endpoint(self):
+        seen = []
+
+        def fake(items, include_updates=True):
+            seen.append((items, include_updates))
+            return {"items": [{"state": "downloaded"}], "library": {"ready": True},
+                    "updates": {"checked_at": 0, "available": False, "records": 0}}
+
+        # 前面的用例可能实例化过真实 Api（它会注册状态入口）：先清掉再验证未就绪分支
+        browser_bridge.set_model_status_handler(None)
+        st, d = req("/api/model/status", "POST", {"items": []}, origin="chrome-extension://abc")
+        self.assertEqual(st, 500)  # 未注册 handler：明确报未就绪
+        self.assertFalse(d["ok"])
+        browser_bridge.set_model_status_handler(fake)
+        try:
+            st, d = req("/api/model/status", "POST",
+                        {"items": [{"model_id": "101", "version_id": "1001"}], "include_updates": False},
+                        origin="chrome-extension://abc")
+            self.assertEqual(st, 200)
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["items"][0]["state"], "downloaded")
+            self.assertEqual(seen[0], ([{"model_id": "101", "version_id": "1001"}], False))
+            st, d = req("/api/model/status", "POST", {"items": "nope"}, origin="chrome-extension://abc")
+            self.assertEqual(st, 400)
+            st, d = req("/api/model/status", "POST", {"items": [{}] * 501}, origin="chrome-extension://abc")
+            self.assertEqual(st, 400)
+            st, d = req("/api/model/status", "POST", {"items": []}, origin="https://evil.example")
+            self.assertEqual(st, 403)
+        finally:
+            browser_bridge.set_model_status_handler(None)
+
+    def test_reveal_endpoint(self):
+        seen = []
+
+        def fake(path):
+            seen.append(path)
+            return {"ok": True, "path": path}
+
+        browser_bridge.set_reveal_handler(None)
+        st, d = req("/api/reveal", "POST", {"path": self.tmp}, origin="chrome-extension://abc")
+        self.assertEqual(st, 503)
+        self.assertFalse(d["ok"])
+        browser_bridge.set_reveal_handler(fake)
+        try:
+            st, d = req("/api/reveal", "POST", {"path": self.tmp}, origin="moz-extension://abc")
+            self.assertEqual(st, 200, d)
+            self.assertTrue(d["ok"])
+            self.assertEqual(seen, [self.tmp])
+            st, d = req("/api/reveal", "POST", {"path": "  "}, origin="chrome-extension://abc")
+            self.assertEqual(st, 400)
+            st, d = req("/api/reveal", "POST", {"path": 123}, origin="chrome-extension://abc")
+            self.assertEqual(st, 400)
+            st, d = req("/api/reveal", "POST", {"path": "x" * 5000}, origin="chrome-extension://abc")
+            self.assertEqual(st, 400)
+            st, d = req("/api/reveal", "POST", {"path": self.tmp}, origin="https://evil.example")
+            self.assertEqual(st, 403)
+            # 白名单拒绝由 Api 返回 ok:false → 桥统一 403，不伪装成功
+            browser_bridge.set_reveal_handler(lambda p: {"ok": False, "msg": "路径未登记，拒绝打开"})
+            st, d = req("/api/reveal", "POST", {"path": "C:/Windows"}, origin="chrome-extension://abc")
+            self.assertEqual(st, 403)
+            self.assertIn("未登记", d["msg"])
+        finally:
+            browser_bridge.set_reveal_handler(None)
 
     def test_check_found(self):
         with open(os.path.join(self.tmp, "hit.civitai.info"), "w", encoding="utf-8") as f:

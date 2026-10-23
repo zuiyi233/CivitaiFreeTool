@@ -435,6 +435,12 @@ class Downloader:
                 ((task.info or {}).get("manual_binding") or {}).get('actual_sha256') == task.actual_sha256 and task.actual_sha256 else None,
             "modelName": (task.info or {}).get("modelName", ""),
             "versionName": (task.info or {}).get("versionName", ""),
+            # C 站身份：模型库扫描未必覆盖历史落点（文件被移出模型根/改名），扩展的下载状态
+            # 需要靠这两列把「历史里下过」与「页面上这个版本」对上。老历史缺列时由
+            # webui._status_history_meta 从 history_assets 快照回填。
+            "model_id": str((task.info or {}).get("model_id") or ""),
+            "version_id": str((task.info or {}).get("version_id") or ""),
+            "model_url": str((task.info or {}).get("url") or previous.get("model_url") or ""),
             # 分流落点与「为什么分流/为什么没分流」：历史列表要能如实显示（dest_dir 已是最终落点）
             "routed_dir": (task.info or {}).get("routed_dir", ""),
             "route_reason": (task.info or {}).get("route_reason", ""),

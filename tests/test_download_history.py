@@ -51,6 +51,20 @@ class DownloadHistoryTests(unittest.TestCase):
         self.assertEqual(len(other.get_history()), 1)
         self.assertNotIn("signature", json.dumps(other.get_history()))
 
+    def test_completed_history_keeps_civitai_identity(self):
+        """扩展下载状态靠历史行里的 model_id/version_id 把“历史下过”与页面版本对上。"""
+        task = downloader.DownloadTask(
+            "https://civitai.red/api/download/models/1001", str(self.root), "demo.safetensors",
+            info={"model_id": "101", "version_id": "1001", "modelName": "Demo",
+                  "versionName": "v1", "url": "https://civitai.red/models/101"})
+        self.dl.add_task(task)
+        self.finish(task)
+        row = self.dl.get_history()[0]
+        self.assertEqual(row["model_id"], "101")
+        self.assertEqual(row["version_id"], "1001")
+        self.assertEqual(row["model_url"], "https://civitai.red/models/101")
+        self.assertNotIn("signature", json.dumps(row))
+
     def test_clear_queue_keeps_history_across_restarts(self):
         task = self.task()
         self.dl.add_task(task)
@@ -162,6 +176,25 @@ class DownloadHistoryTests(unittest.TestCase):
             api = webui.Api()
         self.assertEqual(api.get_tasks()[0]["id"], task.id)
         self.assertEqual(api.get_download_history()["items"][0]["id"], task.id)
+
+    def test_web_api_exposes_hash_verdict(self):
+        import webui
+        task = downloader.DownloadTask("https://example.invalid/download?signature=fixture",
+                                       str(self.root), "example.safetensors",
+                                       expected_sha256="AA" * 32)
+        task.actual_sha256 = "aa" * 32
+        task.verification_status = "verified"
+        self.dl.add_task(task)
+        self.finish(task)
+        with patch.object(config, "load", return_value={}), patch.object(webui.Api, "_new_api"), \
+             patch.object(webui.Api, "_load_updates", return_value={}), \
+             patch.object(webui.browser_bridge, "start"), patch.object(webui.browser_bridge, "set_api"), \
+             patch.object(webui.browser_bridge, "set_download_handler"):
+            api = webui.Api()
+        row = api.get_tasks()[0]
+        self.assertEqual(row["expected_sha256"], "AA" * 32)
+        self.assertEqual(row["actual_sha256"], "aa" * 32)
+        self.assertEqual(row["verification_status"], "verified")
 
 
 if __name__ == "__main__":

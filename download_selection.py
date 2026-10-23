@@ -2,6 +2,7 @@
 import threading
 import time
 import uuid
+from collections import deque
 
 
 class FileChoiceBroker:
@@ -10,6 +11,16 @@ class FileChoiceBroker:
         self.gate = threading.Lock()
         self.lock = threading.Lock()
         self.pending = None
+        self.choice_rev = 0
+        self.choice_log = deque(maxlen=50)
+
+    def _record_locked(self, event, choice_id, **extra):
+        self.choice_rev += 1
+        row = {"rev": self.choice_rev, "event": event, "id": choice_id,
+               "at": time.monotonic()}
+        row.update({k: v for k, v in extra.items() if v is not None})
+        self.choice_log.append(row)
+        return row
 
     def choose(self, files, title, policy='ask'):
         if not files:
@@ -27,6 +38,7 @@ class FileChoiceBroker:
                  'result': None, 'event': threading.Event()}
             with self.lock:
                 self.pending = row
+                self._record_locked('pending', row['id'], files_count=len(row['files']))
             while not row['event'].wait(.05):
                 with self.lock:
                     if row['deadline'] is not None and not row['paused'] and time.monotonic() >= row['deadline']:
@@ -39,6 +51,8 @@ class FileChoiceBroker:
             with self.lock:
                 result = row['result'] or []
                 self.pending = None
+                self._record_locked('resolved', row['id'],
+                                    selected_count=len(result), cancelled=not result)
             return [files[i] for i in result]
 
     def get(self):
@@ -49,6 +63,18 @@ class FileChoiceBroker:
             return {k: row[k] for k in ('id', 'title', 'files', 'paused')} | {
                 'shown': row['deadline'] is not None,
                 'seconds': max(0, row['deadline'] - time.monotonic()) if row['deadline'] is not None else self.timeout}
+
+    def revision(self):
+        with self.lock:
+            return int(self.choice_rev)
+
+    def transitions(self, since=0):
+        try:
+            since = int(since)
+        except (TypeError, ValueError):
+            since = 0
+        with self.lock:
+            return [dict(row) for row in self.choice_log if int(row.get('rev') or 0) > since]
 
     def acknowledge(self, identity):
         """Start the default timer only once the visible UI has actually shown the dialog."""

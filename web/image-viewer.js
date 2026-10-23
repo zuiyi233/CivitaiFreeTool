@@ -1,6 +1,6 @@
 /* 图片大图层与来源生成数据。不执行 ComfyUI 节点，不猜测缺失参数。 */
 "use strict";
-let imageViewer = null, imageViewerRequest = 0, historyFocusRequest = 0;
+let imageViewer = null, imageViewerRequest = 0, historyFocusRequest = 0, imageViewerAiOff = null;
 const viewerDecodedCache=new Map(),VIEWER_CACHE_BYTES=96*1024*1024,VIEWER_CACHE_COUNT=6;
 let viewerCacheAccount=null,viewerCacheEpoch=0;
 const viewerWarmRequests=new Map();
@@ -74,6 +74,7 @@ function displayViewerEntry(v,c,entry,memory){
 const imageText = value => value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value,null,2);
 function closeImageViewer() {
   imageViewerRequest++;
+  if (imageViewerAiOff) { imageViewerAiOff(); imageViewerAiOff = null; }
   if (!imageViewer) return;
   const {root,keyHandler,focus,entry} = imageViewer;
   const video=root.querySelector('video');if(video&&typeof video.pause==='function')video.pause();   // 关闭查看器时暂停视频
@@ -101,6 +102,7 @@ async function openImageViewer(detail,index=0) {
     }
   };
   imageViewer={root,detail,index,zoom:1,targetZoom:1,zoomRaf:0,focus,keyHandler,full:null};
+  if(window.CftOverlays){imageViewerAiOff=window.CftOverlays.register('image_viewer',closeImageViewer,{group:'media',kind:'media',title:'图片查看器',blocking:false,el:root});}
   document.addEventListener('keydown',keyHandler,true);
   root.querySelector('#ivClose').onclick=closeImageViewer;
   root.querySelector('.iv-prev').onclick=()=>loadViewerImage(imageViewer.index-1);

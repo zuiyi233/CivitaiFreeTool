@@ -1,0 +1,12 @@
+{
+  "_comment": "Paste this mcpServers block into claude_desktop_config.json. Replace C:\\Program Files\\CivitaiFreeTool\\CivitaiFreeToolMCP.exe with your installed sidecar. This is the stdio example; for Streamable HTTP use http://127.0.0.1:47532/mcp with 'Authorization: Bearer <token>'. Never commit a real token.",
+  "mcpServers": {
+    "civitai-free-tool": {
+      "command": "C:\\Program Files\\CivitaiFreeTool\\CivitaiFreeToolMCP.exe",
+      "args": ["--stdio", "--toolsets", "core,vision"],
+      "env": {
+        "CFT_BRIDGE_URL": "http://127.0.0.1:47531"
+      }
+    }
+  }
+}

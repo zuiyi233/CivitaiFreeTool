@@ -6,11 +6,20 @@ const CT = globalThis.CftTabs || {};
 // 这两个模块是纯逻辑/纯取数，缺任一个都只该让"筛选"或"补全"降级，不该让列表消失。
 const ROWS = globalThis.CftRows || {};
 const ENRICH = (globalThis.CFT && globalThis.CFT.enrich) || {};
+const MS = (globalThis.CFT && globalThis.CFT.modelStatus) || null;
 const BRIDGE = 'http://127.0.0.1:47531';
+const SIDE = globalThis.__CFT_SIDE_PANEL__ === true;
 const TASK_KEY = 'cftExtTasks';   // 「发送到 CFT 之后」的跟踪快照：必须过 storage，小窗关掉再开还在
+const HISTORY_KEY = 'cftPageHistoryV1';   // 页面级历史：只看过哪些模型页，与下载历史无关
 let tabs = [], rows = [], selected = new Set(), seenKeys = new Set(), firstRows = true, active = null, job = null, online = false, busy = false, refreshSerial = 0;
 let built = { rows: [], others: [], summary: null }, enrichSummary = null, enriching = false;
 let taskState = { at: 0, items: [] };
+let pageHistory = [], historyLoading = false, checkingUpdates = false;
+// 下载状态：loaded=false 时“未知”筛选不生效、徽章不出现，避免把“还没查”画成“未下载”
+let dlMeta = { loaded: false, at: 0, offline: false, error: '', library: null, updates: null };
+let dlRefreshing = false, dlQueued = null, dlRetry = 0, lastTaskTerminalSig = '';
+// 连接探测结论：缓存没到期时不会再问桥，但桥已经连不上就得把「这是上次缓存」说出来
+let statusHealthOffline = false;
 // cftState.reason: connecting | ok | offline | not-cft | too-old —— 三种「不在线」要给用户不同动作
 let cftState = {ok:false, reason:'connecting', version:''};
 const blockedSet = j => new Set([...(j?.completedKeys || []),...(j?.items || []).filter(r => ['sent','sending','waiting','uncertain'].includes(r.status)).map(r => r.key)]);
@@ -55,6 +64,33 @@ function updateButtons() {
   $('btnArchive').disabled = lock || !active;
   $('btnArchiveBatch').disabled = lock || !count;
   $('btnArchiveBatch').textContent = `🗂 批量归档选中 ${count} 页`;
+  // 有更新才展示「下载新版」：只发更新记录里的 latest URL，普通发送不会自动换版本
+  const updatePicked = MS ? rows.filter(r => selected.has(r.key) && r.dl && r.dl.update
+    && r.dl.update.has_update && r.dl.update.latest_url) : [];
+  const updateBar = $('updateBar'), updateBtn = $('btnSendUpdates');
+  if (updateBar) updateBar.hidden = !updatePicked.length;
+  if (updateBtn) {
+    updateBtn.disabled = lock || !online || !updatePicked.length;
+    updateBtn.textContent = `⬆ 下载选中项的新版（${updatePicked.length}）`;
+    updateBtn.title = online
+      ? '只发送这些模型最新版本的下载页（最新版换底模时沿用 CFT 的判定，仍以记录里的版本为准）'
+      : OFFLINE_HINT;
+  }
+  const selectNot = $('selectUndownloaded');
+  if (selectNot) {
+    selectNot.disabled = lock || !MS || !dlMeta.loaded
+      || !rows.some(r => MS.categoryOf(r.dl) === 'not');
+  }
+  const checkBtn = $('btnCheckUpdates');
+  if (checkBtn) {
+    checkBtn.disabled = lock || checkingUpdates || !MS || !dlMeta.loaded || !online
+      || !localPathsForUpdateCheck().length;
+    checkBtn.title = !online ? OFFLINE_HINT
+      : checkingUpdates ? '正在检查更新，请稍候…'
+      : !dlMeta.loaded ? '下载状态还在查询，请稍候'
+      : !localPathsForUpdateCheck().length ? '当前列表没有模型库命中的本地模型；需要用 CFT 模型库扫描到这些文件后才能检查'
+      : '对本机模型库命中的模型批量检查 C 站更新（需要 CFT 里已保存 API Key；不会自动下载）';
+  }
   // 按钮被禁用时要说清「为什么」和「怎么办」；缺 Key 是提示态，不做成红色失败
   const needsKey = online && jobNeedsKey();
   const hint = !online ? OFFLINE_HINT : needsKey ? KEY_HINT : '';
@@ -77,6 +113,10 @@ function currentFilters() {
   if (s) f.states = [s];
   return f;
 }
+// 下载状态筛选在本地做（数据来自本机 CFT，不属于 enrich 的补全状态）
+function currentDlFilter() {
+  return $('fDl') ? $('fDl').value : '';
+}
 function visibleRows() {
   const f = currentFilters();
   let list = typeof ROWS.applyFilters === 'function' ? ROWS.applyFilters(rows, f) : rows.filter(r => !f.q || (r.title + ' ' + r.url).toLowerCase().includes(f.q.toLowerCase()));
@@ -85,14 +125,20 @@ function visibleRows() {
   const sub = $('fSub') ? $('fSub').value : '';
   if (sub === 'yes') list = list.filter(r => r.submittable !== false);
   else if (sub === 'no') list = list.filter(r => r.submittable === false);
+  const dl = currentDlFilter();
+  // 状态还没查回来时不做下载筛选，否则一打开弹层选择“已下载”就会把列表筛空
+  if (dl && dlMeta.loaded && MS) list = list.filter(r => MS.categoryOf(r.dl) === dl);
   return typeof ROWS.sortRows === 'function' ? ROWS.sortRows(list, $('sort') ? $('sort').value : 'tab') : list;
 }
 // 列表 DOM 只取决于：可见行集合 + 筛选/排序控件 + 被占用（blocked）的 key + 是否有批次在跑。
 // 轮询期间逐项 status 变化（waiting→sending→sent）不改变这个集合，所以用它做签名，避免每秒重建 500 行。
 function listSignature() {
   const f = currentFilters();
-  return [job?.running ? 1 : 0, [...blocked()].sort().join(','), visibleRows().map(r => r.key + ':' + (r.state || '') + ':' + (r.meta ? 1 : 0)).join(','),
-    f.q || '', f.types || '', f.baseModels || '', f.states || '', ($('fSub') || {}).value || '', ($('sort') || {}).value || ''].join('#');
+  return [job?.running ? 1 : 0, [...blocked()].sort().join(','),
+    visibleRows().map(r => r.key + ':' + (r.state || '') + ':' + (r.meta ? 1 : 0) + ':'
+      + (r.dl ? r.dl.state + (r.dl.offline ? 'o' : '') : '')).join(','),
+    f.q || '', f.types || '', f.baseModels || '', f.states || '', ($('fSub') || {}).value || '',
+    ($('sort') || {}).value || '', currentDlFilter(), dlMeta.loaded ? 1 : 0].join('#');
 }
 let seenListSig = '';
 
@@ -112,11 +158,28 @@ function rowBadge(row) {
   if (st === 'loading' || !row.state) return { text: '待补全', cls: 'loading' };
   return null;
 }
+// 本机下载状态徽章：与补全状态分开两枚，避免“本站 404”和“已下载”互相覆盖
+function rowDlBadge(row) {
+  if (!MS || !dlMeta.loaded) return null;
+  const entry = row.dl || { state: 'unknown', reason: '还没有这个模型的状态缓存' };
+  const lab = MS.labelOf(entry, { offline: dlMeta.offline || statusHealthOffline });
+  return { state: lab.state, text: lab.badge + ' ' + lab.short, title: lab.title };
+}
 function rowMetaText(row) {
   const m = row.meta || {};
   const bits = ['ID ' + row.id];
   if (row.version) bits.push('版本 ' + row.version);
   if (m.versionName) bits.push('版本名 ' + m.versionName);
+  const dl = row.dl;
+  if (dl && ['downloaded', 'update_available', 'other_version'].includes(dl.state) && dl.local) {
+    const lv = dl.local.version_name || (dl.local.version_id ? '版本 ' + dl.local.version_id : '');
+    if (lv) bits.push('本地 ' + lv);
+  }
+  if (dl && dl.update && dl.update.has_update) {
+    const latest = dl.update.latest_name || dl.update.latest_version;
+    if (latest) bits.push('最新 ' + latest);
+  }
+  if (dl && dl.state === 'downloading' && dl.download && dl.download.status === 'pending') bits.push('已提交待解析');
   if (m.type) bits.push(m.type);
   if (m.baseModel) bits.push(m.baseModel);
   if (m.totalMB != null) bits.push(m.totalMB + ' MB');
@@ -153,6 +216,14 @@ function render() {
     name.textContent = (row.meta && row.meta.name) || row.title || ('ID ' + row.id);
     const badge = rowBadge(row);
     if (badge) { const b = document.createElement('span'); b.className = 'row-state ' + badge.cls; b.textContent = badge.text; name.append(b); }
+    const dlBadge = rowDlBadge(row);
+    if (dlBadge) {
+      const b = document.createElement('span');
+      b.className = 'dl-state dl-' + dlBadge.state;
+      b.textContent = dlBadge.text;
+      b.title = dlBadge.title;
+      name.append(b);
+    }
     meta.textContent = rowMetaText(row);
     const why = shortReason(row.enrichReason);
     if (why) meta.textContent += ' · ' + why;
@@ -183,6 +254,7 @@ function renderSummaries(shownCount) {
   } else {
     summaryEl.textContent = `${rows.length} 个不同模型 / 版本；只读取模型页标题和链接，不读取网页内容。`;
   }
+  renderDlSummary();
   const en = $('enrichSummary');
   if (!en) return;
   if (typeof ENRICH.summaryText !== 'function') { en.textContent = '信息补全模块未加载（lib/enrich.js 缺失），列表仍可用，只有标题和 ID。'; }
@@ -198,6 +270,17 @@ function renderSummaries(shownCount) {
       note.textContent = `站点 ${sites.join('、')} 触发限流，本轮不再请求（退避到 ${CLOCK(retryAt)}）。到时点「刷新」即可，列表里的旧数据仍照常显示。`;
     } else note.hidden = true;
   }
+}
+function renderDlSummary() {
+  const el = $('dlSummary');
+  if (!el) return;
+  if (!MS) { el.textContent = '下载状态模块未加载（lib/model-status.js 缺失），列表与发送仍可用。'; return; }
+  if (!dlMeta.loaded) { el.textContent = '正在查询本机下载状态…（先读缓存，再问 CFT）'; return; }
+  const entries = rows.map(r => r.dl || { state: 'unknown', reason: '还没有这个模型的状态缓存' });
+  const s = MS.summaryOf(entries, { cacheAt: dlMeta.at, offline: dlMeta.offline || statusHealthOffline });
+  let text = s.text || '下载状态：没有可显示的模型';
+  if (dlMeta.error) text += ' · ' + dlMeta.error;
+  el.textContent = text;
 }
 // 轮询路径用：数据真变了才重建列表，否则只刷新按钮态
 function renderListIfChanged() { if (listSignature() !== seenListSig) render(); else syncSelection(); }
@@ -230,6 +313,7 @@ function updateCurrentMeta() {
   if (m.type) bits.push(m.type);
   if (m.baseModel) bits.push(m.baseModel);
   if (m.totalMB != null) bits.push(m.totalMB + ' MB');
+  if (MS && row.dl && dlMeta.loaded) bits.push(MS.labelOf(row.dl).text);
   if (!row.meta) bits.push('信息待联网补全');
   $('modelUrl').textContent = bits.join(' · ');
 }
@@ -262,8 +346,9 @@ async function health() {
   // too-old 依然是真 CFT，/api/download 可用 → 允许发送；not-cft / offline 一律视为未连接
   const wasOnline = online;
   online = st.reason === 'ok' || st.reason === 'too-old';
+  statusHealthOffline = !online;
   cftState = st;
-  showConnection(); updateButtons(); renderTasks();
+  showConnection(); updateButtons(); renderTasks(); renderDlSummary();
   if (online && !wasOnline) pollTasks();
 }
 // 刷新保留用户的勾选决定：已决定过（选中或取消）的 key 原样保留，新出现的页默认选中，已关闭的页丢弃
@@ -301,6 +386,183 @@ async function runEnrich(items, openTabIds, network) {
     return result || null;
   } catch (_) { return null; }   // 契约：enrich 不抛错；真抛了也只是没元数据，行必须还在
 }
+// ---- 本机下载状态：popup 只负责批量问 bg；缓存/离线/徽章都在 background ----
+function bgStatusQuery(payload, timeoutMs) {
+  let req;
+  try {
+    req = ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'modelStatusQuery', payload });
+  } catch (e) {
+    return Promise.resolve({ ok: false, error: String((e && e.message) || e) });
+  }
+  const p = Promise.resolve(req).catch(e => ({ ok: false, error: String((e && e.message) || e) }));
+  return Promise.race([
+    p,
+    new Promise(resolve => setTimeout(() => resolve({ ok: false, error: '扩展后台无响应' }), timeoutMs || 8000)),
+  ]);
+}
+async function refreshStatuses(opts) {
+  const o = opts || {};
+  if (!MS || typeof MS.buildItems !== 'function') return;
+  const items = MS.buildItems(rows);
+  if (!items.length) {
+    dlMeta = { loaded: true, at: Date.now(), offline: false, error: '', library: null, updates: null };
+    renderDlSummary(); updateButtons();
+    return;
+  }
+  if (dlRefreshing) { dlQueued = o; return; }
+  dlRefreshing = true;
+  try {
+    const r = await bgStatusQuery({ items, refresh: o.cacheOnly ? false : (o.force ? true : 'auto') });
+    if (r && r.ok === true) {
+      if (typeof MS.applyToRows === 'function') MS.applyToRows(rows, r);
+      dlMeta = {
+        loaded: true, at: r.cacheAt || Date.now(), offline: !!r.offline,
+        error: r.error || (r.offline ? 'CFT 未连接，显示上次缓存' : ''),
+        library: r.library || null, updates: r.updates || null,
+      };
+      const scanPending = !o.cacheOnly && r.library && (r.library.scanning === true || r.library.ready === false);
+      if (!scanPending) dlRetry = 0;
+      else if (dlRetry < 3) {
+        dlRetry++;
+        setTimeout(() => refreshStatuses({}), 2500);   // 首次扫描可能几秒：有界重试，不无限轮询
+      }
+    } else {
+      if (r && r.items && typeof MS.applyToRows === 'function') MS.applyToRows(rows, r);
+      dlMeta = Object.assign({}, dlMeta, {
+        loaded: true, offline: !!(r && r.offline),
+        error: (r && (r.error || r.msg)) || '状态查询失败（CFT 未应答）',
+      });
+    }
+    renderListIfChanged();
+    renderDlSummary();
+    updateButtons();
+  } catch (e) {
+    dlMeta = Object.assign({}, dlMeta, { loaded: true, error: '状态查询失败：' + String((e && e.message) || e) });
+    renderListIfChanged(); renderDlSummary(); updateButtons();
+  } finally {
+    dlRefreshing = false;
+    if (dlQueued) { const q = dlQueued; dlQueued = null; setTimeout(() => refreshStatuses(q), 0); }
+    refreshPageHistory();
+  }
+}
+// ---- 一键检查更新：只动桌面端既有 mm_check_updates，不自动下载 ----
+function localPathsForUpdateCheck() {
+  const out = [];
+  for (const r of rows) {
+    const d = r.dl || {};
+    const list = Array.isArray(d.localVersions) ? d.localVersions : [];
+    for (const v of list) {
+      if (v && v.source === 'library' && v.exists !== false && v.path) out.push(String(v.path));
+    }
+    if (d.local && d.local.source === 'library' && d.local.exists !== false && d.local.path) {
+      out.push(String(d.local.path));
+    }
+  }
+  return [...new Set(out)].slice(0, 50);
+}
+async function checkUpdates() {
+  if (checkingUpdates) return;
+  if (!MS || !dlMeta.loaded) { $('feedback').textContent = '下载状态还在查询，请稍候再检查更新'; return; }
+  if (!online) { $('feedback').textContent = OFFLINE_HINT; return; }
+  const paths = localPathsForUpdateCheck();
+  if (!paths.length) {
+    $('feedback').textContent = '当前列表没有模型库命中的本地模型：先在 CFT 里扫描模型库，状态里出现“本地”路径后才能检查更新';
+    return;
+  }
+  checkingUpdates = true; updateButtons();
+  $('feedback').textContent = `正在检查 ${paths.length} 个本地模型的更新…（需要联网与 Civitai API Key，请稍候）`;
+  try {
+    const r = await ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'checkModelUpdates', payload: { paths } });
+    if (!r || !r.ok) { $('feedback').textContent = needsApiKey(r) ? KEY_HINT : ((r && r.msg) || '检查更新启动失败'); return; }
+    if (!r.started) { $('feedback').textContent = r.msg || '没有可检查的模型'; return; }
+    for (let i = 0; i < 150; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const st = await ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'modelUpdateState', payload: {} });
+      if (!st || !st.ok) { $('feedback').textContent = '查询检查进度失败：' + ((st && st.msg) || '扩展后台无响应'); return; }
+      const s = st.state || {};
+      const done = Number(s.done) || 0, total = Number(s.total) || 0;
+      $('feedback').textContent = `检查更新 ${done}/${total}…` + (s.msg ? ' ' + s.msg : '');
+      if (!s.running) {
+        $('feedback').textContent = s.msg || `检查完成：${Number(s.newer) || 0} 个模型有更新`;
+        await refreshStatuses({ force: true });
+        return;
+      }
+    }
+    $('feedback').textContent = '检查更新仍在进行，可关闭小窗；完成后重开即可看到结果';
+  } catch (e) {
+    $('feedback').textContent = '检查更新失败：' + String((e && e.message) || e);
+  } finally {
+    checkingUpdates = false;
+    updateButtons();
+  }
+}
+// ---- 页面级历史：只看过哪些模型页；与下载历史完全独立 ----
+async function refreshPageHistory() {
+  if (!MS || historyLoading) return;
+  historyLoading = true;
+  try {
+    const [raw, cacheRaw] = await Promise.all([storeGet(HISTORY_KEY), storeGet(MS.CACHE_KEY)]);
+    const cache = MS.sanitizeCache(cacheRaw);
+    const items = raw && raw.items && typeof raw.items === 'object' ? Object.values(raw.items) : [];
+    const live = new Map();
+    for (const r of rows) live.set(MS.keyOf(r.id, r.version) || r.key, r.dl || null);
+    const list = [];
+    for (const it of items) {
+      if (!it || !it.key || !it.url) continue;
+      const entry = live.get(it.key) || MS.getEntry(cache, it.modelId, it.versionId) || null;
+      const cat = MS.categoryOf(entry);
+      // 已下载/有更新/下载中不需要再提醒；其他版本与未知仍值得看
+      if (cat === 'downloaded' || cat === 'update' || cat === 'downloading') continue;
+      list.push(Object.assign({}, it, { entry }));
+    }
+    list.sort((a, b) => (Number(b.lastAt) || 0) - (Number(a.lastAt) || 0));
+    pageHistory = list.slice(0, 50);
+    renderPageHistory();
+  } catch (_) {
+    pageHistory = [];
+    renderPageHistory();
+  } finally { historyLoading = false; }
+}
+function renderPageHistory() {
+  const panel = $('pageHistoryPanel'), list = $('pageHistoryList'), count = $('pageHistoryCount');
+  if (!panel || !list) return;
+  panel.hidden = !pageHistory.length;
+  if (!pageHistory.length) { list.replaceChildren(); if (count) count.textContent = ''; return; }
+  if (count) count.textContent = `（${pageHistory.length}）`;
+  list.replaceChildren();
+  for (const it of pageHistory) {
+    const row = document.createElement('div'); row.className = 'hist-item';
+    const a = document.createElement('a'); a.href = it.url; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = it.title || ('ID ' + (it.modelId || ''));
+    const meta = document.createElement('span'); meta.className = 'hist-meta';
+    const lab = it.entry && MS ? MS.labelOf(it.entry) : null;
+    meta.textContent = (lab ? lab.label : '状态未知') + (it.lastAt ? ' · ' + CLOCK(it.lastAt) : '');
+    if (it.versionId) a.title = it.url;
+    row.append(a, meta); list.append(row);
+  }
+}
+async function clearPageHistory() {
+  if (!confirm('清除扩展里的页面访问历史？只删除“看过哪些模型页”的记录，不会删除下载历史或模型文件。')) return;
+  await storeSet(HISTORY_KEY, { version: 1, savedAt: 0, items: {} });
+  pageHistory = [];
+  renderPageHistory();
+  $('feedback').textContent = '页面历史已清除；下载历史与模型文件未改动';
+}
+async function revealPath(path) {
+  try {
+    const r = await ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'revealPath', payload: { path } });
+    return r || { ok: false, msg: '扩展后台无响应' };
+  } catch (e) { return { ok: false, msg: String((e && e.message) || e) }; }
+}
+function notifyTerminal(item, cft) {
+  try {
+    const p = ext.runtime.sendMessage({ __cft: true, to: 'bg', type: 'notifyTaskDone', payload: {
+      key: item.key, phase: cft.phase, name: item.name || '', task_id: cft.task_id || '',
+      filename: cft.filename || '', dest_dir: cft.dest_dir || '',
+    } });
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (_) { /* 通知失败不影响任务跟踪 */ }
+}
 async function refresh() {
   const serial=++refreshSerial;
   try {
@@ -310,6 +572,8 @@ async function refresh() {
     built = buildRows(queried);
     applyRows(built.rows);
     render();
+    refreshStatuses({ cacheOnly: true });   // 先画缓存，不阻塞列表
+    refreshPageHistory();
     const openTabIds = queried.map(t => t && t.id).filter(id => typeof id === 'number');
     const items = (built.rows || []).concat(built.others || []);
     // 先只读缓存（0 请求、不写库）：重开小窗时绝大多数行立刻就有元数据
@@ -320,15 +584,16 @@ async function refresh() {
       enrichSummary = peeked.summary || null;
       syncFilterOptions(); render();
     }
-    if (typeof ENRICH.enrich !== 'function' || !items.length) return;
+    if (typeof ENRICH.enrich !== 'function' || !items.length) { refreshStatuses({}); return; }
     enriching = true; render();
     const result = await runEnrich(items, openTabIds, true);
     if(serial!==refreshSerial){enriching=false;return;}
     enriching = false;
-    if (!result) { render(); return; }
+    if (!result) { render(); refreshStatuses({}); return; }
     if (typeof ENRICH.applyToRows === 'function') { ENRICH.applyToRows(built.rows, result); ENRICH.applyToRows(built.others || [], result); }
     enrichSummary = result.summary || null;
     syncFilterOptions(); render();
+    refreshStatuses({});   // 版本 ID/类型补全后再刷新一次状态（auto：缓存新鲜则零请求）
   }catch(_){$('feedback').textContent='读取标签页失败，请重新加载扩展';enriching=false;}
 }
 function mode(batch) {
@@ -360,7 +625,7 @@ async function startArchive() {
     if (r && r.ok) {
       note.textContent = '归档已在页面内进行，请查看页面右下角按钮进度';
       note.hidden = false;
-      setTimeout(() => window.close(), 1000);
+      if (!SIDE) setTimeout(() => window.close(), 1000);
     } else {
       note.textContent = (r && r.msg) || '归档启动失败';
       note.hidden = false;
@@ -411,30 +676,50 @@ const CFT_ST = { pending: '排队中', downloading: '下载中', retrying: '重�
 const TERMINAL = new Set(['done', 'failed', 'library']);
 const MID_RE = /\/models\/([1-9]\d*)/i;
 const modelIdOf = u => { const m = MID_RE.exec(String(u || '')); return m ? m[1] : ''; };
+const versionIdOfUrl = u => {
+  const s = String(u || '');
+  const m = /[?&]modelVersionId=([1-9]\d*)/i.exec(s) || /\/api\/download\/models\/([1-9]\d*)/i.exec(s);
+  return m ? m[1] : '';
+};
+// get_tasks 的版本字段是后来加的；旧桌面端没有时返回空，调用方据此退回“按模型 ID”的旧口径
+const taskVersionId = t => {
+  const direct = String((t && (t.version_id || t.versionId)) || '');
+  if (/^[1-9]\d*$/.test(direct)) return direct;
+  return versionIdOfUrl(t && t.url);
+};
 const sameTarget = (a, b) => {
   const x = String(a || ''), y = String(b || '');
   if (!x || !y) return false;
   if (x === y) return true;
+  const vx = versionIdOfUrl(x), vy = versionIdOfUrl(y);
+  if (vx && vy && vx !== vy) return false;
   const mx = modelIdOf(x), my = modelIdOf(y);
   return !!mx && mx === my;
 };
 // 只发送用户勾选过的链接；这里记的是"发出去了哪些"，用于之后问 CFT 下得怎么样
-function recordSubmission(items) {
+function recordSubmission(items, sourceRows) {
   const list = (items || []).filter(Boolean);
   if (!list.length) return;
   const now = Date.now();
   const byKey = new Map((taskState.items || []).map(it => [it.key, it]));
+  const byMid = new Map();
+  for (const r of (sourceRows || [])) {
+    const mid = String(r.id || r.modelId || '');
+    if (mid) byMid.set(mid, r);
+  }
   for (const raw of list) {
-    const row = rows.find(r => r.key === raw.key) || {};
+    // 「下载新版」发的是 version:<最新版>，在 rows 里找不到同 key；按模型 ID 回退到来源行取名/标题
+    const row = rows.find(r => r.key === raw.key)
+      || byMid.get(String(raw.id || modelIdOf(raw.url) || '')) || {};
     const key = raw.key || row.key || raw.url;
     const prev = byKey.get(key);
-    const versionId = String(raw.version || row.enrichVersionId || (row.meta && row.meta.versionId) || '');
+    const versionId = String(raw.version || row.version || row.enrichVersionId || (row.meta && row.meta.versionId) || '');
     byKey.set(key, {
       key, url: raw.url || row.url || '', modelId: String(raw.id || row.id || modelIdOf(raw.url || '') || ''),
       versionId, name: (row.meta && row.meta.name) || raw.title || row.title || ('ID ' + (raw.id || '')),
       sent: raw.status === 'sent', msg: raw.msg || '',
-      // 已经跑完的跟踪结论保留（CFT 侧后来居上也不该把"已完成"抹成"未知"），未完成的清空重来
-      cft: prev && prev.cft && TERMINAL.has(prev.cft.phase) ? prev.cft : null,
+      // 已经跑完的结论只在“这次没提交成功”时保留；重新提交成功必须清空，否则新任务落地不会通知
+      cft: prev && prev.cft && TERMINAL.has(prev.cft.phase) && raw.status !== 'sent' ? prev.cft : null,
       checkedAt: 0,
     });
   }
@@ -474,11 +759,25 @@ async function rpc(method, args) {
 function tasksOfItem(item, list) {
   const mid = String(item.modelId || '') || modelIdOf(item.url);
   if (!mid) return [];
-  return (list || []).filter(t => t && t.url && modelIdOf(t.url) === mid);
+  const byMid = (list || []).filter(t => t && t.url && modelIdOf(t.url) === mid);
+  const vid = String(item.versionId || '');
+  if (!vid) return byMid;
+  const withVer = byMid.filter(t => taskVersionId(t));
+  // 旧桌面端完全不返回版本：退回模型级（否则会把正在下载的任务显示成“还没入队”）
+  if (!withVer.length) return byMid;
+  // 新桌面端有版本：只认这个版本，避免把同模型的旧 done 任务当成这次下载完成
+  return withVer.filter(t => taskVersionId(t) === vid);
 }
 function parseOfItem(item, state) {
   const items = (state && state.items) || [];
-  for (let i = items.length - 1; i >= 0; i--) if (sameTarget(items[i].url, item.url)) return items[i];
+  const vid = String(item.versionId || '');
+  for (let i = items.length - 1; i >= 0; i--) {
+    const p = items[i];
+    if (!sameTarget(p.url, item.url)) continue;
+    const pv = versionIdOfUrl(p.url);
+    if (vid && pv && pv !== vid) continue;
+    return p;
+  }
   return null;
 }
 // 一个提交项 → 现在到底到哪一步了。注意 CFT 的 _parse_state 只保留"最近一次解析"，
@@ -487,7 +786,8 @@ function cftOfItem(item, list, state) {
   const mine = tasksOfItem(item, list);
   const p = parseOfItem(item, state);
   if (p && p.ok === false) {
-    return { phase: 'failed', terminal: true, text: 'CFT 解析后没有入队：' + (p.msg || '未知原因') + (p.paid ? '（付费/抢先体验，需要时在软件里选「仍要下载」）' : '') };
+    return { phase: 'failed', terminal: true, filename: '', dest_dir: '', task_id: '',
+      text: 'CFT 解析后没有入队：' + (p.msg || '未知原因') + (p.paid ? '（付费/抢先体验，需要时在软件里选「仍要下载」）' : '') };
   }
   if (mine.length) {
     const fin = mine.filter(t => ['done', 'error', 'canceled'].includes(t.status));
@@ -513,7 +813,9 @@ function cftOfItem(item, list, state) {
     if (run && run.dest_dir) text += ` · 落盘：${run.dest_dir}`;
     else if (run) text += ' · 落盘目录在开始下载时才解析';
     const terminal = fin.length === mine.length && mine.length > 0;
-    return { phase: terminal ? (done.length ? 'done' : 'failed') : 'downloading', terminal, text };
+    return { phase: terminal ? (done.length ? 'done' : 'failed') : 'downloading', terminal,
+      filename: (run && run.filename) || '', dest_dir: (run && run.dest_dir) || '',
+      task_id: (run && run.id) || '', text };
   }
   if (item.cft && item.cft.phase === 'library') return item.cft;
   if (p && p.ok) return { phase: 'queued', terminal: false, text: 'CFT 已解析并回报入队：' + (p.msg || '已加入队列'), waiting: true };
@@ -549,9 +851,28 @@ function renderTasks() {
     if (it.versionId) line.push(`版本 ${it.versionId}`);
     small.textContent = line.filter(Boolean).join(' · ');
     small.title = it.url || '';
-    grow.append(b, small); div.append(dot, grow); box.append(div);
+    grow.append(b, small);
+    if (cft.dest_dir) {
+      const open = document.createElement('button');
+      open.className = 'quiet'; open.type = 'button'; open.textContent = '打开目录';
+      open.title = '在资源管理器中打开 CFT 登记的落点（桌面端只接受已登记路径）';
+      open.addEventListener('click', async () => {
+        open.disabled = true;
+        const r = await revealPath(cft.dest_dir);
+        $('feedback').textContent = r.ok ? '已在文件管理器中打开：' + (r.path || cft.dest_dir) : (r.msg || '打开目录失败');
+        open.disabled = false;
+      });
+      grow.append(open);
+    }
+    div.append(dot, grow); box.append(div);
   }
   summarizeTasks(list, taskQueriedAt, taskError);
+}
+function applyCft(it, next) {
+  const prev = it.cft;
+  it.cft = next;
+  // 终态只在“第一次看到”（或阶段变化）时通知；重开小窗恢复的旧终态不重复打扰
+  if (next && next.terminal && (!prev || !prev.terminal || prev.phase !== next.phase)) notifyTerminal(it, next);
 }
 async function pollTasks() {
   const list = taskState.items || [];
@@ -575,16 +896,24 @@ async function pollTasks() {
       it.checkedAt = taskQueriedAt;
       if (chk.ok && chk.result && chk.result.found) {
         const path = (chk.result.paths || [])[0] || '';
-        it.cft = { phase: 'library', terminal: true, text: '已在本机模型库里：' + path };
+        applyCft(it, { phase: 'library', terminal: true, filename: '', dest_dir: path,
+          text: '已在本机模型库里：' + path });
         continue;
       }
     }
     // 已经终态就别再被"这轮没查到"覆盖回等待态（CFT 完成任务后会把它移出活动列表）
     if (it.cft && it.cft.terminal && next.phase === 'waiting') continue;
-    it.cft = next;
+    applyCft(it, next);
   }
   renderTasks();
   persistTasks();
+  // 有任务刚落地（完成/失败/已在库里）→ 拉一次状态，让列表徽章与页面胶囊跟着变
+  const terminalSig = list.filter(it => it.cft && it.cft.terminal)
+    .map(it => it.key + ':' + it.cft.phase).join('|');
+  if (terminalSig && terminalSig !== lastTaskTerminalSig) {
+    lastTaskTerminalSig = terminalSig;
+    refreshStatuses({ force: true });
+  }
   // 全部到终态就自己停表：轮询只在"还有事没落地"时才有意义，别让小窗开着也一直问
   if (!tasksNeedPolling()) stopTaskPolling();
 }
@@ -678,20 +1007,84 @@ $('btnArchive').onclick = startArchive;
 $('clearResults').onclick=async()=>{if(!confirm('清除扩展提交记录后，这些页面可再次发送。请先核对 CFT，避免重复任务；不会删除 CFT 中的下载记录。'))return;try{const r=await ext.runtime.sendMessage({type:'cft-batch-clear'});if(r.ok){renderJob(null);$('feedback').textContent='扩展提交记录已清除；CFT 中的任务未改动';}else $('feedback').textContent=r.msg;}catch(_){$('feedback').textContent='清除失败，请重试';}};
 $('modeCurrent').onclick=()=>mode(false);$('modeBatch').onclick=()=>mode(true);
 $('scope').onchange=refresh;$('refresh').onclick=()=>{refresh();health();};$('search').oninput=render;
-for (const id of ['fType', 'fBase', 'fState', 'fSub', 'sort']) { const el = $(id); if (el) el.onchange = render; }
+for (const id of ['fType', 'fBase', 'fState', 'fSub', 'fDl', 'sort']) { const el = $(id); if (el) el.onchange = render; }
+const selectUndownloadedBtn = $('selectUndownloaded');
+if (selectUndownloadedBtn) selectUndownloadedBtn.onclick = () => {
+  if (!MS || !dlMeta.loaded) { $('feedback').textContent = '下载状态还在查询，请稍候再点「只选未下载」'; return; }
+  selected = new Set(rows.filter(r => MS.categoryOf(r.dl) === 'not').map(r => r.key));
+  render();
+  $('feedback').textContent = `已勾选 ${selected.size} 个确认未下载的页面（状态未知的未改动）`;
+};
+const sendUpdatesBtn = $('btnSendUpdates');
+if (sendUpdatesBtn) sendUpdatesBtn.onclick = () => {
+  const picked = rows.filter(r => selected.has(r.key) && !blocked().has(r.key)
+    && r.dl && r.dl.update && r.dl.update.has_update && r.dl.update.latest_url);
+  if (!picked.length) { $('feedback').textContent = '选中项里没有可发送的新版'; return; }
+  return send(picked.map(r => r.dl.update.latest_url), picked, { skipConfirm: true, update: true });
+};
+// 侧边栏：弹层里提供入口；侧栏页自身不显示这个按钮，归档成功后也不自动关闭
+if (SIDE) {
+  document.body.classList.add('side-panel');
+  const b = $('openSidePanel'); if (b) b.hidden = true;
+} else {
+  const b = $('openSidePanel');
+  if (b) {
+    if (!ext.sidePanel || typeof ext.sidePanel.open !== 'function') b.hidden = true;
+    else {
+      b.hidden = false;
+      b.onclick = async () => {
+        try {
+          const [tab] = await ext.tabs.query({ active: true, currentWindow: true });
+          const windowId = tab && tab.windowId;
+          if (!Number.isFinite(windowId)) throw new Error('找不到当前窗口');
+          await ext.sidePanel.open({ windowId });
+          window.close();
+        } catch (e) { $('feedback').textContent = '侧边栏打开失败：' + String((e && e.message) || e); }
+      };
+    }
+  }
+}
+const checkBtn = $('btnCheckUpdates');
+if (checkBtn) checkBtn.onclick = checkUpdates;
+const clearHistBtn = $('clearPageHistory');
+if (clearHistBtn) clearHistBtn.onclick = clearPageHistory;
+try {
+  if (ext.storage && ext.storage.onChanged) {
+    ext.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes) return;
+      if (changes[HISTORY_KEY] || (MS && changes[MS.CACHE_KEY])) refreshPageHistory();
+    });
+  }
+} catch (_) {}
 const taskRefresh = $('taskRefresh');
-if (taskRefresh) taskRefresh.onclick = () => { taskState.items.forEach(it => { if (it.cft && !it.cft.terminal) it.cft = null; }); renderTasks(); pollTasks(); };
+if (taskRefresh) taskRefresh.onclick = () => { taskState.items.forEach(it => { if (it.cft && !it.cft.terminal) it.cft = null; }); renderTasks(); pollTasks(); refreshStatuses({ force: true }); };
 const clearTasksBtn = $('clearTasks');
 if (clearTasksBtn) clearTasksBtn.onclick = async () => { await clearTasks(); stopTaskPolling(); $('feedback').textContent = '已清除扩展里的下载状态跟踪；CFT 中的任务与文件没有改动。'; };
 $('selectAll').onchange=()=>{for(const r of visibleRows().filter(r=>!blocked().has(r.key))){if($('selectAll').checked)selected.add(r.key);else selected.delete(r.key);}render();};
-$('sendCurrent').onclick=()=>send(active?[active.url]:[]);
-$('sendBatch').onclick=()=>send(rows.filter(r=>selected.has(r.key)&&!blocked().has(r.key)).map(r=>r.url));
-async function send(urls) {
-  if(busy||job?.running||!urls.length)return;busy=true;updateButtons();$('feedback').textContent='正在提交…';
+const selectedRows = () => rows.filter(r=>selected.has(r.key)&&!blocked().has(r.key));
+$('sendCurrent').onclick=()=>{const row=rows.find(r=>active&&r.key===active.key);return send(active?[active.url]:[],row?[row]:[]);};
+$('sendBatch').onclick=()=>{const picked=selectedRows();return send(picked.map(r=>r.url),picked);};
+async function send(urls, pickedRows, opts) {
+  const o = opts || {};
+  if(busy||job?.running||!urls.length)return;
+  // 已下载/有更新的页面必须让用户知道这次点下去会发生什么；绝不静默改 URL、绝不静默跳过
+  if (!o.skipConfirm && MS && dlMeta.loaded && pickedRows && pickedRows.length) {
+    const exact = pickedRows.filter(r => MS.categoryOf(r.dl) === 'downloaded');
+    const upd = pickedRows.filter(r => MS.categoryOf(r.dl) === 'update');
+    if (exact.length || upd.length) {
+      const parts = [];
+      if (exact.length) parts.push(`${exact.length} 项已下载，重发会再下载一遍同一版本`);
+      if (upd.length) parts.push(`${upd.length} 项有更新，普通发送仍会下载页面里的旧版本`);
+      const hint = upd.length ? '要更新请先取消，点「下载选中项的新版」。' : '';
+      if (!confirm(`选中的页面里：${parts.join('；')}。${hint}\n仍要发送吗？`)) return;
+    }
+  }
+  busy=true;updateButtons();$('feedback').textContent='正在提交…';
   try {const r=await ext.runtime.sendMessage({type:'cft-batch-start',urls});if(!r.ok){$('feedback').textContent=needsApiKey(r)?KEY_HINT:r.msg;return;}renderJob(r.job);$('results').open=true;
     // 提交完立刻挂上跟踪：job.items 里就是"用户勾的那些 URL"，一条不多一条不少
-    recordSubmission((r.job && r.job.items) || urls.map(u => ({ url: u, status: 'waiting' })));
-    pollTasks(); startTaskPolling();}
+    recordSubmission((r.job && r.job.items) || urls.map(u => ({ url: u, status: 'waiting' })), pickedRows);
+    pollTasks(); startTaskPolling();
+    setTimeout(() => refreshStatuses({ force: true }), 1200);}
   catch(_){$('feedback').textContent='未收到扩展确认，请重新打开小窗核对提交结果，勿重复点击。';}
   finally{busy=false;updateButtons();}
 }
@@ -708,6 +1101,12 @@ document.addEventListener('DOMContentLoaded',async()=>{
 // 小窗被切走/关闭就停止轮询：批量任务在 bg+offscreen 里跑，不靠 popup 定时器
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopPolling();
-  else { startPolling(); status(); if (!online) health(); pollArchBatch(); if ((taskState.items || []).length) { pollTasks(); startTaskPolling(); } }
+  else {
+    startPolling(); status();
+    if (!online) health();
+    pollArchBatch();
+    if ((taskState.items || []).length) { pollTasks(); startTaskPolling(); }
+    if (Date.now() - dlMeta.at > 120000) refreshStatuses({});
+  }
 });
 window.addEventListener('pagehide', stopPolling);

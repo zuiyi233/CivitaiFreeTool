@@ -18,12 +18,20 @@
 <label>提交 <select id="fSub" aria-label="按是否可提交筛选"><option value="">全部行</option><option value="yes">仅可提交</option><option value="no">仅不可提交</option></select></label>
 <label>排序 <select id="sort" aria-label="列表排序"><option value="tab">按标签页顺序</option><option value="title">按标题</option><option value="type">按类型</option><option value="size">按文件大小</option><option value="downloads">按下载量</option><option value="published">按发布时间</option><option value="window">按窗口</option></select></label>
 </div>
+<div class="tools filters">
+<label>下载 <select id="fDl" aria-label="按本机下载状态筛选"><option value="">全部下载状态</option><option value="downloaded">已下载</option><option value="update">有更新</option><option value="downloading">下载中</option><option value="other">已下载其他版本</option><option value="not">未下载</option><option value="unknown">未知</option></select></label>
+<button id="selectUndownloaded" class="quiet" type="button" title="只勾选确认“未下载”的页面；状态未知的不动">只选未下载</button>
+</div>
 <div class="tools"><label><input id="selectAll" type="checkbox"/> 全选当前列表</label><span id="selectionCount"></span></div>
 <div id="tabList" aria-label="可发送的模型标签页"></div>
 <p class="muted" id="tabSummary"></p>
 <p class="muted" id="enrichSummary"></p>
+<p class="muted" id="dlSummary">正在查询本机下载状态…</p>
+<div class="tools" id="dlActions"><button id="btnCheckUpdates" class="quiet" type="button" disabled title="对本机模型库命中的模型批量检查 C 站更新（需要 CFT 里已保存 API Key）">⫫ 检查这些模型的更新</button></div>
 <p class="muted" id="rateNote" hidden></p>
+<details id="pageHistoryPanel" hidden><summary>看过但未下载 <span id="pageHistoryCount"></span></summary><div id="pageHistoryList"></div><button id="clearPageHistory" class="quiet" type="button">清除页面历史（只删扩展记录）</button></details>
 <div class="tools"><button id="sendBatch" class="primary" disabled>发送选中到 CFT</button></div>
+<div class="tools" id="updateBar" hidden><button id="btnSendUpdates" class="primary" disabled>⬆ 下载选中项的新版</button></div>
 <p class="notice" id="capNoteBatch">「批量归档」也只在 Chrome/Edge 版有；这里勾选后只能把链接发送到 CFT 下载。</p></section>
 <section id="taskPanel" hidden aria-label="发送到 CFT 之后的状态">
 <div class="tools"><h3>发送到 CFT 之后</h3><button id="taskRefresh">查询最新状态</button></div>
@@ -34,5 +42,5 @@
 </section>
 <p id="feedback" role="status" aria-live="polite"></p><details id="results" hidden><summary id="resultSummary"></summary><div id="resultList"></div></details>
 <button id="clearResults" hidden>清除提交记录（允许重新发送）</button>
-<footer>列表只列 C 站模型页，非 C 站／CDN／列表页被筛掉的数量写在列表下方那两行里；只读取标签页标题和链接，不读取网页内容。<br/>模型类型/底模/大小/缩略图来自 C 站公开接口，按每个标签页自己的站点（civitai.com 与 civitai.red 是两套数据）补全，补不到的地方标原因，不拿另一站的数据冒充。<br/>提交后可关闭小窗；下载状态会记在扩展里，重开小窗还能看到。</footer>
-</main><script src="tabs-common.js"></script><script src="lib/tabrows.js"></script><script src="lib/enrich.js"></script><script src="popup.js"></script></body></html>
+<footer>列表只列 C 站模型页，非 C 站／CDN／列表页被筛掉的数量写在列表下方那几行里；只读取标签页标题和链接，不读取网页内容。<br/>模型类型/底模/大小/缩略图来自 C 站公开接口，按每个标签页自己的站点（civitai.com 与 civitai.red 是两套数据）补全，补不到的地方标原因，不拿另一站的数据冒充。<br/>下载状态来自本机 CFT 的模型库、下载历史与任务队列；离线时显示上次缓存并标「离线」，不会把“没查到”说成“未下载”。<br/>提交后可关闭小窗；下载状态会记在扩展里，重开小窗还能看到。</footer>
+</main><script src="tabs-common.js"></script><script src="lib/tabrows.js"></script><script src="lib/enrich.js"></script><script src="lib/model-status.js"></script><script src="popup.js"></script></body></html>

@@ -1,4 +1,108 @@
-# CivitaiFreeTool 更新日志（v1.5.1 → v2.6.32）
+# CivitaiFreeTool 更新日志（v1.5.1 → v2.7.0）
+
+## v2.7.0：MCP 接入层 + 文本/多模态双通道
+
+这一版把 AI 接入从「能调 HTTP」推进到 **MCP 是一等公民**：外部 AI 通过 `CivitaiFreeToolMCP.exe`
+（stdio / Streamable HTTP）拿到 29 个契约工具，文本模型与多模态模型各走自己的最优路径，HTTP 面
+只是同一份契约的投影，三者不会漂移。
+
+### 新增
+1. **契约单一事实源**：`ai_contract.py` 定义 29 个工具（core 19 / vision 5 / admin 5）、JSON Schema、
+   工具集、错误码、resources、prompts 与两份使用指南；MCP、HTTP、Skill 参考文档都从它生成。
+2. **MCP 侧车**：`CivitaiFreeToolMCP.exe` 支持 `--stdio`（默认）与 `--http --port 47532`（Bearer token，
+   默认写 `%LOCALAPPDATA%\CivitaiFreeToolWeb\mcp_http_token.txt`）、`--toolsets`、`--launch-app`、
+   `--selftest`；HTTP 只监听 127.0.0.1。
+3. **文本模型优化**：`cft_describe_model` 一次返回模型信息 + 示例图生成参数 + 附属文件清单；
+   `cft_browse_gallery` / `cft_analyze_workflow` 只回元数据（`mode=text` 递归剥掉内联图片字节），
+   省 token 且不会把 base64 塞进上下文。
+4. **多模态模型**：5 个 vision 工具返回 MCP image content（封面、示例图、视频首帧、contact sheet、
+   单图检查），支持本地优先、8MB 总量 / 8 张 / 单边 1536 的硬上限；同一结果可投影为 OpenAI
+   `image_url`、Anthropic base64 image 或文件路径。
+5. **HTTP 投影**：新增 `/api/automation/ai`、`/tools`、`/tool`、`/guide`、`/state?compact=1` 与
+   `/vision/*`，错误统一 `{ok:false,code,retryable,msg,hint,next_actions}`。
+6. **Skill**：`skills/civitai-free-tool/` 提供安装配置、recipes、视觉用法、安全边界与排障脚本
+   （`cft_doctor.py`、`gen_skill_refs.py`），并附 Qoder / Claude / Cursor 的 MCP 配置样例。
+7. **AI 专用弹层关闭**：新增 `cft_dismiss_ui`（HTTP `POST /api/automation/ui/dismiss`），不只关
+   新手引导，而是统一关闭确认框、下载文件选择、下载完成移动询问、设置未保存、受限提示、结果窗、
+   详情抽屉、图片查看器。**确认框关闭=取消，不会误确认危险操作**；下载文件选择关闭=取消本次下载；
+   设置未保存关闭=继续编辑。`permanent=true` 只对引导写入 `onboarding_done` / `auto_guides=false`，
+   设置页手动入口仍可用。`cft_get_state` 的 `blockers` 会按前端上报的可见弹层直接给出修复动作。
+   原生对话框清零：`web/` 里已无任何 `alert` / `confirm` / `prompt` 调用点（0 处），仅剩的两处
+   「应用内确认框不可用」兜底改成直接按取消处理——原生对话框会卡死整条 JS，`cft_dismiss_ui` 够不到。
+8. **安全门**：`cft_manage_library` 的 dedupe-delete / cleanup、`cft_migrate_storage`、
+   `cft_delete_gallery` 标记 `destructiveHint` 且必须 `confirm:true`；所有服务仅限本机回环。
+9. **MCP 之外的本地接入面**：新增 `GET /api/automation/openapi.json`（OpenAPI 3.1，默认 text
+   19 个操作）和真实执行别名 `POST /api/automation/tool/{name}`，供 Dify / n8n / LangChain /
+   Open WebUI 等不支持 MCP 的本地 Agent 导入；新增 `GET /api/automation/events/stream`，用 SSE
+   推送任务、文件选择、扫描、弹层与配置变化，支持 `Last-Event-ID` 重放、心跳、reset、overflow
+   与 429 上限。事件目录进入 `ai_contract.EVENTS`（21 类），与 `cft_capabilities` / OpenAPI 共用；
+   事件源只在有订阅者时做 1 秒快照差分，不侵入下载器——下载文件选择读变更日志而非电平比较，
+   一闪而过的待选弹窗不会漏；`state` 与事件里的代理地址若带凭据一律脱敏，`types` 过滤对重放同样生效。
+10. **打开的模型标签页索引 + `cft_browser_tabs`**：扩展后台在标签页事件后去抖、每分钟心跳，把打开的
+    C 站模型页标题、URL、模型/版本 ID 推到本机桥 `POST /api/ext/tabs`；桌面端新增只读
+    `GET /api/ext/tabs` 与契约工具 `cft_browser_tabs`。Agent 可先搜索已打开页面，再用
+    `cft_download_model` 下载，不再需要模拟键鼠操作浏览器。索引只存内存、只收模型页；
+    普通网页来源 403，最大 512KiB / 2000 行，超过 150s 未推送标 `stale` 而不是“没有标签页”。
+    契约见 `docs/browser-tabs-bridge.md`。
+11. **MCP 常驻与一键接入**：冻结版桌面端启动后自动拉起同目录 `CivitaiFreeToolMCP.exe --http
+    --port 47532 --toolsets core,vision,admin --exit-with-bridge`（47532 被占则跳过；桥连续不可达
+    约 30s 自动退出，避免孤儿进程）；源码运行/测试不启动。新增 `scripts/mcp_setup.py`，按
+    Cursor/Claude 生成或合并 `mcpServers`（先备份、保留其它 server、token 不回显）。
+    `cft_capabilities` 增加 `extension`（在线/版本/索引新鲜度）与 `mcp.running/token_file`。
+12. **下载落点可判定**：`plan`/`resolve`/`download` 的每个文件与单条结果新增只读 `placement`
+    （`routed / under_root / outside_root / pending` + `hint`）；分流关闭时也会按
+    `download_target_dir`/`download_dir` 预判已存在文件，避免重复下载。`storage` 增加
+    `candidates`/`suggested_root`，只从已配置目录自身/直接上级识别 ComfyUI 模型根。
+    **不自动搬文件、不自动改配置、不新建未注册类型目录。**
+13. **扩展开发态免打包**：新增 `scripts/dev_extension.py link/watch/reload/restore`。`link` 把
+    `.tools/` 下已加载副本换成指向源码的 junction（先备份；`manifest.key` 不变，扩展 ID 与存储
+    不变）；改动后桥置 `dev_reload_at`，扩展在下一次索引上报时 `runtime.reload()`，已见时间戳
+    存 storage 防循环。内容脚本改动仍需刷新页面。见 `docs/extension-dev-mode.md`。
+14. **端到端真机验证后修掉的三处**（都是"测试全绿但真机用不了"那类，见 `docs/releases/v2.7.0.md`）：
+    - `plan`/`resolve` 里每个文件的 `download_url` 恒为空：`_plan_payload` 引用了不存在的局部名 `civ`，
+      `NameError` 被 `try` 吞成 `download_url_error: "name 'civ' is not defined"`，AI 只看到空 URL。
+      现在从 `api.api` 取客户端；桌面端没就绪时如实写「桌面端未提供 C 站客户端」。
+    - 完整性校验结论此前**只存在于下载器内部**：任务行没有 `expected_sha256 / actual_sha256 /
+      verification_status`，`verify` 于是永远报 `sha256_ok: null`，"没校验"和"校验通过"长得一样。
+      现在三个字段进任务投影，`verify?task_id=` 原样带出下载结论，`hash=1` 而缺期望值时附 `sha256_hint`。
+    - 扩展索引的 `source` 用 `typeof browser` 猜宿主浏览器，在 Edge/Chrome 里被误报成
+      `firefox-extension`。两棵树改为各自硬编码来源（版本仍由 `ext_version` 说明是哪一份构建）。
+15. **MCP 文本结果不再返残串**：工具结果超过 4000 字符时，旧实现直接切字符串补 `...[truncated]`，
+    `cft_list_tasks` 这类列表工具一超限就返回无法 `json.loads` 的半截 JSON。现在按结构收缩：先夹逼超长
+    字符串，再整行丢弃列表尾部，并如实标 `truncated / dropped_rows / hint`（指引改用 `fields`/`limit`）；
+    只有连外壳都放不下的极小 limit 才退回切片标记。见 `docs/ai-integration.md` §4。
+16. **`cft_list_tasks` 默认紧凑投影 + 保最新**：任务行 26 个字段全发时 6 行就撑爆文本预算，收缩器只能整行丢弃，
+    丢的恰好是**最新的任务**。现在 MCP 侧默认只发判断所需的字段（状态、落点、期望/实算 SHA256、
+    `verification_status`、收尾错误清单等），并且超预算时按时间序从**最旧**开始丢，附
+    `oldest_dropped_ids`、`count` 仍是总数；`fields=["*"]` 或自选 `fields=["id","status"]` 仍可要全量
+    （`fields` 是数组，写字符串会被 schema 直接拒掉）。
+
+## 🧩 浏览器扩展：模型下载状态与工作台（Chrome 2.6.1 / Firefox 1.7.1，本 fork 新增）
+
+扩展不再只“把链接交给软件”，而是能回答当前打开的模型页**本机到底有没有**：
+
+1. **桌面端唯一事实源**：新增 `POST /api/model/status`，合并模型库扫描、下载历史（含旧记录从 `history_assets` 快照回填 `model_id/version_id`）、活动任务队列与 `model_updates.json`，批量返回 `downloaded / update_available / downloading / other_version / not_downloaded / unknown` 六态；模型库未扫描完时缺席不判“未下载”。
+2. **三处一致提示**：Chrome 模型页右下角状态胶囊、逐标签工具栏徽章、弹层行徽章 + 下载状态筛选 + 汇总；Firefox 弹层同文案（与 Chrome 共用逐字节相同的 `lib/model-status.js`）。
+3. **闭合动作**：「只选未下载」只勾确认未下载的行；「下载选中项的新版」只发更新记录里的 `latest_url`，普通发送命中已下载/有更新时先确认，绝不静默改 URL。
+4. **诚实口径**：扩展只发模型/版本 ID 与清洗过的页面 URL，不读 Cookie/API Key/正文；缓存 2/5 分钟，CFT 离线或旧版桌面端（无该路由）显示“上次缓存/需升级”，不把没查到说成未下载。
+
+### 第二阶段：浏览时就能看见、点完能收尾（Chrome 2.5.0 / Firefox 1.6.0；后续版本沿用）
+
+1. **列表页 / 图片页卡片徽章**：在 C 站 `/models`、`/images/<id>`、`/posts/<id>` 的模型卡片右上角贴 `✓ 已下载 / ↑ 有更新 / … 下载中 / ◐ 其他版本 / ↓ 未下载`；数据只读扩展缓存与本机桥，unknown 不贴，站外/下载链接/图片链接不贴。列表页查询带 `badge:false`，不会把某个模型的状态写到工具栏徽章上。
+2. **侧边栏常驻工作台（Chrome）**：`chrome.sidePanel` 打开 `sidepanel.html`，与弹层共用同一套脚本与样式；侧栏里不显示“打开侧栏”入口，归档/提交后也不会自动关自己。Firefox 明确不做侧栏。
+3. **一键检查更新**：弹层把当前列表里**模型库命中**的本地路径（去重、最多 50 个）交给桌面端既有 `mm_check_updates`，每 2 秒查 `get_mm_update_state`，最多 5 分钟；只更新 `model_updates.json` 并刷新徽章，不自动下载。缺 API Key / 正在跑 / 超时各有独立文案，不误报“已是最新”。
+4. **完成通知 + 打开所在目录**：Chrome 在普通提交批次后启动 `chrome.alarms` 守望（1 分钟一次、上限 2 小时），任务落地时发一次通知（按 `key:phase` 持久化去重，通知按钮带登记的落点）；桌面端新增 `POST /api/reveal`，**只接受模型库、下载历史、活动任务里已登记的路径**，未登记一律 403，不提供任意路径浏览。Firefox 无通知权限，但任务行的「打开目录」直连同一端点。批量归档有独立的进度面板与徽章，暂不逐模型发系统通知。
+5. **哈希级身份回退**：C 站 `files[].hashes.SHA256` 经富化保留为 `meta.files[].sha256 / meta.sha256s`，随状态请求发送（每项最多 8 个、规范小写）；桌面端用模型库侧车与下载历史里的已有哈希做回退索引，版本 ID 丢失或文件改名时仍能认出“同一份文件”，文件已不存在则不猜。
+6. **页面级历史**：Chrome/Firefox 后台记录看过的 C 站模型页（30 秒同标签去重、最多 500 条、只存清洗后的 URL/标题/时间），弹层列出「看过但未下载」，已下载/有更新/下载中的自动过滤，可一键清除；与下载历史、模型文件完全独立。
+
+**边界**：`/api/reveal` 只认桌面已登记的落点；扩展仍不读 Cookie/API Key/正文，只连硬编码 `http://127.0.0.1:47531`。Firefox 不伪造侧栏、通知或页面注入能力。
+
+### 第三阶段：标签页索引桥 + 开发态（Chrome 2.6.1 / Firefox 1.7.1）
+
+1. **后台只读上报**：Chrome/Firefox 共用逐字节相同的 `lib/tab-index.js`，在标签页创建/更新/关闭/移动/切换后去抖 1.2s，并每分钟心跳一次，把打开的 C 站模型页标题、URL、模型/版本 ID 推到 `POST /api/ext/tabs`；不读网页正文、Cookie、API Key 或非 C 站页面。
+2. **桌面只读索引**：`GET /api/ext/tabs?q=...` 返回索引与 `stale/age_s/counts`；只存内存、不落盘。桥侧再次校验 host/path/查询串/标题/行数，普通网页来源 403，最大 512KiB / 2000 行。
+3. **Agent 工具**：新增只读 `cft_browser_tabs`；命中后可直接 `cft_download_model`。扩展弹层的「批量标签页」UI 保持不变，桥只是给 Agent 多一条只读数据面。
+4. **开发态**：索引载荷带 `ext_version`；桥新增 `/api/ext/dev/reload` 与 `/api/ext/dev/state`，扩展只认新的 `dev_reload_at` 并自重载；`scripts/dev_extension.py` 用 junction 把已加载目录指向源码，改完不再打包导入。
 
 ## 🌐 局域网无头服务器资产接入（本 fork 新增）
 

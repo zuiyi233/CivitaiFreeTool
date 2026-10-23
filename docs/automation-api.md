@@ -58,10 +58,53 @@ AI 不必猜配置值形状、也不必读源码：
   是 `model_routing`，这里是它的投影）。
 - `sidecars`：落点校验期望的附属文件与「算封面的后缀集合」。
 
+### AI 工具层（MCP / HTTP 共用）
+
+唯一契约在 `ai_contract.py`，完整说明见 [`ai-integration.md`](ai-integration.md)。
+
+- `GET /api/automation/ai`：版本、toolsets、限额、guide、MCP 提示；`caps` 里同时给出
+  `openapi` / `sse` 与事件名，客户端不必猜。
+- `GET /api/automation/tools?format=openai|anthropic|mcp&profile=text|vision|admin|all`：
+  从契约生成工具 schema；`text` 19 个、`vision` 24 个、`admin` 24 个、`all` 29 个。
+- `GET /api/automation/openapi.json?profile=text|vision|admin|all`：由契约运行时生成的
+  OpenAPI 3.1 文档；默认 `text`（19 个操作），每个工具对应
+  `POST /api/automation/tool/{name}`。可直接导入 Dify / n8n / LangChain / Open WebUI 等
+  本地 Agent 平台；`servers` 只接受回环 Host，不生成指向任意主机的地址。
+- `POST /api/automation/tool/{name}`：OpenAPI 导入器使用的每工具入口，body 直接是
+  arguments 对象（不是 `{name,arguments}` 包装），内部与 `/tool` 走同一条执行链；
+  `?content_format=` 控制图片内容块。未知工具 404，GET 返回 405。
+- `GET /api/ext/tabs?q=...&limit=...`：浏览器扩展上报的已打开 C 站模型页只读索引
+  （只存内存，只含标题/URL/模型版本 ID）；`cft_browser_tabs` 工具封装此接口。
+  命中后用 `cft_download_model` 下载。契约与安全边界见
+  [`browser-tabs-bridge.md`](browser-tabs-bridge.md)。
+- `POST /api/automation/tool`：`{"name":"cft_*","arguments":{...}}` 统一执行；
+  `content_format=neutral|openai|anthropic|mcp` 控制视觉内容块。
+- `GET /api/automation/guide?profile=text|vision`：给模型的紧凑 runbook。
+- `POST /api/automation/ui/dismiss`：AI 一键关闭所有挡路弹层——新手引导、API Key 提示、
+  反向解析教程、确认框、下载文件选择、下载完成移动询问、设置未保存、受限提示、结果窗、
+  详情抽屉、图片查看器。`targets` 可写 `all` / `guides` / `dialogs` 或具体名字。
+  **关闭确认框=取消，绝不自动确认危险操作**；关闭下载文件选择=取消本次下载；
+  关闭设置未保存=继续编辑。默认 `permanent=true` 只对引导生效（写 `onboarding_done` /
+  `auto_guides=false`），设置页手动入口仍可用。
+  MCP 对应工具 `cft_dismiss_ui`；`state.ui.guides.overlays[]` 会列出当前可见弹层，
+  有阻塞项时直接调用即可。
+- 视觉端点：`/vision/model`、`/vision/gallery`、`/vision/workflow`、
+  `/vision/contact-sheet`、`/vision/analyze`。视频只回首帧 JPEG；`delivery=paths` 只回路径，
+  `inline` 回图片内容；默认 `max_side=768–1024`、最多 8 张。
+- 现有详情端点加 `mode=text`：`/model` 与 `/gallery/item` 剥掉内联 base64，
+  纯文本模型不会拿到图片 token；`/workflow/analyze` 加 `include_image=1` 才回缩略预览。
+- 所有错误现在都带 `code`、`retryable`、`hint`；核心工具成功响应带 `next_actions`。
+
+MCP 侧车是同一个契约的 stdio / Streamable HTTP 入口：`CivitaiFreeToolMCP.exe`。
+Skill 在 `skills/civitai-free-tool/`，负责安装、recipes 和安全边界。
+
 ## 1. 观测
 
 ### `GET /api/automation/state`
-版本、关键配置、最近 20 条任务（含 `routed_dir` / `route_reason`）、待选文件、界面状态。
+版本、关键配置、`config_rev`、最近 20 条任务（含 `routed_dir` / `route_reason` /
+`postprocess` / `postprocess_errors`）、待选文件、界面状态（`ui.guides` 给出新手引导是否会弹、
+`auto_guides`、`dismiss_rev` / `dismiss_targets`，以及前端上报的 `overlays[]`：
+名称/标题/是否阻塞/上报时间）。
 
 ### `GET /api/automation/tasks`
 参数：`ids`(csv)、`status`(csv)、`limit`、`since`(ms)、`wait=1`、`timeout`(秒，默认 300，上限 1800)。
@@ -71,6 +114,9 @@ AI 不必猜配置值形状、也不必读源码：
 - `wait=1` 无 `ids`：阻塞到队列里没有 pending/downloading。
 - 返回 `{ok, tasks, count, waited_s, timed_out}` —— `timed_out=true` 表示到点仍未终态，
   不是失败，按需再查。
+- 每行带完整性结论 `expected_sha256 / actual_sha256 / verification_status`
+  （`verified` / `mismatch` / `unverified`）：只有 `hash_mismatch` 分不清「校验通过」与「根本没校验」，
+  而 `unverified` 是如实状态，不是失败。
 
 ### `GET /api/automation/extension`
 浏览器扩展通道状态：`download_requests`、`archive_files_written`、`archive_done_calls`、
@@ -88,6 +134,32 @@ AI 不必猜配置值形状、也不必读源码：
 ### `GET /api/automation/events`
 增量事件流：`since`（上次返回的 `next_since`）、`limit`。每条事件带自增 `seq`。
 比 `logs?source=events` 更适合轮询——只拿新增的那几条，不重复读全量。
+
+### `GET /api/automation/events/stream`（SSE）
+领域事件推送，把「AI 每秒轮询 state」变成「弹层/任务/扫描一有变化就收到」：
+
+- 响应：`text/event-stream`，标准 `event:` / `id:` / `data:`，每 15 秒一条 `: keep-alive` 注释心跳。
+- 参数：`since=<seq>`（或标准 `Last-Event-ID` header）、`types=<csv 事件名/组名|all>`、
+  `snapshot=0|1`（默认 1：新连接先发一条 `state.snapshot` 作为基线；重连且无缺口时不重发）。
+- 事件目录由 `ai_contract.EVENTS` 生成，可通过 `/api/automation/ai` 的 `caps.events` 或
+  `/api/automation/openapi.json` 的 `x-cft-events` 读到；默认订阅全部领域事件，
+  `api.call` 仅在 `types=all` 时实时推送，不参与历史重放。
+- 事件源是 1 秒快照差分（任务、待选文件、模型/资源库扫描、可见弹层、配置版本），
+  不向下载器埋点；因此事件最多延迟约 1 秒，与前端轮询同一量级。
+  待选文件按变更日志（`state.file_choice_transitions` + `file_choice_rev`）读取，
+  一闪而过的 pending→resolved 也不会漏；瞬时完成的补 `created`+`finished`，
+  两次采样之间跑完的扫描补 `*.finished`。
+- 可靠性：环形缓冲 500 条；`Last-Event-ID` 在缓冲内按序补发（补发同样只给 `types` 订阅的类别），
+  超出先发 `stream.reset` 再转实时；每客户端队列 256，满时丢最旧并补一条 `stream.overflow`；
+  最多 8 个并发订阅，超出返回 429 + `hint`。
+  最后一个订阅者断开后采样线程保留 30 秒宽限期，宽限期内重连可继续重放；服务退出走
+  `shutdown()`，`app.stopping` 尽力发送，被强杀时可能缺席——以连接关闭为准。
+- 安全：只监听 `127.0.0.1`；事件只带配置键名，绝不带 `api_key` / 翻译密钥 / token 值；
+  `config.proxy_address` 里的 `user:pass@` 在状态层就脱敏。
+
+```bash
+curl -N "http://127.0.0.1:47531/api/automation/events/stream?types=task,ui,file_choice"
+```
 
 ### `GET /api/automation/history`
 下载历史（已完成/失败/取消，倒序）。参数：`limit`、`status`、`detail=1`。
@@ -238,11 +310,22 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 ```
 
 回答：模型/版本信息、每个文件的名称与体积、**会落进哪个目录**、分流原因、
-`exists`（目标文件已在盘上）、`queued`（已在下载队列）、`in_library`（模型库已有该版本）。
+`exists`（目标文件已在盘上，分流关闭时按 `download_target_dir`/`download_dir` 预判）、
+`queued`（已在下载队列）、`in_library`（模型库已有该版本）。每个文件还有只读的
+`placement`：
+
+```json
+{"dest_dir": "D:/models/loras/demo", "routed_dir": "D:/models/loras/demo",
+ "folder": "loras", "expected_folder": "loras",
+ "under_models_root": true, "under_configured_root": true,
+ "status": "routed", "hint": ""}
+```
+
+`status`：`routed`（在 `comfyui_models_root/<类型>/` 下）、`under_root`（在模型根但没进类型目录）、
+`outside_root`（不在任何已配置模型根内）、`pending`（下载开始才解析）。
+`hint` 给出可执行的修复方向；本接口仍**不建目录、不入队、不下载**。
 `probe=true` 才做 safetensors 头嗅探（两次 Range 请求），用于 Checkpoint/Model 这类
 `checkpoints` 与 `diffusion_models` 分不清的情况。
-
-**不建目录、不入队、不下载。**
 
 ### `POST /api/automation/resolve`
 参数：`url` 或 `model_id`(+`version_id`)。比 `plan` 多返回 `versions`（全部版本的 id/名称/底模/
@@ -263,11 +346,14 @@ C 站公开模型搜索（只读，`limit` 夹在 1–20，站点根跟随 `site
 - `{"urls": ["...", "..."]}`：批量提交（`file_ids` 不能与 `urls` 同用）。
 
 - `caps` 缺省就是 `["bundle"]`：自动化默认开启类型分流，本体与附属文件才会进同一个目录。
-- **目标文件已存在时不会重下**：返回 `{ok:true, skipped:"exists", files:[...]}`（`task` 为 null），
-  `hint` 指向 `force:true`。这是给 AI 兜底的——它看不到界面，直接对已下载过的模型调
-  `/download` 会白传几百 MB 并覆盖同名文件（实测 284MB）。`force:true` 显式要求重下。
+- **目标文件已存在时不会重下**：返回 `{ok:true, skipped:"exists", files:[...], placement:{...}}`
+  （`task` 为 null），`hint` 指向 `force:true`。这是给 AI 兜底的——它看不到界面，直接对已下载过的
+  模型调 `/download` 会白传几百 MB 并覆盖同名文件（实测 284MB）。`force:true` 显式要求重下。
   预判只看单条 `url`/`model_id`；`urls`/`file_ids` 批量不做预判（避免 N 次解析）。
-  分流关闭时算不出落点，也就无从预判，行为与旧版一致。
+  分流关闭时按 `download_target_dir` / `download_dir` 预判；两者都为空才退回旧行为。
+- **返回落点**：单条结果与每个 item 都带 `placement`（结构同 `plan`），
+  `skipped=exists` 时也带；任务还没解析出落点时 `status=pending`。
+  它只报告，不会移动文件、不会改配置。
 - `wait=true`（默认）：阻塞到本次提交产生的**全部**新任务进入终态，返回 `task`（单条）或
   `items`（多条，每条含 `submit`/`task`/`verify`）；`timed_out=true` 表示到点未完成。
 - `verify=true`（默认）：完成后再跑一次落点校验（文件/附属文件）。**会先等收尾结束**
@@ -356,6 +442,10 @@ cover 分头补，既不知道补完没有，也没有一次做完的入口。
 的存在性、可写性、剩余空间；`type_dirs` 列出 ComfyUI 核心类型目录哪些已存在。
 用于回答「为什么没分流」——分流只写已存在的类型目录，不新建。
 
+`candidates` / `suggested_root`：从这些已配置目录**自身或直接上级**里，找出包含至少两个
+ComfyUI 核心类型目录的路径，作为 `comfyui_models_root` 的建议值。只读、不扫整盘、不自动写配置。
+配合 `POST /api/automation/config` 写 `{"route_by_type": true, "comfyui_models_root": "<suggested_root>"}`。
+
 ### `POST /api/automation/move`
 移动模型或其落点，三种目标任选其一：
 
@@ -399,6 +489,11 @@ cover 分头补，既不知道补完没有，也没有一次做完的入口。
 ### `GET /api/automation/verify`
 参数：`task_id` 或 `path`，可选 `hash=1` 重算 SHA256。
 
+用 `task_id` 时，下载那一刻的结论会原样带出（`expected_sha256 / actual_sha256 /
+verification_status`），`verification_status=verified` 时 `sha256_ok` 直接给 `true`，
+不必为了确认完整性再花几十秒重算；没校验过就保持 `sha256_ok=null`，并在 `hash=1` 又缺期望值时
+附 `sha256_hint` 说明「只给实算值、没有可比对的期望哈希」。
+
 校验项：模型文件存在、体积、SHA256（与任务记录的期望值比对）、
 `.civitai.info` / `.json` / `_评论.txt`、封面、`.images/` 目录与帧数、
 扩展产物 `评论.txt` / `example.json`。
@@ -432,7 +527,7 @@ cover 分头补，既不知道补完没有，也没有一次做完的入口。
 `download_name_mode`、`filename_include_version`、`rename_clean_rules`、
 `max_concurrent_downloads`、`download_timeout`、`download_retry`、
 `gen_metadata`、`save_raw_json`、`save_translated_json`、`auto_translate`、
-`target_env`、`organize_mode`、`archive_root`。
+`target_env`、`organize_mode`、`archive_root`、`onboarding_done`、`auto_guides`。
 
 出现白名单外的键 → 整条 400，**不做部分生效**。写入走 `Api.save_config`（与设置页同一条路径，
 含多目录规范化与下载器重绑）。
@@ -455,6 +550,7 @@ python scripts/verify_e2e.py --task <task_id> --hash      # 只校验已有任�
 python scripts/ai_flow_audit.py                            # 卡点审计：API 层走完整流程并计时
 python scripts/ai_flow_audit.py --e2e                      # 额外真实下载一个 1–20MB 的小模型
 python scripts/ai_ui_audit.py                              # 卡点审计：真 Chromium 打开界面，验配置改动是否即时生效
+python scripts/smoke_agent_transports.py --json             # OpenAPI + /tool/{name} + SSE 重放（只读）
 ```
 
 `ai_flow_audit.py` 只回答三个问题：某一步是不是**必须人工介入**、是不是**没有完成信号**、
@@ -477,3 +573,6 @@ python scripts/ai_ui_audit.py                              # 卡点审计：真 
   所有 content 消息经 background 代发；归档日志由 offscreen 转交 bg 落盘。
 - `plan` 的 `probe=true` 会走网络；默认关闭以免干跑变慢。
 - 自动化端点与 `/api/rpc` 同源放行：本机任何进程都能调用，**不要在没有本机信任的前提下暴露端口**。
+- 请求体上限：`POST /api/automation/{tool,vision/analyze}` 与 `tool/{name}` 中属于
+  `ai_contract.LARGE_BODY_TOOLS`（当前只有 `cft_inspect_image`，MCP 图片上传入口）放宽到 8MB，
+  其余自动化端点与别名仍是 1MB；超限返回 413 + `limit_bytes`，不把桥变成任意大文件入口。
