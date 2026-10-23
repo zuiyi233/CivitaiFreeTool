@@ -173,10 +173,14 @@ class TestFullBuild(TempDirCase):
         fake_cli = os.path.join(out, 'CivitaiFreeToolCLI.exe')
         with open(fake_cli, 'wb') as f:
             f.write(b'MZ' + bytes(2048))
+        fake_mcp = os.path.join(out, 'CivitaiFreeToolMCP.exe')
+        with open(fake_mcp, 'wb') as f:
+            f.write(b'MZ' + bytes(3072))
         notes = os.path.join(ROOT, 'docs', 'releases', 'v%s.md' % VERSION)
-        bra.build(out, VERSION, fake_exe, notes, cli_exe_path=fake_cli)
+        bra.build(out, VERSION, fake_exe, notes, cli_exe_path=fake_cli, mcp_exe_path=fake_mcp)
         names = {n for n in os.listdir(out)
-                 if n not in ('CivitaiFreeToolWeb.exe', 'CivitaiFreeToolCLI.exe')}
+                 if n not in ('CivitaiFreeToolWeb.exe', 'CivitaiFreeToolCLI.exe',
+                              'CivitaiFreeToolMCP.exe')}
         self.assertEqual(names, REQUIRED_NAMES | {'release_assets.json'},
                          '附件集合必须正好等于 release_github.py 认可的那 6 个')
         manifest = json.loads(io.open(os.path.join(out, 'release_assets.json'), encoding='utf-8').read())
@@ -208,6 +212,9 @@ class TestFullBuild(TempDirCase):
                              open(fake_exe, 'rb').read())
             self.assertEqual(z.read('%s/%s' % (bra.PORTABLE_ROOT, bra.CLI_EXE_NAME)),
                              open(fake_cli, 'rb').read())
+            # 冻结版只拉起「同目录」的侧车：便携包里没它，用户就没有 MCP
+            self.assertEqual(z.read('%s/%s' % (bra.PORTABLE_ROOT, bra.MCP_EXE_NAME)),
+                             open(fake_mcp, 'rb').read())
             self.assertTrue([n for n in z.namelist() if n.startswith(bra.PORTABLE_ROOT + '/chrome-extension/lib/model-status.js')],
                             '便携包里的扩展必须含状态模块（旧包就是缺这些才暴露的）')
 
@@ -217,6 +224,7 @@ class TestFullBuild(TempDirCase):
             'CivitaiFreeTool v9.9.9',
             '解压到个人可写目录后运行 CivitaiFreeToolWeb.exe。首次运行配置默认写在 EXE 旁，可在设置修改软件信息储存位置。',
             '命令行/脚本调用：CivitaiFreeToolCLI.exe --bridge http://127.0.0.1:47531 doctor（用法见 docs/ai-cli-webhook.md）。',
+            'MCP 侧车 CivitaiFreeToolMCP.exe 与桌面端同目录，桌面端启动时会自动拉起它（47532，Bearer token 只写本机文件）。',
             '更新旧版请只替换 EXE，保留 user_config.json、任务/历史和缓存。',
             'Chrome：加载已解压的 chrome-extension 目录。',
             'Firefox：使用 Release 中的独立 Firefox ZIP 临时加载，长期安装需要 Mozilla 签名。',
@@ -234,6 +242,20 @@ class TestFullBuild(TempDirCase):
             bra.build(out, VERSION, fake_exe, notes,
                       cli_exe_path=os.path.join(out, 'missing-cli.exe'))
         self.assertIn('CLI EXE', str(ctx.exception))
+
+    def test_missing_mcp_exe_refuses(self):
+        out = self._mktmp()
+        fake_exe = os.path.join(out, 'CivitaiFreeToolWeb.exe')
+        with open(fake_exe, 'wb') as f:
+            f.write(b'MZ' + bytes(4096))
+        fake_cli = os.path.join(out, 'CivitaiFreeToolCLI.exe')
+        with open(fake_cli, 'wb') as f:
+            f.write(b'MZ' + bytes(2048))
+        notes = os.path.join(ROOT, 'docs', 'releases', 'v%s.md' % VERSION)
+        with self.assertRaises(RuntimeError) as ctx:
+            bra.build(out, VERSION, fake_exe, notes, cli_exe_path=fake_cli,
+                      mcp_exe_path=os.path.join(out, 'missing-mcp.exe'))
+        self.assertIn('MCP EXE', str(ctx.exception))
 
     def test_wrong_version_refuses(self):
         out = self._mktmp()

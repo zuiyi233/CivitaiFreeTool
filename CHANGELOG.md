@@ -23,7 +23,9 @@
 4. **发现面**：`cft_capabilities` 增加 `caps.webhook`（启用/配置/事件/目标 host）与
    `caps.cli`（命令/退出码），`caps.transports` 增加 webhook/CLI；OpenAPI 增加
    `x-cft-transports`；`/api/automation` 清单与 `/schema` 增加 webhook 端点/配置键说明。
-5. **打包与文档**：便携 ZIP 增加 `CivitaiFreeToolCLI.exe`（不新增顶层发布资产）；
+5. **打包与文档**：便携 ZIP 增加 `CivitaiFreeToolCLI.exe` 与 `CivitaiFreeToolMCP.exe`
+   （两者都不新增顶层发布资产；冻结版只拉起「同目录」的 MCP 侧车，便携包此前从未带它，
+   按 ZIP 安装的用户因此拿不到 MCP 自启动，本版修复）；
    `docs/ai-cli-webhook.md` 记录完整契约；新增 `tests/test_webhook.py`、`tests/test_ai_cli.py`，
    `tests/test_automation_sse.py` 增加 sink 生命周期用例。`scripts/verify_webhook_delivery.py`
    用一次真实下载证明 `task.created/updated/finished` 确实推到接收端并逐条校验 HMAC

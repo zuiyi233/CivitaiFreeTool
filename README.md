@@ -134,7 +134,7 @@
 ## 快速开始（Windows）
 
 1. 在 [Releases](https://github.com/ADVICEsama/CivitaiFreeTool/releases/latest) 下载 Windows 便携 ZIP 或版本号 EXE。
-2. 解压到个人可写目录，运行 `CivitaiFreeToolWeb.exe`。默认启动软件窗口，失败才按兜底开关打开浏览器。设置“启动界面”为浏览器后，以后直接启动浏览器，不创建软件窗口；选择即保存、重启生效。临时打开浏览器不会改长期模式。
+2. 解压到个人可写目录，运行 `CivitaiFreeToolWeb.exe`。默认启动软件窗口，失败才按兜底开关打开浏览器。设置“启动界面”为浏览器后，以后直接启动浏览器，不创建软件窗口；选择即保存、重启生效。临时打开浏览器不会改长期模式。便携 ZIP 同目录还带 `CivitaiFreeToolCLI.exe`（命令行客户端，`doctor` 一条自检）与 `CivitaiFreeToolMCP.exe`（MCP 侧车，桌面端启动时自动拉起 47532）。
 3. 设置下载目录、模型管理目录；如需要，在 C站账户中申请 API Key 后填写。它不是使用本地模型管理的前提。
 4. 粘贴 Civitai / HuggingFace 链接进行下载，或扫描已有模型。
 
