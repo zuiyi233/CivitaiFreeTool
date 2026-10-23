@@ -8,9 +8,9 @@
 
 跑法：
     pyinstaller --clean --noconfirm CivitaiFreeToolCLI.spec
-    python scripts/build_release_assets.py --version 2.7.0 --assets-dir .tools/release2700
+    python scripts/build_release_assets.py --version 2.8.0 --assets-dir .tools/release2800
 然后：
-    python scripts/release_github.py 2.7.0 docs/releases/v2.7.0.md --assets-dir .tools/release2700 \
+    python scripts/release_github.py 2.8.0 docs/releases/v2.8.0.md --assets-dir .tools/release2800 \
         --repo zuiyi233/CivitaiFreeTool --remote origin
 """
 import argparse

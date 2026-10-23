@@ -1,6 +1,6 @@
-# CivitaiFreeTool 更新日志（v1.5.1 → v2.7.0）
+# CivitaiFreeTool 更新日志（v1.5.1 → v2.8.0）
 
-## 未发布：AI 调用面 CLI / webhook 传输层
+## v2.8.0：AI 调用面 CLI / webhook 传输层
 
 契约仍是 `ai_contract.py` 的 29 工具 / 21 事件；这一版只补最后两个传输方向，不新增工具、
 不改执行链、不改下载器。
@@ -27,6 +27,8 @@
    `docs/ai-cli-webhook.md` 记录完整契约；新增 `tests/test_webhook.py`、`tests/test_ai_cli.py`，
    `tests/test_automation_sse.py` 增加 sink 生命周期用例。第三方平台（Dify/n8n 等）仍不做
    虚假导入验收，按文档步骤由有环境的用户验证。
+6. **CLI 输出编码**：非 TTY（管道/重定向）时 stdout/stderr 强制 UTF-8。Windows 默认按 ANSI 代码页
+   写出，脚本与 Agent 捕获到的中文错误会变成乱码；交互式控制台行为不变。
 
 ## v2.7.0：MCP 接入层 + 文本/多模态双通道
 

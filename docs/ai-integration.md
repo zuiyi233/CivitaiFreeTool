@@ -1,7 +1,7 @@
 # AI 接入契约（MCP / Skill / HTTP）
 
-> 状态：v2.7.0 契约（MCP / OpenAPI / SSE / Skill / HTTP / CLI / webhook 均已落地）。
-> 唯一事实源是 `ai_contract.py`；本文解释结构与边界，不重复维护工具表。
+> 状态：契约仍是 v2.7.0 定义的 29 工具 / 21 事件；MCP / OpenAPI / SSE / Skill / HTTP 自 v2.7.0，
+> CLI 与出站 webhook 自 v2.8.0。唯一事实源是 `ai_contract.py`；本文解释结构与边界，不重复维护工具表。
 
 ## 1. 角色
 
