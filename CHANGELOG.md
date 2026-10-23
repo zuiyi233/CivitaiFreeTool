@@ -91,6 +91,16 @@
     `const` 第二次声明直接抛 `SyntaxError`、整批脚本静默失效（`lib/util.js` 的 `_utf8Len`），已改成顶层
     `var`，并加上"manifest 注入清单里不许有顶层 const/let/class"的静态不变量与真加载重复注入回归。
     设计见 `docs/extension-status-autoshow.md`。
+18. **发布资产重建与门禁**（`scripts/build_release_assets.py`）：审计 v2.6.32 的 Release 附件时发现
+    两份扩展 ZIP 其实还是 **Chrome 2.3.0 / Firefox 1.4.0** 时代的包（ZIP 里没有 `lib/model-status.js`、
+    `sidepanel.html`、`lib/tab-index.js`），而 `release_verified.py` 的哈希校验全绿——它只比"上传的文件
+    == 清单里的文件"，从不问"这个 ZIP 是不是当前源码树打的"。手工流程漏一步就是静默发旧包。
+    现在六个附件（EXE、便携 ZIP、两份扩展 ZIP、源码 ZIP、SHA256SUMS）一条命令生成，并把这些判定变成硬门禁：
+    ZIP 内 manifest 版本 == 源码 manifest 版本、关键文件在场、每个条目都能在源码树里逐字节对上、
+    不许目录项/嵌套 ZIP、便携 ZIP 里的扩展与独立 ZIP 同源、`APP_VERSION` 与 `--version` 必须一致、
+    清单绑定 `git rev-parse HEAD`。`更新说明.md` 改为直接取 `docs/releases/v<版本>.md` 全文（不再手抄），
+    `使用说明.txt` 文案进脚本、只随版本换行。回归见 `tests/test_build_release_assets.py`（10 项），
+    流程写进 `docs/RELEASING.md` 第 7 步。
 
 ## 🧩 浏览器扩展：模型下载状态与工作台（Chrome 2.7.0 / Firefox 1.8.0，本 fork 新增）
 

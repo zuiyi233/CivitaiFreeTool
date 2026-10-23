@@ -9,6 +9,10 @@
 5. 只提交应用源码、长期测试与发布文档；**不能上传 API Key、用户配置、任务/历史 JSON、图片缓存或用户模型/素材目录**。
 6. 正常推送 main，不强推。附件清单须绑定这次提交的完整 SHA。
 7. Release 附件为版本号 EXE、Windows 便携 ZIP、Chrome 扩展 ZIP、Firefox 扩展 ZIP、源码 ZIP、SHA256SUMS.txt；扩展 ZIP 的 manifest.json 必须位于根目录，不嵌套旧 ZIP。
+   - **六个附件一律由 `python scripts/build_release_assets.py --version <版本> --assets-dir <目录>` 生成，不要手工复制。** 事故记录：v2.6.32 的 Release 里两份扩展 ZIP 实际是 2.3.0 / 1.4.0 时代的旧包（ZIP 内没有 `lib/model-status.js`、`sidepanel.html`、`lib/tab-index.js`），而 `release_verified.py` 的哈希校验全绿——它只保证"上传的文件 == 清单里的文件"，从不问"这个 ZIP 是不是当前源码树打的"。手工流程漏掉一步就是静默发旧包，用户从 Release 装到的扩展少几个阶段的功能。
+   - 脚本自带的门禁（任一不满足直接失败，不落半成品）：ZIP 内 `manifest.json` 的 version 必须等于源码 manifest 的 version；关键文件必须在场；条目必须都能在源码树里找到且**逐字节相同**；不许有目录项、不许嵌套 ZIP；便携 ZIP 里的扩展必须与独立 ZIP 同源；`APP_VERSION` 与 `--version` 对不上就中止；`SHA256SUMS.txt` 为 5 行 CRLF 且与磁盘哈希一致；`release_assets.json` 绑定 `git rev-parse HEAD`。**所以要在提交之后再跑**，否则清单里的 commit 不是最终 HEAD。
+   - `更新说明.md` 直接取 `docs/releases/v<版本>.md` 全文（不再手抄精简版：手抄就是同款静默腐烂风险）；`使用说明.txt` 的文案在脚本里，只有版本号随 `--version` 变。
+   - 测试：`tests/test_build_release_assets.py`（把"旧包/缺文件/多文件/改过一个字节"四种病灶各钉一条，外加整套 build 的自洽性）。
    - **两份扩展 ZIP 的文件名固定不带版本号**（`CivitaiFreeTool-ChromeExtension.zip` / `CivitaiFreeTool-FirefoxExtension.zip`，版本只在 Release tag、`manifest.json` 的 `version` 和更新说明里）。原因：Windows"全部提取"用 ZIP 文件名建目录；没有 `key` 的未打包扩展会按路径推导 ID，而同一 ID 不能并存两份。名字固定后解压就是原地覆盖，扩展管理页点一次"重新加载"即可，`chrome.storage` 与 IndexedDB 里的提交记录/历史不会丢。
    - `chrome-extension/manifest.json` 的 `"key"`（公钥 SPKI DER 的 base64，非机密）**不得删除**：它把 ID 从路径解绑，换目录、换机器、从源码树加载都仍是同一个 ID（`cljlgpakghbofcdjbimchcmefdfnfdii`），存储和权限授权因此不再丢。同一浏览器里同 ID 不能并存两个未打包扩展，所以从旧版（无 `key`）迁移过去的那一次仍要先移除旧条目再加载新目录，此后不再需要。
    - 便携 ZIP 用 `CivitaiFreeTool/` 单层根目录，内含 `CivitaiFreeToolWeb.exe`、`更新说明.md`、`使用说明.txt`、`chrome-extension/**`、`firefox-extension/**`；只放文件不放目录项，全部 deflate。两份说明**不在仓库里**：`更新说明.md` 由 `docs/releases/v<版本>.md` 精简成用户视角，`使用说明.txt` 只把版本号换掉、其余文案沿用。源码 ZIP 用 `git archive HEAD`（不加前缀，根级就是 `.github/`、`CHANGELOG.md`）。`SHA256SUMS.txt` 为 5 行 `<64位哈希>␣␣<文件名>`、按文件名排序、CRLF、无 BOM。
