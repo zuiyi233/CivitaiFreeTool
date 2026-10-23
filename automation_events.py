@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import queue
@@ -190,6 +191,7 @@ class Subscription:
 class EventHub:
     def __init__(self, *, snapshot_provider=None, tasks_provider=None,
                  model_scan_provider=None, library_scan_provider=None,
+                 config_provider=None,
                  interval=DEFAULT_INTERVAL_S, idle_stop=DEFAULT_IDLE_STOP_S,
                  max_clients=MAX_CLIENTS, queue_size=QUEUE_MAX, ring_max=RING_MAX):
         limits = getattr(ai_contract, "AGENT_TRANSPORT_LIMITS", {})
@@ -204,9 +206,12 @@ class EventHub:
         self._tasks_provider = tasks_provider
         self._model_scan_provider = model_scan_provider
         self._library_scan_provider = library_scan_provider
+        # 原始配置只用于算 config.changed.keys；对外快照仍是脱敏后的 state.config。
+        self._config_provider = config_provider
         self._lock = threading.RLock()
         self._ring = deque(maxlen=self.ring_max)
         self._subs = set()
+        self._sinks = set()
         self._seq = 0
         self._prev = None
         self._sampler = None
@@ -235,6 +240,12 @@ class EventHub:
         ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
         guides = ui.get("guides") if isinstance(ui.get("guides"), dict) else {}
         config = state.get("config") if isinstance(state.get("config"), dict) else {}
+        raw_config = self._safe_call(self._config_provider, None)
+        if not isinstance(raw_config, dict):
+            raw_config = config
+        else:
+            # 配置是原地更新的同一个 dict；必须快照，否则上一帧也会被改成新值。
+            raw_config = copy.deepcopy(raw_config)
         choice_log = state.get("file_choice_transitions")
         if not isinstance(choice_log, list):
             choice_log = []
@@ -250,6 +261,7 @@ class EventHub:
             "dismiss_targets": list(guides.get("dismiss_targets") or []) if isinstance(guides, dict) else [],
             "config_rev": int(state.get("config_rev") or 0),
             "config": config,
+            "config_raw": raw_config,
         }
 
     def _ensure_sampler(self):
@@ -270,7 +282,7 @@ class EventHub:
     def _run(self):
         while not self._stop.wait(self.interval):
             with self._lock:
-                if not self._subs:
+                if not self._subs and not self._sinks:
                     idle = time.time() - self._last_sub_at
                     if idle >= self.idle_stop:
                         self._sampler = None
@@ -366,7 +378,10 @@ class EventHub:
             out.append(("ui.dismissed", {"rev": int(curr.get("dismiss_rev") or 0),
                                          "targets": list(curr.get("dismiss_targets") or [])}, "ui"))
 
-        old_cfg, new_cfg = prev.get("config") or {}, curr.get("config") or {}
+        old_cfg = prev.get("config_raw") if isinstance(prev.get("config_raw"), dict) \
+            else (prev.get("config") or {})
+        new_cfg = curr.get("config_raw") if isinstance(curr.get("config_raw"), dict) \
+            else (curr.get("config") or {})
         if int(curr.get("config_rev") or 0) != int(prev.get("config_rev") or 0):
             keys = sorted(k for k in set(old_cfg) | set(new_cfg)
                           if _json_key(old_cfg.get(k)) != _json_key(new_cfg.get(k)))
@@ -391,9 +406,36 @@ class EventHub:
             if replay:
                 self._ring.append(event)
             subs = list(self._subs)
+            sinks = list(self._sinks)
         for sub in subs:
             sub.offer(event)
+        for sink in sinks:
+            try:
+                sink(event)
+            except Exception:
+                # sink 是旁路：webhook 故障不能影响 SSE / 下载 / 其它订阅者。
+                continue
         return event
+
+    def add_sink(self, sink):
+        """注册旁路消费者（webhook）：不占 SSE 客户端名额，但同样维持采样线程。"""
+        if not callable(sink):
+            return False
+        with self._lock:
+            if self._dead:
+                return False
+            self._sinks.add(sink)
+            self._ensure_sampler()
+        return True
+
+    def remove_sink(self, sink):
+        with self._lock:
+            self._sinks.discard(sink)
+            self._last_sub_at = time.time()
+
+    def active_sinks(self):
+        with self._lock:
+            return len(self._sinks)
 
     def subscribe(self, since=None, types=None, queue_size=None):
         with self._lock:
@@ -432,11 +474,12 @@ class EventHub:
             if self._dead:
                 return
             self._dead = True
-        if self._subs:
+        if self._subs or self._sinks:
             self.publish("app.stopping", {"pid": os.getpid()}, group="app")
         with self._lock:
             subs = list(self._subs)
             self._subs.clear()
+            self._sinks.clear()
             self._stop.set()
         for sub in subs:
             sub.close(clear=False)

@@ -292,6 +292,9 @@ AUTOMATION_CONFIG_KEYS = (
     "target_env", "organize_mode", "archive_root",
     # 首次引导：AI 不需要人类的新手引导，可直接关闭并禁止自动弹出
     "onboarding_done", "auto_guides",
+    # 出站 webhook：默认关闭；secret/URL 在状态与保存响应里打码
+    "webhook_enabled", "webhook_url", "webhook_events",
+    "webhook_secret", "webhook_allow_remote",
 )
 
 
@@ -343,7 +346,9 @@ def automation_state():
         choice_log = list(api.get_download_file_choice_transitions(0) or [])[-20:]
     except Exception:
         choice_log = []
-    config = {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS}
+    import automation_api
+    config = automation_api.redact_config_values(
+        {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS})
     config["proxy_address"] = _redact_proxy_address(config.get("proxy_address"))
     ui = dict(_ui_state)
     done = cfg.get("onboarding_done") is True
@@ -1422,13 +1427,29 @@ class _Handler(BaseHTTPRequestHandler):
             return 400, {"ok": False, "msg": "不允许修改的配置项: " + ", ".join(bad),
                          "allowed": list(AUTOMATION_CONFIG_KEYS)}
         try:
+            import webhook_dispatch
+            webhook_dispatch.validate_patch(patch, getattr(api, "cfg", None) or {})
+        except webhook_dispatch.WebhookConfigError as e:
+            return 400, {"ok": False, "msg": str(e),
+                         "hint": "webhook 配置整条校验：非法键/URL/密钥/事件名都会拒绝，不做部分生效"}
+        try:
             ok = api.save_config(dict(patch))
         except Exception as e:
             return 500, {"ok": False, "msg": "保存失败: %s" % str(e)[:120]}
         if ok is False:
             return 500, {"ok": False, "msg": "保存失败（配置未变更）"}
+        try:
+            import automation_events
+            import webhook_dispatch
+            webhook_dispatch.refresh_from_config(getattr(api, "cfg", None) or {},
+                                                automation_events.get_hub())
+        except Exception:
+            pass
+        import automation_api
         cfg = getattr(api, "cfg", None) or {}
-        return 200, {"ok": True, "config": {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS}}
+        return 200, {"ok": True,
+                     "config": automation_api.redact_config_values(
+                         {k: cfg.get(k) for k in AUTOMATION_CONFIG_KEYS})}
 
     def _rpc(self, origin):
         """浏览器模式通用方法调用：{method, args:[...]} → {result} / {error}"""
@@ -1741,7 +1762,12 @@ def start(version="", port=None):
                 tasks_provider=_event_tasks_snapshot,
                 model_scan_provider=_event_model_scan,
                 library_scan_provider=_event_library_scan,
+                # 只用原始配置算 keys；SSE 快照仍走 automation_state 的脱敏值。
+                config_provider=lambda: getattr(_api, "cfg", None) or {},
             )
+        import webhook_dispatch
+        webhook_dispatch.refresh_from_config(getattr(_api, "cfg", None) or {},
+                                            automation_events.get_hub())
     except Exception:
         pass
     if _server is not None:
@@ -1763,6 +1789,11 @@ def stop():
     try:
         import automation_events
         automation_events.shutdown()
+    except Exception:
+        pass
+    try:
+        import webhook_dispatch
+        webhook_dispatch.shutdown(flush_s=1.0)
     except Exception:
         pass
     if _server is not None:

@@ -12,6 +12,7 @@ import time
 from urllib.parse import quote
 
 import ai_contract
+import webhook_dispatch
 
 
 # cft_list_tasks 的默认投影：够判断「下没下完、落在哪、校验过没有」，
@@ -339,6 +340,15 @@ def _mcp_runtime(cfg):
 
 def capabilities_payload(api, ctx, include_tools=False):
     version = str((ctx or {}).get("version") or "")
+    cfg = getattr(api, "cfg", None) or {}
+    webhook_url = str(cfg.get("webhook_url") or "")
+    raw_events = cfg.get("webhook_events")
+    webhook_events = ([str(x) for x in raw_events if str(x).strip()]
+                      if isinstance(raw_events, (list, tuple))
+                      else list(ai_contract.WEBHOOK_DEFAULT_EVENT_GROUPS))
+    if not webhook_events:
+        webhook_events = list(ai_contract.WEBHOOK_DEFAULT_EVENT_GROUPS)
+    webhook_enabled = cfg.get("webhook_enabled") is True
     data = {
         "ok": True, "app": "CivitaiFreeTool", "version": version,
         "api_version": ai_contract.API_VERSION,
@@ -360,9 +370,31 @@ def capabilities_payload(api, ctx, include_tools=False):
             "openapi": True,
             "sse": True,
             "events": [e["type"] for e in ai_contract.EVENTS],
+            "webhook": {
+                "available": True,
+                "enabled": webhook_enabled,
+                "configured": bool(webhook_enabled and webhook_url
+                                   and str(cfg.get("webhook_secret") or "")),
+                "url_host": webhook_dispatch.url_info(webhook_url)["host"],
+                "events": webhook_events,
+                "signature": "HMAC-SHA256",
+                "endpoint": "/api/automation/webhooks",
+            },
+            "cli": {
+                "available": True,
+                "command": "CivitaiFreeToolCLI.exe",
+                "source": "cft_cli.py",
+                "transport": "http-bridge",
+                "bridge": ai_contract.DEFAULT_BRIDGE,
+                "commands": ["health", "capabilities", "tools", "guide", "openapi",
+                             "call", "batch", "events", "doctor"],
+                "exit_codes": dict(ai_contract.CLI_EXIT_CODES),
+            },
             "transports": {
                 "openapi": "/api/automation/openapi.json?profile=text|vision|admin|all",
                 "sse": "/api/automation/events/stream?since=&types=&snapshot=1",
+                "webhook": "/api/automation/webhooks",
+                "cli": "CivitaiFreeToolCLI.exe --bridge %s doctor" % ai_contract.DEFAULT_BRIDGE,
             },
         },
         "limits": dict(ai_contract.LIMITS),

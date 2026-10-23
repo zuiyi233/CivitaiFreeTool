@@ -48,6 +48,12 @@ DEFAULTS = {
     "update_keep_old": "keep",           # 更新下载完成后旧版处理：keep=保留（默认）/ delete=移入回收站（可还原）
     "window_wait_seconds": 30,           # 窗口启动至少等待 30 秒，检测到进展可继续宽限
     "mcp_http_autostart": True,          # 冻结版随桌面端启动 MCP HTTP 侧车（47532，Bearer）；源码运行不启动
+    # 出站 webhook（AI 事件推送）：默认关；secret 本机保存但所有接口回显打码
+    "webhook_enabled": False,
+    "webhook_url": "",
+    "webhook_events": [],
+    "webhook_secret": "",
+    "webhook_allow_remote": False,
     "browser_fallback_enabled": True,   # 原生窗口仍是默认；失败时允许浏览器兜底
     "cache_detail_images": True,        # 详情在线缩略图本地缓存；不下载原图
     "pointer_effects": "off",           # off / click / trail

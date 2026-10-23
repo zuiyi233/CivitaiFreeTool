@@ -1,5 +1,33 @@
 # CivitaiFreeTool 更新日志（v1.5.1 → v2.7.0）
 
+## 未发布：AI 调用面 CLI / webhook 传输层
+
+契约仍是 `ai_contract.py` 的 29 工具 / 21 事件；这一版只补最后两个传输方向，不新增工具、
+不改执行链、不改下载器。
+
+1. **CLI `CivitaiFreeToolCLI.exe`**（源码 `cft_cli.py`，stdlib-only）：`health` / `capabilities` /
+   `tools` / `guide` / `openapi` / `call` / `batch` / `events` / `doctor`。工具调用统一走
+   `POST /api/automation/tool/{name}`；`--args` JSON、`--arg key=value` 类型解析、
+   `--save-content DIR` 把图片内容块落盘并在输出里用 `<saved>` 代替 base64。事件流支持
+   `Last-Event-ID` 断线重连、`--max` / `--idle-timeout` 收口；退出码由
+   `ai_contract.CLI_EXIT_CODES` 映射（0 成功 / 3 桌面端未运行 / 4 参数 / 5 未找到 /
+   6 需确认 / 8 超时）。只连接回环地址，不自动启动桌面端。
+2. **出站 webhook**（`webhook_dispatch.py`）：默认关闭，配置键 `webhook_*` 走现有白名单；
+   启用时必须有 URL 与至少 16 字符 secret。投递带 HMAC-SHA256 签名、事件/seq/instance/delivery
+   头；有界队列 256、4 次重试（1s/5s/15s）、不跟随重定向、不使用系统代理；默认只允许解析到
+   非公网地址的目标，`webhook_allow_remote=true` 才放行公网。`GET/POST
+   /api/automation/webhooks` 提供脱敏状态、投递日志、`test` 合成探针、清空日志与重载。
+   `webhook_url`/`webhook_secret` 在任何响应与日志里都不回显；webhook 不持久化、不跨重启重放。
+3. **事件总线 sink**：`EventHub` 新增非阻塞 `add_sink/remove_sink`，webhook 作为旁路消费者，
+   不占 SSE 的 8 个连接名额，但同样能维持 1 秒采样线程；sink 异常被隔离，不影响 SSE/下载。
+4. **发现面**：`cft_capabilities` 增加 `caps.webhook`（启用/配置/事件/目标 host）与
+   `caps.cli`（命令/退出码），`caps.transports` 增加 webhook/CLI；OpenAPI 增加
+   `x-cft-transports`；`/api/automation` 清单与 `/schema` 增加 webhook 端点/配置键说明。
+5. **打包与文档**：便携 ZIP 增加 `CivitaiFreeToolCLI.exe`（不新增顶层发布资产）；
+   `docs/ai-cli-webhook.md` 记录完整契约；新增 `tests/test_webhook.py`、`tests/test_ai_cli.py`，
+   `tests/test_automation_sse.py` 增加 sink 生命周期用例。第三方平台（Dify/n8n 等）仍不做
+   虚假导入验收，按文档步骤由有环境的用户验证。
+
 ## v2.7.0：MCP 接入层 + 文本/多模态双通道
 
 这一版把 AI 接入从「能调 HTTP」推进到 **MCP 是一等公民**：外部 AI 通过 `CivitaiFreeToolMCP.exe`

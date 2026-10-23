@@ -40,7 +40,8 @@ MCP 继续作为 Agent 的首选入口，不替代、不改协议。新增两条
 
 明确不做的事：
 
-- 不做 webhook、A2A、CLI、WebSocket；这些留到确有需求再加。
+- 不做 A2A、WebSocket、入站 webhook；出站 webhook 与 CLI 已在 P3 落地，
+  见 [CLI / webhook 传输层](ai-cli-webhook.md)。
 - 不新增工具、不改变工具语义、不改变 MCP 返回结构。
 - 不把桥暴露到局域网或公网；OpenAPI 只面向 **同一台机器上的本地 Agent**。
 - 不为 OpenAPI 再手写一份工具表；文档必须由 `ai_contract.py` 生成。
@@ -442,12 +443,14 @@ library_scan = api.lib_scan_state()    # 轻量，无行数据
 | P0 | 契约事件目录、OpenAPI 生成器、`/openapi.json`、`/tool/{name}` | ✅ 文档 19/24/24/29；别名与 `/tool` 结果一致；测试全绿 |
 | P1 | `automation_events.py`、快照差分、SSE 端点、重放/心跳/背压 | ✅ SSE 测试通过；无订阅者超过宽限期后停止采样 |
 | P2 | 打包真机验收、示例客户端、Dify/n8n/LangChain 接入文档、Skill recipes | ✅ 见本节下方实际验收；文档步骤可复现 |
-| P3（后续） | CLI 子命令、webhook、A2A | 单独立项，不阻塞本期 |
+| P3 | CLI 子命令、出站 webhook | ✅ 已实现；契约见 [ai-cli-webhook.md](ai-cli-webhook.md) |
+| P3（后续） | A2A、WebSocket、入站 webhook | 单独立项，不阻塞本期 |
 
 预计改动文件：
 
 - 新增：`openapi_projection.py`、`automation_events.py`、`tests/test_ai_openapi.py`、
-  `tests/test_automation_sse.py`。
+  `tests/test_automation_sse.py`；P3 另增 `cft_cli.py`、`webhook_dispatch.py`、
+  `CivitaiFreeToolCLI.spec`、`tests/test_ai_cli.py`、`tests/test_webhook.py`。
 - 修改：`ai_contract.py`（事件目录/caps）、`automation_api.py`（路由/清单）、
   `browser_bridge.py`（SSE 传输/状态字段/8MB 路径）、`docs/ai-integration.md`、
   `docs/automation-api.md`、`docs/releases/*`、`skills/civitai-free-tool/references/recipes.md`。

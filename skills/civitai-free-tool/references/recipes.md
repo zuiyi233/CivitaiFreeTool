@@ -304,3 +304,50 @@ data: {"seq":7,"instance_id":"...","type":"file_choice.pending",...,"data":{"id"
 **不要做**：不要为了“更快”开多个订阅；最多 8 个客户端。不要把事件当成完成证明，仍需
 `wait/verify`；不要把事件里的路径原样展示给用户前做存在性检查。
 
+## 9. CLI 与 webhook（本机脚本 / 事件外推）
+
+### 9.1 CLI
+
+```bash
+CivitaiFreeToolCLI.exe doctor
+CivitaiFreeToolCLI.exe call cft_capabilities --json
+CivitaiFreeToolCLI.exe call cft_search_models --arg query=seedream --arg limit=5
+CivitaiFreeToolCLI.exe call cft_download_model --args '{"url":"...","wait":true}'
+CivitaiFreeToolCLI.exe events --types task,file_choice --json
+CivitaiFreeToolCLI.exe call cft_view_gallery --args '{"ids":[1,2]}' --save-content .\out
+```
+
+- 只连 `127.0.0.1/localhost/::1`，不自动启动桌面端；app 不在线退出码 3。
+- 退出码：0 成功 / 2 用法 / 3 app 未运行 / 4 参数 / 5 未找到 / 6 需确认 / 7 限流 / 8 超时 / 9 版本。
+- `events` 默认跟随并断线重连；`--max N` 或 `--idle-timeout S` 收口；`--json` 是 NDJSON。
+- 需要图片时 `--save-content DIR` 落盘，stdout 不喷 base64。
+
+### 9.2 webhook（先得到用户同意）
+
+webhook 会把事件（文件名、落点、弹层、配置键名）发到用户指定的地址，属于数据出境选择。
+**先问用户目标地址是否可信、是否允许公网**，再配置：
+
+```text
+cft_configure {"action":"set","config":{
+  "webhook_enabled":true,
+  "webhook_url":"http://127.0.0.1:8799/cft-hook",
+  "webhook_secret":"<至少 16 字符的随机串>",
+  "webhook_events":["task","file_choice","ui"],
+  "webhook_allow_remote":false
+}}
+```
+
+然后：
+
+```bash
+curl -s http://127.0.0.1:47531/api/automation/webhooks
+curl -s -X POST http://127.0.0.1:47531/api/automation/webhooks \
+  -H 'Content-Type: application/json' -d '{"action":"test"}'
+```
+
+- 接收端校验 `X-CFT-Signature: sha256=HMAC(secret, "<timestamp>.<raw body>")`，拒绝时间偏差
+  >300s，并按 `X-CFT-Delivery` 去重；`webhook.test` 探针带 `X-CFT-Synthetic: 1`。
+- 重试 4 次（1s/5s/15s），不跟随 3xx；队列满/应用退出会丢事件，`stats.dropped` 如实记录。
+- **不要**把 `webhook_secret` 写进回答/日志/仓库；不要在用户未明确同意时设
+  `webhook_allow_remote=true`；不要把 webhook 当成可靠队列（需要重放用 SSE）。
+

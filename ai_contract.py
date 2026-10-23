@@ -40,6 +40,37 @@ AGENT_TRANSPORT_LIMITS = {
     "event_data_max_bytes": 64 * 1024,
 }
 
+# CLI 是桥的客户端，不是第二个执行层：退出码只做传输语义映射。
+CLI_VERSION = "1.0.0"
+CLI_EXIT_CODES = {
+    "ok": 0,
+    "internal_error": 1,
+    "usage": 2,
+    "app_not_running": 3,
+    "invalid_argument": 4,
+    "not_found": 5,
+    "destructive_requires_confirm": 6,
+    "rate_limited": 7,
+    "timeout": 8,
+    "version_mismatch": 9,
+    "unsupported": 9,
+}
+
+# webhook 是出站尽力推送：有界队列 + 有限重试，不做持久化/跨重启重放。
+WEBHOOK_LIMITS = {
+    "timeout_s": 5.0,
+    "max_attempts": 4,
+    "backoff_s": [1.0, 5.0, 15.0],
+    "queue_size": 256,
+    "log_size": 200,
+    "max_body_bytes": 64 * 1024,
+    "max_response_bytes": 64 * 1024,
+    "min_secret_length": 16,
+    "test_timeout_s": 10.0,
+}
+# api.call 是高频自检事件，默认不推；要收就显式写 "api" 或 "all"。
+WEBHOOK_DEFAULT_EVENT_GROUPS = ("task", "file_choice", "scan", "ui", "config", "app")
+
 
 def _obj(props=None, required=None, **extra):
     out = {"type": "object", "properties": props or {},
@@ -759,6 +790,7 @@ ERROR_CODES = {
     "verification_failed": {"status": 200, "retryable": False},
     "task_failed": {"status": 200, "retryable": False},
     "network_error": {"status": 502, "retryable": True},
+    "webhook_failed": {"status": 502, "retryable": False},
     "invalid_media": {"status": 400, "retryable": False},
     "internal_error": {"status": 500, "retryable": True},
 }

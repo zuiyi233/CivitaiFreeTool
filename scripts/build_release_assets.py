@@ -7,6 +7,7 @@
 这里把"打包"和"判定"收进同一条命令，任何一项对不上就直接失败，不落半成品。
 
 跑法：
+    pyinstaller --clean --noconfirm CivitaiFreeToolCLI.spec
     python scripts/build_release_assets.py --version 2.7.0 --assets-dir .tools/release2700
 然后：
     python scripts/release_github.py 2.7.0 docs/releases/v2.7.0.md --assets-dir .tools/release2700 \
@@ -23,6 +24,7 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE_NAME = 'CivitaiFreeToolWeb.exe'
+CLI_EXE_NAME = 'CivitaiFreeToolCLI.exe'
 PORTABLE_ROOT = 'CivitaiFreeTool'
 SKIP_NAMES = {'.DS_Store', 'Thumbs.db', 'desktop.ini'}
 SKIP_DIR_NAMES = {'__pycache__', '.git', '.idea'}
@@ -43,6 +45,7 @@ REQUIRED = {
 }
 USAGE_LINES = [
     '解压到个人可写目录后运行 CivitaiFreeToolWeb.exe。首次运行配置默认写在 EXE 旁，可在设置修改软件信息储存位置。',
+    '命令行/脚本调用：CivitaiFreeToolCLI.exe --bridge http://127.0.0.1:47531 doctor（用法见 docs/ai-cli-webhook.md）。',
     '更新旧版请只替换 EXE，保留 user_config.json、任务/历史和缓存。',
     'Chrome：加载已解压的 chrome-extension 目录。',
     'Firefox：使用 Release 中的独立 Firefox ZIP 临时加载，长期安装需要 Mozilla 签名。',
@@ -135,13 +138,17 @@ def usage_text(version):
     return '\n'.join(['CivitaiFreeTool v%s' % version] + USAGE_LINES) + '\n'
 
 
-def build(assets_dir, version, exe_path, notes_path, tag=None):
+def build(assets_dir, version, exe_path, notes_path, tag=None, cli_exe_path=None):
     tag = tag or ('v' + version)
     if app_version() != version:
         raise RuntimeError('APP_VERSION=%s 与要发布的 %s 不一致；先同步版本号再打附件'
                            % (app_version(), version))
     if not os.path.exists(notes_path):
         raise RuntimeError('缺少版本说明：%s' % notes_path)
+    cli_exe_path = cli_exe_path or os.path.join(os.path.dirname(exe_path), CLI_EXE_NAME)
+    if not os.path.isfile(cli_exe_path):
+        raise RuntimeError('缺少 CLI EXE：%s（先 pyinstaller --clean --noconfirm '
+                           'CivitaiFreeToolCLI.spec）' % cli_exe_path)
     os.makedirs(assets_dir, exist_ok=True)
 
     report = []
@@ -161,6 +168,7 @@ def build(assets_dir, version, exe_path, notes_path, tag=None):
     usage_bytes = usage_text(version).encode('utf-8')
     portable = os.path.join(assets_dir, 'CivitaiFreeTool-Windows-%s.zip' % tag)
     entries = [(PORTABLE_ROOT + '/' + EXE_NAME, open(exe_path, 'rb').read()),
+               (PORTABLE_ROOT + '/' + CLI_EXE_NAME, open(cli_exe_path, 'rb').read()),
                (PORTABLE_ROOT + '/更新说明.md', notes_bytes),
                (PORTABLE_ROOT + '/使用说明.txt', usage_bytes)]
     for rel_dir in ('chrome-extension', 'firefox-extension'):
@@ -173,10 +181,13 @@ def build(assets_dir, version, exe_path, notes_path, tag=None):
         names = z.namelist()
         if [n for n in names if n.endswith('/')]:
             raise RuntimeError('便携 ZIP 不该有目录项')
-        for must in (PORTABLE_ROOT + '/' + EXE_NAME, PORTABLE_ROOT + '/更新说明.md',
-                     PORTABLE_ROOT + '/使用说明.txt'):
+        for must in (PORTABLE_ROOT + '/' + EXE_NAME,
+                     PORTABLE_ROOT + '/' + CLI_EXE_NAME,
+                     PORTABLE_ROOT + '/更新说明.md', PORTABLE_ROOT + '/使用说明.txt'):
             if must not in names:
                 raise RuntimeError('便携 ZIP 缺 %s' % must)
+        if z.read(PORTABLE_ROOT + '/' + CLI_EXE_NAME) != open(cli_exe_path, 'rb').read():
+            raise RuntimeError('便携 ZIP 里的 CLI EXE 与打包输入不一致')
         if z.read(PORTABLE_ROOT + '/使用说明.txt') != usage_bytes:
             raise RuntimeError('便携 ZIP 里的使用说明.txt 与生成的文本不一致')
         # 便携包里的扩展必须与独立 ZIP 同源，否则用户按 README 加载到的是另一份
@@ -186,8 +197,8 @@ def build(assets_dir, version, exe_path, notes_path, tag=None):
             if got.get('version') != want.get('version'):
                 raise RuntimeError('便携 ZIP 里的 %s 版本 %s != 源码 %s'
                                    % (rel_dir, got.get('version'), want.get('version')))
-    report.append('CivitaiFreeTool-Windows-%s.zip：%d 个条目，含 %s（与独立扩展 ZIP 同源）'
-                  % (tag, len(names), EXE_NAME))
+    report.append('CivitaiFreeTool-Windows-%s.zip：%d 个条目，含 %s + %s（与独立扩展 ZIP 同源）'
+                  % (tag, len(names), EXE_NAME, CLI_EXE_NAME))
 
     source_zip = os.path.join(assets_dir, 'CivitaiFreeTool-Source-%s.zip' % tag)
     subprocess.run(['git', '-C', ROOT, 'archive', 'HEAD', '-o', source_zip], check=True)
@@ -230,12 +241,17 @@ def main():
     p.add_argument('--version', required=True)
     p.add_argument('--assets-dir', required=True)
     p.add_argument('--exe', default=os.path.join(ROOT, 'dist', EXE_NAME))
+    p.add_argument('--cli-exe', default=os.path.join(ROOT, 'dist', CLI_EXE_NAME))
     p.add_argument('--notes', default=None, help='更新说明来源，默认 docs/releases/v<version>.md')
     args = p.parse_args()
     notes = args.notes or os.path.join(ROOT, 'docs', 'releases', 'v%s.md' % args.version)
     if not os.path.exists(args.exe):
         raise SystemExit('找不到 EXE：%s（先按 docs/RELEASING.md 第 3 步打包）' % args.exe)
-    for line in build(args.assets_dir, args.version, args.exe, notes):
+    if not os.path.exists(args.cli_exe):
+        raise SystemExit('找不到 CLI EXE：%s（先 pyinstaller --clean --noconfirm '
+                         'CivitaiFreeToolCLI.spec）' % args.cli_exe)
+    for line in build(args.assets_dir, args.version, args.exe, notes,
+                      cli_exe_path=args.cli_exe):
         print('OK', line)
     print('\n附件目录就绪：%s' % os.path.abspath(args.assets_dir))
 

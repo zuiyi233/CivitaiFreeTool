@@ -45,6 +45,15 @@ class OpenApiProjectionTest(unittest.TestCase):
                 self.assertEqual(operation["x-cft-toolset"], tool["toolset"])
                 self.assertEqual(operation["x-cft-annotations"], tool["annotations"])
 
+    def test_transport_discovery_is_contract_derived(self):
+        _, doc = self.call("/api/automation/openapi.json", query={"profile": ["text"]})
+        transports = doc["x-cft-transports"]
+        self.assertEqual(set(transports), {"mcp", "openapi", "sse", "webhook", "cli"})
+        self.assertEqual(transports["webhook"]["events"],
+                         list(ai_contract.WEBHOOK_DEFAULT_EVENT_GROUPS))
+        self.assertEqual(transports["cli"]["exit_codes"], dict(ai_contract.CLI_EXIT_CODES))
+        self.assertEqual(transports["webhook"]["signature"], "HMAC-SHA256")
+
     def test_profiles_control_admin_visibility(self):
         _, text = self.call("/api/automation/openapi.json", query={"profile": ["text"]})
         _, all_doc = self.call("/api/automation/openapi.json", query={"profile": ["all"]})

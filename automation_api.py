@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, unquote
 import ai_contract
 import ai_tools
 import openapi_projection
+import webhook_dispatch
 
 MAX_WAIT_S = 1800
 DEFAULT_WAIT_S = 300
@@ -385,6 +386,12 @@ def _manifest(api, ctx):
              "params": {"since": "int?", "types": "csv 事件名/组 或 all",
                         "snapshot": "0|1（默认 1）"},
              "desc": "SSE 领域事件流：任务/文件选择/扫描/弹层/配置；支持 Last-Event-ID 重放"},
+            {"method": "GET", "path": "/api/automation/webhooks",
+             "desc": "出站 webhook 状态：启停/脱敏目标/事件过滤/统计/最近投递；不返回 secret 与 URL 路径"},
+            {"method": "POST", "path": "/api/automation/webhooks",
+             "params": {"action": "test|clear-log|refresh", "timeout": "0.5-30s（仅 test）"},
+             "desc": "测试投递（webhook.test 合成探针 + HMAC）、清空投递日志、重载配置；"
+                     "启用/URL/secret/事件过滤走 POST /api/automation/config 白名单"},
             {"method": "GET", "path": "/api/automation/history",
              "params": {"limit": "int", "status": "str", "detail": "0|1", "fields": "csv"},
              "desc": "已完成/失败/取消的下载历史（倒序）"},
@@ -1211,10 +1218,7 @@ def _verify(api, ctx, query):
 
 
 def _config_get(api, ctx):
-    cfg = dict(getattr(api, "cfg", None) or {})
-    for k in ("api_key", "baidu_key", "baidu_appid"):
-        if cfg.get(k):
-            cfg[k] = "***"
+    cfg = redact_config_values(getattr(api, "cfg", None) or {})
     try:
         storage = api.get_data_storage_info()
     except Exception:
@@ -1780,6 +1784,12 @@ def _search(api, ctx, body):
 # 动作整理成 AI 能一次看懂、一次调完的形状（含可等待的进度与结果）。
 
 _CONFIG_HINTS = {
+    "webhook_enabled": ("bool", "", "出站 webhook 总开关（默认关）"),
+    "webhook_url": ("str", "", "webhook 接收地址；状态里只露 scheme+host+port"),
+    "webhook_events": ("list", ["task", "file_choice", "scan", "ui", "config", "app", "all"],
+                       "推送的事件类型/组；空数组 = 除 api 外的领域事件"),
+    "webhook_secret": ("secret", "", "HMAC-SHA256 密钥；启用时至少 16 字符，响应里打码"),
+    "webhook_allow_remote": ("bool", "", "允许公网 webhook 目标（默认只允许本机/局域网）"),
     "route_by_type": ("bool", "", "按类型分流到 <comfyui_models_root>/<类型key>/<文件名主干>/"),
     "comfyui_models_root": ("path", "", "ComfyUI 的 models 根目录；空或不存在 = 不分流"),
     "download_target_dir": ("path", "", "下载落地目录；空 = 用 download_dir"),
@@ -1823,7 +1833,21 @@ _MM_OPS = {
 }
 _CONFIRM_OPS = {"dedupe-delete", "cleanup"}
 
-_SECRET_KEYS = ("api_key", "baidu_key", "baidu_appid")
+_SECRET_KEYS = ("api_key", "baidu_key", "baidu_appid", "webhook_secret")
+
+
+def redact_config_values(values):
+    """配置回显统一脱敏：密钥打码，webhook URL 只留可诊断的 scheme+host+port。"""
+    out = dict(values or {})
+    if out.get("webhook_url"):
+        try:
+            out["webhook_url"] = webhook_dispatch.redact_url(out["webhook_url"])
+        except Exception:
+            out["webhook_url"] = "***"
+    for key in _SECRET_KEYS:
+        if out.get(key):
+            out[key] = "***"
+    return out
 
 
 def _schema(api, ctx):
@@ -1839,7 +1863,7 @@ def _schema(api, ctx):
         default = config.DEFAULTS.get(k)
         typ, options, desc = _CONFIG_HINTS.get(
             k, (type(default).__name__ if default is not None else "any", "", ""))
-        current = "***" if k in _SECRET_KEYS and cfg.get(k) else cfg.get(k)
+        current = redact_config_values({k: cfg.get(k)})[k]
         keys[k] = {"type": typ, "options": options, "desc": desc,
                    "default": default, "current": current}
     return 200, {
@@ -1848,7 +1872,9 @@ def _schema(api, ctx):
         "task_states": ["pending", "downloading", "paused", "done", "error", "canceled"],
         "task_actions": ["pause", "resume", "retry", "start", "remove", "archive"],
         "library_ops": {k: {"desc": v[2], "waitable": True} for k, v in _MM_OPS.items()},
-        "caps": {"bundle": "客户端能接收落点令牌，允许分流并写附属文件"},
+        "caps": {"bundle": "客户端能接收落点令牌，允许分流并写附属文件",
+                 "webhook": "出站事件推送（HMAC-SHA256）；配置键 webhook_*；"
+                            "状态/测试见 /api/automation/webhooks"},
         "routing": {
             "models_root": str(cfg.get("comfyui_models_root") or ""),
             "enabled": bool(cfg.get("route_by_type")),
@@ -1917,6 +1943,52 @@ def _tool_call(api, ctx, body):
         return _fail(400, "content_format 必须是 neutral|openai|anthropic|mcp",
                      "neutral 给通用客户端；openai/anthropic 直接给消息 content 块")
     return status, ai_tools.format_content(payload, fmt)
+
+
+def _webhook_status(api, ctx):
+    """webhook 运行态 + 投递日志。只读：不在 GET 里重做 DNS/配置校验或丢队列。"""
+    return 200, webhook_dispatch.status()
+
+
+def _webhook_action(api, ctx, body):
+    import automation_events
+    b = body or {}
+    action = str(b.get("action") or "").strip().lower()
+    if action == "refresh":
+        webhook_dispatch.refresh_from_config(getattr(api, "cfg", None) or {},
+                                             automation_events.get_hub())
+        return 200, webhook_dispatch.status()
+    dispatcher = webhook_dispatch.get_dispatcher()
+    if action == "clear-log":
+        return 200, {"ok": True, "cleared": dispatcher.clear_log()}
+    if action == "test":
+        try:
+            timeout = float(b.get("timeout") or ai_contract.WEBHOOK_LIMITS["test_timeout_s"])
+        except (TypeError, ValueError):
+            timeout = float(ai_contract.WEBHOOK_LIMITS["test_timeout_s"])
+        timeout = max(0.5, min(30.0, timeout))
+        try:
+            result = dispatcher.test_delivery(timeout=timeout)
+        except webhook_dispatch.WebhookConfigError as e:
+            return _fail(409, str(e),
+                         "先通过 cft_configure 设置 webhook_enabled/url/secret，再重试")
+        if result.get("ok"):
+            return 200, result
+        if result.get("status") in ("queued", "retrying"):
+            payload = dict(result)
+            payload.update({"ok": False, "code": "timeout",
+                            "msg": "webhook 投递仍在进行",
+                            "hint": "稍后查 GET /api/automation/webhooks 的 deliveries/stats"})
+            return 408, payload
+        payload = dict(result)
+        payload.update({
+            "ok": False, "code": "webhook_failed",
+            "msg": "webhook 投递失败: %s" % (result.get("error") or "unknown"),
+            "hint": "检查接收端是否在线并返回 2xx；投递记录见 GET /api/automation/webhooks",
+        })
+        return 502, payload
+    return _fail(400, "action 必须是 test|clear-log|refresh",
+                 '例如 {"action":"test"}')
 
 
 def _guide(api, ctx, query):
@@ -2638,6 +2710,8 @@ def _dispatch_impl(path, method, query, body, api, ctx):
             return _tasks(api, ctx, q)
         if path == "/api/automation/events":
             return _events(api, ctx, q)
+        if path == "/api/automation/webhooks":
+            return _webhook_status(api, ctx)
         if path == "/api/automation/history":
             return _history(api, ctx, q)
         if path == "/api/automation/prompts":
@@ -2688,6 +2762,8 @@ def _dispatch_impl(path, method, query, body, api, ctx):
             return _tool_call(api, ctx, body)
         if path == "/api/automation/vision/analyze":
             return _vision_analyze(api, ctx, body)
+        if path == "/api/automation/webhooks":
+            return _webhook_action(api, ctx, body)
         if path == "/api/automation/batch":
             return _batch(api, ctx, body)
         if path == "/api/automation/history":

@@ -90,6 +90,54 @@ class EventHubTest(unittest.TestCase):
         self.hub.sample_once()
         self.assertEqual([e["type"] for e in _drain(sub)], ["task.removed"])
 
+    def test_sink_receives_events_without_sse_client(self):
+        self.make_hub()
+        seen = []
+
+        def collect(item):
+            seen.append(item)
+
+        self.assertTrue(self.hub.add_sink(collect))
+        self.assertEqual(self.hub.active_sinks(), 1)
+        self.tasks.append({"id": "t1", "filename": "a.safetensors",
+                           "status": "downloading", "progress": 10})
+        self.hub.sample_once()
+        self.assertEqual([e["type"] for e in seen], ["task.created"])
+        self.hub.remove_sink(collect)
+        self.assertEqual(self.hub.active_sinks(), 0)
+
+    def test_sink_exception_does_not_break_other_subscribers(self):
+        self.make_hub()
+
+        def boom(_event):
+            raise RuntimeError("sink failed")
+
+        self.hub.add_sink(boom)
+        sub, _ = self.subscribe()
+        self.tasks.append({"id": "t1", "filename": "a.safetensors",
+                           "status": "downloading", "progress": 10})
+        self.hub.sample_once()
+        self.assertEqual([e["type"] for e in _drain(sub)], ["task.created"])
+
+    def test_sink_keeps_sampler_alive_until_idle(self):
+        self.make_hub(interval=0.03, idle_stop=0.09)
+        received = []
+
+        def collect(item):
+            received.append(item)
+
+        self.hub.add_sink(collect)
+        self.assertIsNotNone(self.hub._sampler)
+        deadline = time.time() + 0.2
+        while self.hub._sampler is None and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIsNotNone(self.hub._sampler, "sink 单独存在时采样线程不能停")
+        self.hub.remove_sink(collect)
+        deadline = time.time() + 1.0
+        while self.hub._sampler is not None and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertIsNone(self.hub._sampler, "移除 sink 后应按 idle_stop 停采样")
+
     def test_file_choice_events(self):
         self.make_hub()
         sub, _ = self.subscribe()
@@ -254,6 +302,34 @@ class EventHubTest(unittest.TestCase):
         self.hub.shutdown()
         events = _drain(sub, timeout=0.5)
         self.assertTrue(any(e["type"] == "app.stopping" for e in events))
+
+    def test_config_changed_keys_use_raw_config_not_redacted_state(self):
+        raw = {"webhook_secret": "old-secret", "download_dir": "D:/out"}
+        self.make_hub(config_provider=lambda: raw)
+        self.state["config"] = {"webhook_secret": "***", "download_dir": "D:/out"}
+        self.state["config_rev"] = 1
+        sub, _ = self.subscribe(types={"config"})
+        raw["webhook_secret"] = "new-secret"
+        self.state["config_rev"] = 2
+        self.hub.sample_once()
+        events = [e for e in _drain(sub) if e["type"] == "config.changed"]
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["data"]["keys"], ["webhook_secret"])
+        blob = json.dumps(events[0], ensure_ascii=False)
+        self.assertNotIn("old-secret", blob)
+        self.assertNotIn("new-secret", blob)
+
+    def test_shutdown_publishes_stopping_to_sink_only(self):
+        self.make_hub()
+        seen = []
+
+        def collect(item):
+            seen.append(item)
+
+        self.hub.add_sink(collect)
+        self.hub.shutdown()
+        self.assertTrue(any(e["type"] == "app.stopping" for e in seen),
+                        "只有 webhook sink 时也必须尽力发 app.stopping")
 
 
 class _Task:

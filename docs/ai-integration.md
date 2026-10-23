@@ -1,7 +1,7 @@
 # AI 接入契约（MCP / Skill / HTTP）
 
-> 状态：v2.7.0 契约（MCP / OpenAPI / SSE / Skill / HTTP 均已落地）。唯一事实源是
-> `ai_contract.py`；本文解释结构与边界，不重复维护工具表。
+> 状态：v2.7.0 契约（MCP / OpenAPI / SSE / Skill / HTTP / CLI / webhook 均已落地）。
+> 唯一事实源是 `ai_contract.py`；本文解释结构与边界，不重复维护工具表。
 
 ## 1. 角色
 
@@ -11,7 +11,9 @@
 | Skill `skills/civitai-free-tool` | 安装、操作手册、recipes、安全边界、排障 | 不承载业务逻辑，不替代 MCP |
 | HTTP API `/api/automation/*` | 脚本与不支持 MCP 的客户端；同一契约的投影 | 不做过渡层；不另写一套 schema |
 | OpenAPI 3.1 `/api/automation/openapi.json` | Dify / n8n / LangChain / Open WebUI 等函数调用平台的导入面 | 不手写工具表；不暴露管理员工具为默认 |
-| SSE `/api/automation/events/stream` | 任务、弹层、扫描、配置变化的服务端推送 | 不新增工具；不做 webhook / 公网回调 |
+| SSE `/api/automation/events/stream` | 任务、弹层、扫描、配置变化的服务端推送 | 不新增工具；不做入站回调 / 公网服务 |
+| CLI `CivitaiFreeToolCLI.exe` | 本机脚本/Shell Agent 的命令行客户端；`call` / `events` / `batch` / `doctor` | 不直连 C 站；不复制工具逻辑；只连回环，不自动启动桌面端 |
+| Webhook `/api/automation/webhooks` | 把同一批契约事件出站推送到用户配置的 HTTP 端点 | 不新增事件；不做入站 webhook；不持久化；默认关闭且默认只允许非公网目标 |
 
 ```text
 MCP Host
@@ -22,11 +24,16 @@ MCP Host
   │                             ▼
 OpenAPI importer ──► GET /api/automation/openapi.json
                  └─► POST /api/automation/tool/{name} ─► ai_tools.execute_tool
+CivitaiFreeToolCLI.exe ─► POST /api/automation/tool/{name} / GET /events/stream
 Local agent ───────► GET /api/automation/events/stream ◄─ EventHub（1 秒快照差分）
+                                                     ├─ sink ─► webhook_dispatch ─► 用户端点
                                                      │
                                                      ▼
                                   automation_api.dispatch / Api / downloader
 ```
+
+CLI 与 webhook 的完整契约（命令、退出码、SSE 重连、HMAC、重试、SSRF/重定向策略）见
+[CLI / webhook 传输层](ai-cli-webhook.md)。两者都只消费上面的同一份工具/事件目录。
 
 ## 2. 契约层
 
@@ -41,6 +48,9 @@ Local agent ───────► GET /api/automation/events/stream ◄─ Ev
 - `ERROR_CODES` 与 `normalize_error()`：稳定 `code/retryable/hint/next_actions`。
 - `EVENTS`：SSE 领域事件目录（类型、分组、说明、payload schema）；OpenAPI 与
   `cft_capabilities` 的 `caps.events` 都从这里生成。
+- `CLI_VERSION` / `CLI_EXIT_CODES`：CLI 传输语义；只映射退出码，不新增工具。
+- `WEBHOOK_LIMITS` / `WEBHOOK_DEFAULT_EVENT_GROUPS`：出站 webhook 的超时、重试、
+  队列、日志与默认事件组；仍投影同一份 `EVENTS`，默认排除高频 `api.call`。
 - `RESOURCES` / `PROMPTS`：MCP 资源与用户可调用的 recipe prompt。
 - `TEXT_GUIDE` / `VISION_GUIDE`：`/guide` 与 `cft://guide/*` 的同一份内容。
 

@@ -7,6 +7,28 @@ import ai_contract
 
 
 class ContractTest(unittest.TestCase):
+    def test_public_counts_are_pinned(self):
+        # 传输层只能投影契约，不能顺手加工具/事件；数字变化必须显式改这里。
+        self.assertEqual(len(ai_contract.TOOLS), 29)
+        self.assertEqual(len(ai_contract.EVENTS), 21)
+        self.assertEqual(len(ai_contract.DOMAIN_EVENT_TYPES), 20)
+
+    def test_transport_constants_are_well_formed(self):
+        codes = ai_contract.CLI_EXIT_CODES
+        self.assertEqual(codes["ok"], 0)
+        self.assertEqual(len(codes), len(set(codes.values())) + 1)  # unsupported 与 version_mismatch 同码
+        self.assertTrue(all(isinstance(v, int) and 0 <= v <= 9 for v in codes.values()))
+        limits = ai_contract.WEBHOOK_LIMITS
+        self.assertGreaterEqual(limits["max_attempts"], 1)
+        self.assertEqual(len(limits["backoff_s"]), limits["max_attempts"] - 1)
+        self.assertGreaterEqual(limits["min_secret_length"], 16)
+        self.assertGreater(limits["queue_size"], 0)
+        # 默认组必须是真实存在的事件组，且刻意排除 api.call。
+        groups = {item["group"] for item in ai_contract.EVENTS}
+        self.assertEqual(set(ai_contract.WEBHOOK_DEFAULT_EVENT_GROUPS),
+                         groups - {"api", "stream"})
+        self.assertNotIn("api", ai_contract.WEBHOOK_DEFAULT_EVENT_GROUPS)
+
     def test_tool_names_unique_and_toolsets_cover_all(self):
         names = list(ai_contract.TOOLS)
         self.assertEqual(len(names), len(set(names)))

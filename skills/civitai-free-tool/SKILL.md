@@ -1,6 +1,6 @@
 ---
 name: civitai-free-tool
-description: "Control the local CivitaiFreeTool desktop app via MCP; search, download, verify and repair Civitai or HuggingFace models; manage the local model library; browse and tag the ComfyUI output gallery; inspect model covers and sample images with vision. Use for text-only hosts (core tools, metadata only), multimodal hosts (core+vision, inline images), OpenAPI/Dify/n8n/LangChain fallbacks, SSE event monitoring, MCP setup or download-failure triage."
+description: "Control the local CivitaiFreeTool desktop app via MCP; search, download, verify and repair Civitai or HuggingFace models; manage the local model library; browse and tag the ComfyUI output gallery; inspect model covers and sample images with vision. Use for text-only hosts (core tools, metadata only), multimodal hosts (core+vision, inline images), OpenAPI/Dify/n8n/LangChain fallbacks, SSE event monitoring, the CLI client, outbound webhook delivery, MCP setup or download-failure triage."
 ---
 
 # CivitaiFreeTool
@@ -30,6 +30,11 @@ description: "Control the local CivitaiFreeTool desktop app via MCP; search, dow
    - 需要持续感知任务、待选文件或弹层：订阅
      `GET /api/automation/events/stream`，保存每条事件的 `id`，断线用 `Last-Event-ID`
      重放；不要每秒轮询 state。
+   - **Shell/CI 场景**可用 `CivitaiFreeToolCLI.exe`（`call` / `batch` / `events` / `doctor`），
+     它只连本机桥，退出码映射契约；完整命令见 [docs/ai-cli-webhook.md](../../docs/ai-cli-webhook.md)。
+   - **需要事件出站推送**时，经用户明确同意后用 `cft_configure` 设置 `webhook_*`
+     （默认关闭、默认只允许非公网目标）；`GET/POST /api/automation/webhooks` 可看状态/测试，
+     不要把 secret 写进回答或日志。
    - HTTP MCP 默认监听 `http://127.0.0.1:47532/mcp`（Streamable HTTP），必须带 `Authorization: Bearer <token>`；token 只从本地环境/客户端注入，绝不写进仓库或回答。
    - **冻结版桌面端会自动拉起 MCP HTTP**（47532，桥断即退）；不需要用户另开控制台。源码运行需手动 `python mcp_server.py --http`。
    - 配置片段见 `assets/mcp-qoder.json`、`assets/mcp-claude.json`、`assets/mcp-cursor.json`；也可在仓库根运行
@@ -87,6 +92,7 @@ description: "Control the local CivitaiFreeTool desktop app via MCP; search, dow
 | 29 个工具的参数/安全注解/返回类型 | [references/tools.md](references/tools.md) |
 | 端到端调用序列与预期结果 | [references/recipes.md](references/recipes.md) |
 | OpenAPI 导入、每工具别名、SSE 订阅与重连 | [references/recipes.md](references/recipes.md) §8 |
+| CLI 子命令/退出码、webhook 配置/签名/测试 | [references/recipes.md](references/recipes.md) §9；[docs/ai-cli-webhook.md](../../docs/ai-cli-webhook.md) |
 | 视觉工具、delivery、contact sheet、视频首帧 | [references/vision.md](references/vision.md) |
 | 本机边界、token、破坏性确认、路径越界 | [references/safety.md](references/safety.md) |
 | 连通性/代理/DNS 诊断脚本 | [scripts/cft_doctor.py](scripts/cft_doctor.py) |

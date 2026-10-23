@@ -161,6 +161,43 @@ Skill 在 `skills/civitai-free-tool/`，负责安装、recipes 和安全边界�
 curl -N "http://127.0.0.1:47531/api/automation/events/stream?types=task,ui,file_choice"
 ```
 
+### 出站 webhook：`GET/POST /api/automation/webhooks`
+
+把同一批契约事件以 HTTP POST 推给用户配置的端点，适合 n8n/zapier/自建接收器。
+**默认关闭**；不新增事件类型，仍投影 `ai_contract.EVENTS`（默认排除高频 `api.call`）。
+
+配置键（与其它白名单键一样走 `POST /api/automation/config` 或 `cft_configure`）：
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `webhook_enabled` | bool | false | 总开关 |
+| `webhook_url` | str | "" | http(s) 端点；回显只露 scheme+host+port（路径可能含平台 token） |
+| `webhook_events` | list | [] | 事件名/组名/`all`；空 = `task/file_choice/scan/ui/config/app` |
+| `webhook_secret` | str | "" | HMAC-SHA256 密钥；启用时至少 16 字符，回显恒为 `***` |
+| `webhook_allow_remote` | bool | false | 允许公网目标；默认只允许本机/局域网 |
+
+`GET /api/automation/webhooks` 返回启停、脱敏目标、事件过滤、统计（accepted/sent/failed/
+dropped/retried）、最近 50 条投递与 `config_error`。`POST` 的 `action`：
+
+- `test`：发一条 `webhook.test` 合成探针（带 `X-CFT-Synthetic: 1`），默认等到投递结束；
+- `clear-log`：清空投递日志，累计统计保留；
+- `refresh`：从当前配置重新加载（手工改配置文件/长尾 RPC 后使用）。
+
+`GET /api/automation/webhooks` 只读：不会重新做 DNS/配置校验，也不会停用投递或丢队列；
+配置保存（`POST /api/automation/config`）会立即刷新，手工改文件后显式调 `refresh`。
+
+投递请求带 `X-CFT-Delivery/Event/Group/Seq/Instance/Timestamp/Signature`；签名是
+`HMAC-SHA256(secret, "<timestamp>.<raw body>")`，接收端应校验时间窗（建议 300 秒）并按
+`X-CFT-Delivery` 去重。重试 4 次（1s/5s/15s），只对网络错误、408/425/429/5xx 重试；
+**不跟随 3xx**；队列 256，满时丢新事件并计入 `dropped`；不持久化、不跨重启重放。
+完整契约与 Python/Node 校验示例见 [ai-cli-webhook.md](ai-cli-webhook.md)。
+
+```bash
+curl -s http://127.0.0.1:47531/api/automation/webhooks
+curl -s -X POST http://127.0.0.1:47531/api/automation/webhooks \
+  -H 'Content-Type: application/json' -d '{"action":"test"}'
+```
+
 ### `GET /api/automation/history`
 下载历史（已完成/失败/取消，倒序）。参数：`limit`、`status`、`detail=1`。
 默认返回精简字段（id/filename/status/dest_dir/routed_dir/file_path/file_exists/total/error/finished_at）；
@@ -576,3 +613,7 @@ python scripts/smoke_agent_transports.py --json             # OpenAPI + /tool/{n
 - 请求体上限：`POST /api/automation/{tool,vision/analyze}` 与 `tool/{name}` 中属于
   `ai_contract.LARGE_BODY_TOOLS`（当前只有 `cft_inspect_image`，MCP 图片上传入口）放宽到 8MB，
   其余自动化端点与别名仍是 1MB；超限返回 413 + `limit_bytes`，不把桥变成任意大文件入口。
+- 出站 webhook 是尽力实时推送，不是 at-least-once：不落盘、不跨重启重放、不跟随重定向；
+  队列满或应用退出时事件会丢，`stats.dropped` / 投递日志会如实记录。需要可靠重放请用 SSE。
+- webhook 默认只允许解析到非公网地址的目标；`webhook_allow_remote=true` 是显式数据出境选择，
+  事件里可能含本地文件名/落点路径。`webhook_url` 与 `webhook_secret` 不会出现在任何响应/日志里。
